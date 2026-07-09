@@ -1,0 +1,7 @@
+python comic_bubble_pipeline.py `
+    --src  "D:\i\comics\도박묵시록 카이지\도박묵시록 카이지 01\upscayl_png_digital-art-4x_2x" `
+    --out  ".\test_run" `
+    --font "C:\Users\kiuk1\Downloads\nanum-all\나눔 글꼴\나눔명조\NanumFontSetup_TTF_MYUNGJO\NanumMyeongjoBold.ttf" `
+    --tesseract "C:\Program Files\Tesseract-OCR\tesseract.exe" `
+    --limit 3 `
+    --debug

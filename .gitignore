@@ -1,0 +1,33 @@
+# API 키가 저장될 수 있음 — 절대 커밋 금지
+app_config.json
+
+# 파이썬
+__pycache__/
+*.pyc
+
+# 빌드 산출물
+build/
+dist/
+
+# 작업 산출물 (출력 폴더에 생성되는 것들 — 혹시 리포 안에서 돌릴 경우 대비)
+review.json
+review.html
+rework.json
+_style_default.json
+_upscaled/
+_paint/
+_cache/
+_debug/
+_sample/
+*_final.png
+*.psd
+
+# 폰트 (라이선스별 재배포 조건 상이 — 각자 설치)
+fonts/
+
+# 임시
+_to_delete/
+
+# OS
+Thumbs.db
+desktop.ini
