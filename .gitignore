@@ -1,5 +1,6 @@
 # API 키가 저장될 수 있음 — 절대 커밋 금지
 app_config.json
+ebook_config.json
 
 # 파이썬
 __pycache__/
@@ -17,6 +18,7 @@ _style_default.json
 _upscaled/
 _paint/
 _cache/
+_restored/
 _debug/
 _sample/
 *_final.png

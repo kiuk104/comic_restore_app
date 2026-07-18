@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="ko"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#064e3b">
+<title>이북 검수</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+:root{--bg:#f4f5f7;--tx:#21242b;--tx2:#5b6270;--acc:#10b981;--deep:#064e3b}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font-family:'Malgun Gothic',sans-serif;background:var(--bg);
+ color:var(--tx);display:flex;flex-direction:column}
+.pg{display:none;flex:1;min-height:0}
+.pg.on{display:flex;flex-direction:column}
+/* ---- 서재 ---- */
+#home header{background:var(--deep);color:#fff;padding:
+ calc(14px + env(safe-area-inset-top)) 18px 14px;font-size:18px;
+ font-weight:700;display:flex;align-items:center;gap:10px}
+#home header img{width:26px;height:26px;border-radius:6px}
+#books{flex:1;overflow:auto;padding:14px}
+.bk{display:block;width:100%;text-align:left;background:#fff;
+ border:1px solid #d5d9e0;border-radius:12px;padding:16px 16px;
+ margin:0 0 10px;font-size:16px;color:var(--tx);cursor:pointer}
+.bk:active{background:#eef7f3}
+.bk small{display:block;color:var(--tx2);font-size:12px;margin-top:3px}
+#hint{color:var(--tx2);font-size:13px;padding:4px 16px 18px}
+#hint button{border:0;background:none;color:var(--acc);font-size:13px;
+ text-decoration:underline;cursor:pointer;padding:0}
+/* ---- 검수(iframe) ---- */
+#view{position:relative}
+#view iframe{border:0;width:100%;flex:1;min-height:0}
+#back{position:fixed;right:12px;bottom:calc(14px + env(safe-area-inset-bottom));
+ z-index:9;width:44px;height:44px;border-radius:50%;border:0;
+ background:rgba(6,78,59,.78);color:#fff;font-size:20px;cursor:pointer;
+ box-shadow:0 2px 8px rgba(0,0,0,.25)}
+/* ---- 설정 ---- */
+#setup{padding:calc(26px + env(safe-area-inset-top)) 22px;gap:6px}
+#setup h2{margin:0 0 4px;font-size:19px}
+#setup p{margin:2px 0 14px;color:var(--tx2);font-size:13px}
+#setup label{font-size:13px;color:var(--tx2);margin-top:8px}
+#setup input{width:100%;padding:11px 10px;font-size:14px;
+ border:1px solid #c2c8d3;border-radius:8px;background:#fff;margin-top:4px}
+#setup button{margin-top:18px;padding:13px;font-size:15px;font-weight:700;
+ border:0;border-radius:10px;background:var(--acc);color:#fff;cursor:pointer}
+#err{color:#c04545;font-size:13px;min-height:18px;margin-top:8px}
+.spin{color:var(--tx2);padding:24px;text-align:center;font-size:14px}
+</style></head><body>
+
+<div class="pg" id="setup">
+ <h2>📚 이북 검수 설정</h2>
+ <p>Apps Script 배포 주소와 동기화 키를 한 번만 입력하면
+  이 기기에 저장됩니다.</p>
+ <label>동기화 URL (…/exec)</label>
+ <input id="s_url" type="url" placeholder="https://script.google.com/macros/s/…/exec">
+ <label>동기화 키</label>
+ <input id="s_key" type="password">
+ <button onclick="saveSetup()">저장하고 시작</button>
+ <div id="err"></div>
+</div>
+
+<div class="pg" id="home">
+ <header><img src="icon-192.png" alt="">이북 검수
+  <span style="flex:1"></span>
+  <button onclick="show('setup')" style="border:0;background:none;color:#fff;
+   font-size:17px;cursor:pointer" title="설정">⚙</button></header>
+ <div id="books"><div class="spin">목록 불러오는 중…</div></div>
+ <div id="hint"></div>
+</div>
+
+<div class="pg" id="view">
+ <iframe id="fr" src="about:blank" allow="clipboard-write"></iframe>
+ <button id="back" onclick="goHome()" title="서재로">⌂</button>
+</div>
+
+<script>
+"use strict";
+const LS = "ebookShellCfg";
+let cfg = null;
+try { cfg = JSON.parse(localStorage.getItem(LS) || "null"); } catch (e) {}
+
+// 최초 1회: ?gas=…&key=… 로 열면 자동 저장
+const qp = new URLSearchParams(location.search);
+if (qp.get("gas")) {
+  cfg = {url: qp.get("gas"), key: qp.get("key") || ""};
+  localStorage.setItem(LS, JSON.stringify(cfg));
+  history.replaceState(null, "", location.pathname);
+}
+
+function show(id) {
+  document.querySelectorAll(".pg").forEach(p =>
+    p.classList.toggle("on", p.id === id));
+  document.getElementById("back").style.display =
+    id === "view" ? "" : "none";
+}
+
+function saveSetup() {
+  const u = document.getElementById("s_url").value.trim();
+  const k = document.getElementById("s_key").value.trim();
+  if (!u || !k) {
+    document.getElementById("err").textContent = "URL과 키를 입력하세요";
+    return;
+  }
+  cfg = {url: u, key: k};
+  localStorage.setItem(LS, JSON.stringify(cfg));
+  loadList();
+}
+
+async function loadList() {
+  show("home");
+  const bx = document.getElementById("books");
+  bx.innerHTML = '<div class="spin">목록 불러오는 중…</div>';
+  document.getElementById("hint").innerHTML = "";
+  try {
+    const r = await fetch(cfg.url, {method: "POST",
+      body: JSON.stringify({op: "list", key: cfg.key})});
+    const d = await r.json();
+    if (d.err) throw new Error(d.err);
+    bx.innerHTML = "";
+    (d.books || []).forEach(b => {
+      const el = document.createElement("button");
+      el.className = "bk";
+      el.innerHTML = "📖 " + b.replace(/[<>&]/g, "");
+      el.onclick = () => openBook(b);
+      bx.appendChild(el);
+    });
+    if (!(d.books || []).length)
+      bx.innerHTML = '<div class="spin">아직 업로드된 책이 없습니다 — ' +
+                     "PC에서 [☁ 업로드]</div>";
+    const last = localStorage.getItem("ebookShellLast");
+    if (last && (d.books || []).includes(last)) openBook(last);
+  } catch (e) {   // CORS 등 목록 API 실패 — GAS 목록 페이지로 폴백
+    bx.innerHTML = '<div class="spin">목록 API 실패(' +
+      (e.message || e) + ") — 내장 목록으로 엽니다</div>";
+    document.getElementById("hint").innerHTML =
+      '<button onclick="show(\'setup\')">설정 다시 입력</button>';
+    setTimeout(() => {
+      document.getElementById("fr").src =
+        cfg.url + "?key=" + encodeURIComponent(cfg.key);
+      show("view");
+    }, 800);
+  }
+}
+
+function openBook(b) {
+  localStorage.setItem("ebookShellLast", b);
+  document.getElementById("fr").src = cfg.url +
+    "?book=" + encodeURIComponent(b) + "&key=" + encodeURIComponent(cfg.key);
+  show("view");
+}
+
+function goHome() {
+  localStorage.removeItem("ebookShellLast");   // 자동 재진입 해제
+  document.getElementById("fr").src = "about:blank";
+  loadList();
+}
+
+if ("serviceWorker" in navigator)
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+
+if (cfg && cfg.url) loadList();
+else show("setup");
+</script></body></html>

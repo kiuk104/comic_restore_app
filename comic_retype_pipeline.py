@@ -39,7 +39,7 @@ v2(comic_restore_pipeline)의 비파괴 톤 보정을 베이스로 깔고, 그 �
 
 from __future__ import annotations
 
-__version__ = "0.9.0"
+__version__ = "0.16.3"   # Gemini 전사+별도 백엔드 번역 분리, 파트별 API 요금 표시
 
 import argparse
 import base64
@@ -228,7 +228,7 @@ PROMPT = """스캔 만화 페이지에서 잘라낸 말풍선 이미지 {n}장�
 - 문맥상 자연스러운 단어로 바꿔 쓰지 마세요. 이미지의 글자 모양이 항상 우선이고, 문맥은 획이 뭉개진 글자의 후보를 고르는 보조로만 사용합니다.
 - 원문 그대로 (맞춤법 교정·의역 금지, 문장부호·말줄임표 유지)
 - 원본의 줄바꿈을 그대로 살려 각 줄을 \\n으로 구분 (레이아웃 정합에 사용됨)
-- kind 분류: "dialogue"=식자(인쇄체) 대사·캡션, "hand"=손글씨로 쓴 대사·메모·쪽지, "display"=제목·로고 등 장식 텍스트, "sfx"=효과음, "none"=한글 텍스트 없음
+- kind 분류: "dialogue"=말풍선 속 식자(인쇄체) 대사, "shout"=크고 굵게 강조된 외침 대사(뾰족한 말풍선·볼드 대형 글자), "caption"=말풍선 밖 네모 상자의 내레이션·장면 설명·시간 경과 캡션, "hand"=손글씨로 쓴 대사·메모·쪽지, "display"=제목·로고 등 장식 텍스트, "sfx"=효과음, "none"=한글 텍스트 없음
 - confidence: "high"=모든 글자 확신, "medium"=한두 글자 추정, "low"=상당 부분 추정 불가. 글자 모양이 아닌 문맥으로 추정한 글자가 하나라도 있으면 "high" 금지.
 - uncertain: 추정했거나 불확실한 글자를 "2번째 줄 '묵' (후보: 목/묵)" 형식으로 나열한 문자열. 전부 확실하면 null.
 - 텍스트가 없거나 읽을 수 없으면 text는 null
@@ -249,6 +249,307 @@ JSON 배열만 출력 (설명 금지):
 [{{"id": 1, "text": "...", "kind": "dialogue", "confidence": "high", "fixed": null}}, ...]"""
 
 
+# ---------------------------------------------------------------------------
+# 번역 모드 (원서 → 한글) — --source-lang de 등
+# ---------------------------------------------------------------------------
+SRC_LANG_NAMES = {"de": "독일어", "en": "영어", "ja": "일본어"}
+
+# 로컬 OCR 언어 코드: (tesseract, easyocr, winocr)
+_OCR_LANG_CODES = {"ko": ("kor", "ko", "ko"), "de": ("deu", "de", "de"),
+                   "en": ("eng", "en", "en"), "ja": ("jpn", "ja", "ja")}
+
+PROMPT_XLAT = """스캔 만화 페이지에서 잘라낸 말풍선 이미지 {n}장입니다. \
+원문은 {lang}입니다. 각 이미지에 대해 ① 보이는 {lang} 원문을 그대로 \
+전사하고(src), ② 문맥에 맞는 자연스러운 한국어로 번역하세요(text).
+
+- src: 이미지에 실제로 보이는 글자 그대로 (대소문자·문장부호 보존, 원본 \
+줄바꿈을 \\n으로 유지, 줄 끝 하이픈 분철도 그대로). 문맥상 자연스러운 \
+단어로 바꿔 쓰지 마세요 — 글자 모양이 항상 우선입니다.
+- text: 자연스러운 한국어 만화 대사체 번역 (직역투 금지). 인물 관계·장면 \
+분위기에 맞게 존댓말/반말을 정하고 일관성을 유지하세요. 말풍선에 들어갈 \
+글이므로 원문과 비슷한 줄 수가 되도록 어절 단위로 \\n 줄바꿈.
+- kind 분류: "dialogue"=말풍선 속 식자(인쇄체) 대사, "shout"=크고 굵게 \
+강조된 외침 대사, "caption"=말풍선 밖 네모 상자의 내레이션·장면 설명 캡션, \
+"hand"=손글씨 대사·메모, "display"=제목·로고 등 장식 텍스트, \
+"sfx"=효과음, "none"=텍스트 없음
+- confidence: 원문 판독 확신도 — "high"=모든 글자 확신, "medium"=한두 \
+글자 추정, "low"=상당 부분 추정 불가
+- uncertain: 판독이 불확실했던 글자를 나열한 문자열, 전부 확실하면 null
+- 텍스트가 없거나 읽을 수 없으면 src·text는 null
+{gloss}
+JSON 배열만 출력 (설명 금지):
+[{{"id": 1, "src": "...", "text": "...", "kind": "dialogue", \
+"confidence": "high", "uncertain": null}}, ...]"""
+
+PROMPT_XLAT_SRC = """스캔 만화 페이지에서 잘라낸 말풍선 이미지 {n}장입니다. \
+원문은 {lang}입니다. 각 이미지에 보이는 {lang} 원문을 그대로 전사하세요. \
+번역하지 마세요 — 번역은 별도 단계에서 수행됩니다.
+
+- text: 이미지에 실제로 보이는 {lang} 글자 그대로 (대소문자·문장부호 보존, \
+원본 줄바꿈을 \\n으로 유지, 줄 끝 하이픈 분철도 그대로). 문맥상 자연스러운 \
+단어로 바꿔 쓰지 마세요 — 글자 모양이 항상 우선입니다.
+- kind 분류: "dialogue"=말풍선 속 식자(인쇄체) 대사, "shout"=크고 굵게 \
+강조된 외침 대사, "caption"=말풍선 밖 네모 상자의 내레이션·장면 설명 캡션, \
+"hand"=손글씨 대사·메모, "display"=제목·로고 등 장식 텍스트, \
+"sfx"=효과음, "none"=텍스트 없음
+- confidence: 판독 확신도 — "high"=모든 글자 확신, "medium"=한두 글자 \
+추정, "low"=상당 부분 추정 불가
+- uncertain: 판독이 불확실했던 글자를 나열한 문자열, 전부 확실하면 null
+- 텍스트가 없거나 읽을 수 없으면 text는 null
+
+JSON 배열만 출력 (설명 금지):
+[{{"id": 1, "text": "...", "kind": "dialogue", \
+"confidence": "high", "uncertain": null}}, ...]"""
+
+VERIFY_PROMPT_XLAT = """말풍선 이미지 {n}장과 각각의 후보({lang} 전사 \
+src + 한국어 번역 text)입니다. 후보끼리 다르거나 확신이 낮았던 항목들입니다.
+
+이미지의 실제 글자와 후보 src를 글자 단위로 대조해 원문을 확정하고, \
+확정된 원문 기준으로 자연스러운 한국어 번역(text)을 확정하세요.
+- 판단 기준은 '이미지에 실제로 보이는 글자 모양'입니다.
+- 후보 src 중 이미지와 일치하는 쪽을 선택, 둘 다 틀렸으면 이미지 기준 수정.
+- 끝까지 판독 불가한 글자가 있으면 confidence "low".
+- src 줄바꿈(\\n)은 이미지의 줄 구성 그대로, text는 어절 단위 줄바꿈.
+- fixed: 후보에서 고친 내용 요약, 없으면 null.
+{gloss}
+JSON 배열만 출력 (설명 금지):
+[{{"id": 1, "src": "...", "text": "...", "kind": "dialogue", \
+"confidence": "high", "fixed": null}}, ...]"""
+
+TRANSLATE_PROMPT = """만화 한 페이지의 말풍선 {lang} 대사 목록입니다 \
+(읽기 순서). 로컬 OCR로 추출한 텍스트라 오탈자·띄어쓰기 오류가 있을 수 \
+있으니, 명백한 OCR 오류는 문맥으로 교정해서 번역하세요.
+
+- 페이지 전체 문맥과 인물 관계에 맞는 자연스러운 한국어 만화 대사체
+- 존댓말/반말은 장면에 맞게 정하고 페이지 안에서 일관성 유지
+- 원문 줄 끝 하이픈 분철(예: "Ge-\\nfahr")은 한 단어로 이어 읽을 것
+- 번역문은 원문과 비슷한 줄 수가 되도록 어절 단위로 \\n 줄바꿈
+- 번역할 수 없으면 text는 null
+{gloss}
+JSON 배열만 출력 (설명 금지):
+[{{"id": 1, "text": "..."}}, ...]"""
+
+
+# Ollama 로컬 번역 백엔드 기본값 — local-ocr 번역 모드의 텍스트 번역만 대체
+# (vision 모드는 이미지 전사+번역이 한 요청이라 항상 Claude 사용)
+OLLAMA_URL = "http://localhost:11434"
+OLLAMA_MODEL = "qwen3:14b"
+OLLAMA_TIMEOUT = 300   # 초 — 로컬 생성은 페이지당 수십 초까지 걸릴 수 있음
+
+# Gemini (Google) 저가 백엔드 — 전사(비전)와 번역 양쪽에 쓸 수 있음.
+# 키 발급: https://aistudio.google.com/apikey (GEMINI_API_KEY 환경변수 지원)
+# ※Gemini 전사는 1회 전사(합의 검증 없음) — 정확도는 Claude 합의 구조 아래.
+# 번역 모드 조합: 전사 엔진 gemini + 번역 엔진 gemini → 전사+번역 한 요청,
+# 번역 엔진이 claude/ollama면 Gemini는 원문 전사만 하고 번역은 해당 백엔드
+# (저가 비전 전사 + 고품질 번역 분리 조합 — transcribe_gemini_route 참조).
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
+GEMINI_TIMEOUT = 180
+
+# DeepSeek (OpenAI 호환) — 전사용 초저가 대안. 키: platform.deepseek.com
+# ※2026-07 현재 공식 API의 이미지 입력 지원이 막 열리는 중 — 거부되면
+#   'DeepSeek URL'을 비전 지원 OpenAI 호환 서버(DeepInfra deepseek-ocr,
+#   Qwen DashScope 등)로 바꾸고 그쪽 키·모델명을 쓰면 된다.
+DEEPSEEK_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
+
+
+# ---------------------------------------------------------------------------
+# API 사용량·요금 집계 — 파트(전사/검증/번역)별 토큰과 예상 요금
+# ---------------------------------------------------------------------------
+# 단가 ($ / 100만 토큰) — 2026-07 공시가 기준 추정용. 요금 개정 시 이 표만
+# 갱신하면 됨. 모델명 앞부분 매칭(위에서부터 먼저 걸리는 항목 우선),
+# 미등록 모델은 요금 없이 토큰만 표시.
+API_PRICES = [
+    ("claude-fable-5", 10.0, 50.0),
+    ("claude-sonnet-5", 2.0, 10.0),      # 프로모션가 (~2026-08, 이후 3/15)
+    ("claude-opus-4-8", 5.0, 25.0),
+    ("claude-opus", 15.0, 75.0),
+    ("claude-sonnet", 3.0, 15.0),
+    ("claude-haiku-4-5", 1.0, 5.0),
+    ("claude-haiku", 0.8, 4.0),
+    ("gemini-3.1-flash-lite", 0.25, 1.50),
+    ("gemini-2.5-flash-lite", 0.10, 0.40),
+    ("gemini-3.5-flash", 1.50, 9.00),    # 주의: lite보다 6배 비쌈
+    ("deepseek-v4-flash", 0.14, 0.28),   # 캐시 미스 기준 (히트 시 더 쌈)
+    ("deepseek-v4-pro", 0.435, 0.87),
+    ("ollama:", 0.0, 0.0),               # 로컬 — 무료
+]
+
+_API_USAGE: dict = {}   # (part, model) -> {calls, in, out, cost}
+
+
+def _price_for(model: str):
+    m = (model or "").lower()
+    for prefix, pin, pout in API_PRICES:
+        if m.startswith(prefix):
+            return pin, pout
+    return None
+
+
+def track_usage(part: str, model: str, in_tok, out_tok,
+                batch: bool = False) -> None:
+    """API 호출 1건의 토큰 사용량 기록 (batch=True면 50% 할인 적용)."""
+    key = (part, model or "?")
+    u = _API_USAGE.setdefault(key, {"calls": 0, "in": 0, "out": 0,
+                                    "cost": None})
+    i, o = int(in_tok or 0), int(out_tok or 0)
+    u["calls"] += 1
+    u["in"] += i
+    u["out"] += o
+    p = _price_for(model)
+    if p is not None:
+        disc = 0.5 if batch else 1.0
+        u["cost"] = (u["cost"] or 0.0) + (i * p[0] + o * p[1]) / 1e6 * disc
+
+
+def usage_summary(reset: bool = True) -> str:
+    """이번 실행에서 쌓인 파트별 API 사용량·예상 요금 요약 문자열.
+
+    호출이 없었으면 빈 문자열. reset=True(기본)면 집계 초기화 —
+    실행 단위(전체/샘플/검수 적용)마다 새로 셈."""
+    if not _API_USAGE:
+        return ""
+    lines = ["API 사용량·예상 요금 (이번 실행):"]
+    total, unknown = 0.0, False
+    for (part, model), u in _API_USAGE.items():
+        if u["cost"] is None:
+            unknown = True
+            cost_s = "단가 미등록"
+        elif u["cost"] == 0.0:
+            cost_s = "무료(로컬)"
+        else:
+            total += u["cost"]
+            cost_s = f"${u['cost']:.4f}"
+        lines.append(f"  · {part} [{model}] — {u['calls']}회, "
+                     f"입력 {u['in']:,} / 출력 {u['out']:,} 토큰 → {cost_s}")
+    tail = " + 미등록 모델분" if unknown else ""
+    lines.append(f"  합계 ≈ ${total:.4f}{tail} "
+                 f"(공시 단가 기준 추정 — 실제 청구액은 콘솔에서 확인)")
+    if reset:
+        _API_USAGE.clear()
+    return "\n".join(lines)
+
+
+def _gemini_key(args=None) -> str:
+    return ((getattr(args, "gemini_key", None) if args is not None else None)
+            or os.environ.get("GEMINI_API_KEY") or "").strip()
+
+
+def _deepseek_key(args=None) -> str:
+    return ((getattr(args, "deepseek_key", None)
+             if args is not None else None)
+            or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+
+
+def _load_glossary(args, out_dir=None) -> str:
+    """용어집 텍스트 로드 — --glossary 경로 우선, 없으면 출력폴더/_glossary.txt.
+
+    형식 자유(한 줄에 '원어 = 한글 표기' 권장). 등장인물 이름·말투 규칙을
+    적어두면 챕터가 넘어가도 번역 일관성이 유지된다."""
+    cands = []
+    gp = getattr(args, "glossary", None)
+    if gp:
+        cands.append(Path(gp))
+    if out_dir is not None:
+        cands.append(Path(out_dir) / "_glossary.txt")
+    for c in cands:
+        try:
+            if c.exists():
+                t = c.read_text(encoding="utf-8").strip()
+                if t:
+                    return t
+        except Exception:
+            pass
+    return ""
+
+
+def xlat_cfg(args, out_dir=None) -> Optional[dict]:
+    """번역 모드 설정 — source_lang이 ko(기본)면 None(기존 한글 복원)."""
+    sl = (getattr(args, "source_lang", "ko") or "ko").lower()
+    if sl == "ko":
+        return None
+    g = _load_glossary(args, out_dir)
+    gloss = ("\n용어집·표기 규칙 (반드시 따를 것):\n" + g + "\n") if g else ""
+    return {"lang": sl, "name": SRC_LANG_NAMES.get(sl, sl), "gloss": gloss,
+            # 텍스트 번역 백엔드 (translate_texts에서 사용 — local-ocr 전용)
+            "backend": (getattr(args, "translate_backend", "claude")
+                        or "claude").lower(),
+            "ollama_model": (getattr(args, "ollama_model", None)
+                             or OLLAMA_MODEL),
+            "ollama_url": ((getattr(args, "ollama_url", None)
+                            or OLLAMA_URL).rstrip("/")),
+            "gemini_model": (getattr(args, "gemini_model", None)
+                             or GEMINI_MODEL),
+            "gemini_key": _gemini_key(args)}
+
+
+def needs_api_key(args) -> bool:
+    """이 설정으로 실행 시 ANTHROPIC_API_KEY가 필요한지 판정 (앱과 공용).
+
+    Claude vision 전사면 항상 필요. 로컬 OCR 경로는 번역 호출만 남는데,
+    번역 백엔드가 Ollama면 키 없이 완전 로컬로 동작한다."""
+    sl = (getattr(args, "source_lang", "ko") or "ko").lower()
+    eng = getattr(args, "ocr_engine", "claude")
+    # 번역 local-ocr 모드: 엔진이 claude(기본)면 tesseract로 자동 대체
+    # (process_page와 동일 규칙 — 실제 실행 경로 기준으로 판정)
+    if sl != "ko" and getattr(args, "translate_mode", "vision") \
+            == "local-ocr" and eng == "claude":
+        eng = "tesseract"
+    if eng == "claude":
+        return True
+    # gemini/로컬 OCR 전사: 번역 모드에서 번역 백엔드가 claude(기본)일
+    # 때만 번역 호출에 anthropic 키 필요 (gemini+gemini 통합은 불필요)
+    return sl != "ko" and (getattr(args, "translate_backend", "claude")
+                           or "claude").lower() == "claude"
+
+
+def needs_gemini_key(args) -> bool:
+    """이 설정으로 실행 시 GEMINI_API_KEY(또는 --gemini-key)가 필요한지."""
+    sl = (getattr(args, "source_lang", "ko") or "ko").lower()
+    if getattr(args, "ocr_engine", "claude") == "gemini":
+        return True
+    return sl != "ko" and (getattr(args, "translate_backend", "claude")
+                           or "claude").lower() == "gemini"
+
+
+def needs_deepseek_key(args) -> bool:
+    """이 설정으로 실행 시 DEEPSEEK_API_KEY(또는 --deepseek-key)가 필요한지."""
+    return getattr(args, "ocr_engine", "claude") == "deepseek"
+
+
+def parse_page_range(spec) -> Optional[tuple]:
+    """페이지 범위 문자열 파싱 — '5-20'/'5-'/'-20'/'7' → (start, end).
+
+    1부터 세는 양끝 포함 범위 (파일 정렬 순서 기준). 빈 값이면 None(전체).
+    '~'도 '-'로 인식. 형식이 틀리면 ValueError."""
+    s = str(spec or "").strip().replace("~", "-")
+    if not s:
+        return None
+    try:
+        if "-" in s:
+            a, _, b = s.partition("-")
+            if not a.strip() and not b.strip():   # '-' 단독은 오타로 간주
+                raise ValueError(s)
+            start = int(a) if a.strip() else 1
+            end = int(b) if b.strip() else 10 ** 9
+        else:
+            start = end = int(s)
+    except ValueError:
+        raise ValueError(f"잘못된 페이지 범위: '{spec}' — "
+                         "예: 5-20, 5-, -20, 7")
+    if start < 1 or end < start:
+        raise ValueError(f"잘못된 페이지 범위: '{spec}' — "
+                         "시작은 1 이상, 끝은 시작 이상이어야 합니다")
+    return start, end
+
+
+def apply_page_range(files: list, spec) -> list:
+    """정렬된 파일 목록에서 페이지 범위만 잘라냄 (spec 비면 그대로)."""
+    pr = parse_page_range(spec)
+    return files if pr is None else files[pr[0] - 1: pr[1]]
+
+
 def crop_bubble(img_bgr: np.ndarray, b: Bubble, pad: int = 12) -> np.ndarray:
     x, y, w, h = b.bbox
     H, W = img_bgr.shape[:2]
@@ -263,19 +564,139 @@ def crop_bubble(img_bgr: np.ndarray, b: Bubble, pad: int = 12) -> np.ndarray:
     return c
 
 
+# 폰트에 글리프가 없어 ☒(tofu)로 찍히는 특수 공백/제어문자 정규화.
+# 모델이 NBSP(U+00A0) 등을 일반 공백 자리에 섞어 보내는 경우가 있음.
+# 전각 공백(U+3000)은 수동 들여쓰기 용도로 보존.
+_WS_TO_SPACE = dict.fromkeys(map(ord,
+    "\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
+    "\u2006\u2007\u2008\u2009\u200a\u202f\u205f"), " ")
+_WS_TO_DROP = dict.fromkeys(map(ord,
+    "\u200b\u200c\u200d\u200e\u200f\u2060\u2061\u2062"
+    "\u2063\ufeff\u00ad"), None)
+
+
+def _clean_ws(t):
+    """비표준 공백 → 일반 공백, 폭 0 문자 제거 (문자열 외 타입은 그대로)."""
+    if not isinstance(t, str):
+        return t
+    return t.translate(_WS_TO_SPACE).translate(_WS_TO_DROP)
+
+
 def _parse_json_reply(raw: str) -> list[dict]:
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.strip("`").lstrip("json").strip()
-    return json.loads(raw)
+    out = json.loads(raw)
+    if isinstance(out, list):   # 전사/번역 텍스트의 특수 공백 정규화
+        for it in out:
+            if isinstance(it, dict):
+                for k in ("text", "src"):
+                    if isinstance(it.get(k), str):
+                        it[k] = _clean_ws(it[k])
+    return out
 
 
 def _call_claude(client, model: str, content: list, temperature: float,
-                 max_tokens: int = 4000) -> list[dict]:
+                 max_tokens: int = 4000, part: str = "기타") -> list[dict]:
     msg = client.messages.create(
         model=model, max_tokens=max_tokens, temperature=temperature,
         messages=[{"role": "user", "content": content}])
+    u = getattr(msg, "usage", None)
+    track_usage(part, model, getattr(u, "input_tokens", 0),
+                getattr(u, "output_tokens", 0))
+    if not msg.content:   # 빈 응답 — IndexError 대신 원인 있는 오류로
+        raise RuntimeError(
+            f"빈 응답 (stop_reason={getattr(msg, 'stop_reason', None)})")
     return _parse_json_reply(msg.content[0].text)
+
+
+def _call_ollama(xlat: dict, prompt: str,
+                 temperature: float = 0.0) -> list[dict]:
+    """Ollama 로컬 서버로 텍스트 요청 1건 (OpenAI 호환 API, 표준lib만 사용).
+
+    qwen3 등 reasoning 모델의 <think> 블록 제거 + JSON 배열 추출 폴백.
+    연결 실패 시 실행 안내를 담은 RuntimeError — translate_texts의
+    기존 실패 처리(원문 유지+xlat-failed)로 흘러간다."""
+    import re
+    import urllib.request
+    import urllib.error
+    url = xlat.get("ollama_url") or OLLAMA_URL
+    model = xlat.get("ollama_model") or OLLAMA_MODEL
+    body = json.dumps({
+        "model": model, "stream": False, "temperature": temperature,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{url}/v1/chat/completions", data=body,
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError as e:
+        raise RuntimeError(
+            f"Ollama 연결 실패({url}) — Ollama가 실행 중인지, "
+            f"모델을 받아뒀는지(ollama pull {model}) 확인하세요: {e}")
+    uu = data.get("usage") or {}
+    track_usage("번역", f"ollama:{model}", uu.get("prompt_tokens"),
+                uu.get("completion_tokens"))
+    raw = (data.get("choices") or [{}])[0].get("message", {}).get(
+        "content") or ""
+    # reasoning 모델의 사고 블록 제거 (닫는 태그 없이 끊긴 경우 포함)
+    raw = re.sub(r"<think>.*?(</think>|$)", "", raw, flags=re.S).strip()
+    try:
+        return _parse_json_reply(raw)
+    except Exception:
+        # 로컬 모델은 JSON 앞뒤에 잡담을 붙이기도 함 — 배열 부분만 추출
+        s, e = raw.find("["), raw.rfind("]")
+        if s != -1 and e > s:
+            return _parse_json_reply(raw[s:e + 1])
+        raise
+
+
+def _call_gemini(messages: list, model: str, key: str,
+                 temperature: float = 0.0,
+                 max_tokens: int = 4000, part: str = "기타") -> list[dict]:
+    """Gemini OpenAI 호환 API 호출 → JSON 배열 파싱 (표준lib urllib만).
+
+    401/403은 키 안내를 담아 즉시 RuntimeError — 페이지 단위 재시도로
+    흘리지 않는다. 응답 잡담·코드펜스는 배열 추출 폴백으로 흡수."""
+    import re
+    import urllib.request
+    import urllib.error
+    body = json.dumps({"model": model, "stream": False,
+                       "temperature": temperature,
+                       "max_tokens": max_tokens,
+                       "messages": messages}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{GEMINI_URL}/chat/completions", data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            detail = ""
+        hint = (" — GEMINI_API_KEY 확인 (https://aistudio.google.com/apikey)"
+                if e.code in (401, 403) else "")
+        raise RuntimeError(f"Gemini API 오류 {e.code}{hint}: {detail}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Gemini 연결 실패: {e}")
+    uu = data.get("usage") or {}
+    track_usage(part, model, uu.get("prompt_tokens"),
+                uu.get("completion_tokens"))
+    raw = ((data.get("choices") or [{}])[0].get("message", {})
+           .get("content") or "")
+    raw = re.sub(r"<think>.*?(</think>|$)", "", raw, flags=re.S).strip()
+    try:
+        return _parse_json_reply(raw)
+    except Exception:
+        s, e2 = raw.find("["), raw.rfind("]")
+        if s != -1 and e2 > s:
+            return _parse_json_reply(raw[s:e2 + 1])
+        raise
 
 
 def _img_block(c: np.ndarray) -> dict:
@@ -285,12 +706,35 @@ def _img_block(c: np.ndarray) -> dict:
         "data": base64.b64encode(buf.tobytes()).decode()}}
 
 
+def _gemini_img_block(c: np.ndarray) -> dict:
+    ok, buf = cv2.imencode(".png", c)
+    b64 = base64.b64encode(buf.tobytes()).decode()
+    return {"type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}"}}
+
+
 BATCH = 6  # 호출당 크롭 수 — 길어질수록 후반부 정확도가 떨어져 분할
 
 
+def _transcribe_prompt(n: int, xlat: Optional[dict]) -> str:
+    if xlat:
+        return PROMPT_XLAT.format(n=n, lang=xlat["name"], gloss=xlat["gloss"])
+    return PROMPT.format(n=n)
+
+
+def _verify_prompt(n: int, xlat: Optional[dict]) -> str:
+    if xlat:
+        return VERIFY_PROMPT_XLAT.format(n=n, lang=xlat["name"],
+                                         gloss=xlat["gloss"])
+    return VERIFY_PROMPT.format(n=n)
+
+
 def transcribe_claude(crops: list[np.ndarray], model: str,
-                      temperature: float = 0.0) -> list[dict]:
-    """말풍선 크롭들을 배치 분할해 전사. 결과는 crops 순서와 정렬."""
+                      temperature: float = 0.0,
+                      xlat: Optional[dict] = None) -> list[dict]:
+    """말풍선 크롭들을 배치 분할해 전사. 결과는 crops 순서와 정렬.
+
+    xlat 지정 시 번역 모드 — 원문 전사(src)+한국어 번역(text)을 한 요청에."""
     import anthropic
     client = anthropic.Anthropic()  # ANTHROPIC_API_KEY 환경변수 사용
     out: list[dict] = []
@@ -300,8 +744,10 @@ def transcribe_claude(crops: list[np.ndarray], model: str,
         for i, c in enumerate(chunk, 1):
             content.append({"type": "text", "text": f"[이미지 {i}]"})
             content.append(_img_block(c))
-        content.append({"type": "text", "text": PROMPT.format(n=len(chunk))})
-        items = _call_claude(client, model, content, temperature)
+        content.append({"type": "text",
+                        "text": _transcribe_prompt(len(chunk), xlat)})
+        items = _call_claude(client, model, content, temperature,
+                             part="전사+번역" if xlat else "전사")
         by_id = {int(it["id"]): it for it in items}
         out += [by_id.get(i, {"text": None, "kind": "none",
                               "confidence": "low"})
@@ -309,12 +755,203 @@ def transcribe_claude(crops: list[np.ndarray], model: str,
     return out
 
 
+def transcribe_gemini(crops: list[np.ndarray], model: str, key: str,
+                      temperature: float = 0.0,
+                      xlat: Optional[dict] = None,
+                      src_only: bool = False) -> list[dict]:
+    """Gemini 비전 전사 — Claude와 동일 프롬프트, 배치 분할도 동일.
+
+    저가 대안: 1회 전사만 수행(합의·검증 없음) → 확신도는 모델 자가 보고.
+    id 누락 응답은 순서 기준 매칭 폴백.
+    src_only=True(번역 모드 분리 조합): 원문 전사만 수행(text=원어) —
+    번역은 이후 translate_texts()가 설정된 백엔드(Claude 등)로 처리."""
+    split = bool(src_only and xlat)
+    part = "전사" if (split or not xlat) else "전사+번역"
+    out: list[dict] = []
+    for s in range(0, len(crops), BATCH):
+        chunk = crops[s:s + BATCH]
+        content = []
+        for i, c in enumerate(chunk, 1):
+            content.append({"type": "text", "text": f"[이미지 {i}]"})
+            content.append(_gemini_img_block(c))
+        content.append({"type": "text",
+                        "text": (PROMPT_XLAT_SRC.format(n=len(chunk),
+                                                        lang=xlat["name"])
+                                 if split
+                                 else _transcribe_prompt(len(chunk), xlat))})
+        items = _call_gemini([{"role": "user", "content": content}],
+                             model, key, temperature, part=part)
+        by_id = {}
+        for n, it in enumerate(items, 1):
+            if not isinstance(it, dict):
+                continue
+            try:
+                by_id[int(it.get("id", n))] = it
+            except (TypeError, ValueError):
+                by_id[n] = it
+        for i in range(1, len(chunk) + 1):
+            r = by_id.get(i, {"text": None, "kind": "none",
+                              "confidence": "low"})
+            if src_only and r.get("src"):
+                # 지시를 어기고 XLAT식(src+번역)으로 응답한 경우 —
+                # 원문만 취하고 번역은 버림 (별도 백엔드가 재번역)
+                r["text"] = r.pop("src")
+            r.setdefault("passes", "gemini")
+            out.append(r)
+    return out
+
+
+def transcribe_gemini_route(crops: list[np.ndarray], args,
+                            xl: Optional[dict]) -> list[dict]:
+    """Gemini 전사 엔진의 공용 경로 (process_page·검수 적용 양쪽에서 사용).
+
+    번역 모드에서 번역 백엔드가 gemini면 전사+번역을 한 요청으로(통합,
+    요청 수 최소), 아니면 Gemini는 원문 전사만 하고 translate_texts()가
+    설정된 백엔드(Claude/Ollama)로 번역 — 저가 비전 전사 + 고품질 번역
+    분리 조합. 한글 복원 모드(xl=None)는 기존 그대로 전사만."""
+    model = getattr(args, "gemini_model", None) or GEMINI_MODEL
+    key = _gemini_key(args)
+    if xl and (xl.get("backend") or "claude") != "gemini":
+        results = transcribe_gemini(crops, model, key, xlat=xl,
+                                    src_only=True)
+        translate_texts(results, xl, args.model)
+        return results
+    return transcribe_gemini(crops, model, key, xlat=xl)
+
+
+def _call_deepseek(messages: list, model: str, key: str, url: str,
+                   temperature: float = 0.0,
+                   max_tokens: int = 4000, part: str = "기타") -> list[dict]:
+    """DeepSeek(또는 임의 OpenAI 호환 서버) 호출 → JSON 배열 파싱.
+
+    _call_gemini와 동일 구조 — base URL만 교체 가능 (이북앱과 동일 방식).
+    401/403은 키 안내를 담아 즉시 RuntimeError."""
+    import re
+    import urllib.request
+    import urllib.error
+    body = json.dumps({"model": model, "stream": False,
+                       "temperature": temperature,
+                       "max_tokens": max_tokens,
+                       "messages": messages}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{(url or DEEPSEEK_URL).rstrip('/')}/chat/completions", data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            detail = ""
+        if e.code in (401, 403):
+            host = (url or DEEPSEEK_URL)
+            if "deepseek.com" in host:
+                hint = (" — DeepSeek API 키 확인 "
+                        "(https://platform.deepseek.com)")
+            elif "deepinfra.com" in host:
+                hint = (" — 이 서버는 DeepInfra 키가 필요합니다 "
+                        "(https://deepinfra.com 발급 — 공식 DeepSeek 키는 "
+                        "여기서 안 됩니다)")
+            else:
+                hint = (f" — 입력한 키가 {host} 서버에서 발급된 키인지 "
+                        "확인하세요 (서버마다 키가 다릅니다)")
+        else:
+            hint = ""
+        if e.code == 400 and "image" in detail.lower():
+            hint = (" — 이 서버가 이미지 입력을 지원하지 않는 것 같습니다. "
+                    "'DeepSeek URL'을 비전 지원 OpenAI 호환 서버로 바꾸고 "
+                    "그쪽 키·모델명을 쓰세요")
+        raise RuntimeError(f"DeepSeek API 오류 {e.code}{hint}: {detail}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"DeepSeek 연결 실패: {e}")
+    uu = data.get("usage") or {}
+    track_usage(part, model, uu.get("prompt_tokens"),
+                uu.get("completion_tokens"))
+    raw = ((data.get("choices") or [{}])[0].get("message", {})
+           .get("content") or "")
+    raw = re.sub(r"<think>.*?(</think>|$)", "", raw, flags=re.S).strip()
+    try:
+        return _parse_json_reply(raw)
+    except Exception:
+        s, e2 = raw.find("["), raw.rfind("]")
+        if s != -1 and e2 > s:
+            return _parse_json_reply(raw[s:e2 + 1])
+        raise
+
+
+def transcribe_deepseek(crops: list[np.ndarray], model: str, key: str,
+                        url: str = "", temperature: float = 0.0,
+                        xlat: Optional[dict] = None,
+                        src_only: bool = False) -> list[dict]:
+    """DeepSeek 비전 전사 — transcribe_gemini와 동일 구조 (초저가 대안).
+
+    1회 전사만 수행(합의·검증 없음), OpenAI 호환이라 URL 교체 가능.
+    src_only=True: 원문 전사만 — 번역은 translate_texts()가 설정된
+    백엔드(Claude/Gemini/Ollama)로 분리 수행."""
+    split = bool(src_only and xlat)
+    part = "전사" if (split or not xlat) else "전사+번역"
+    out: list[dict] = []
+    for s in range(0, len(crops), BATCH):
+        chunk = crops[s:s + BATCH]
+        content = []
+        for i, c in enumerate(chunk, 1):
+            content.append({"type": "text", "text": f"[이미지 {i}]"})
+            content.append(_gemini_img_block(c))   # OpenAI 호환 공통 포맷
+        content.append({"type": "text",
+                        "text": (PROMPT_XLAT_SRC.format(n=len(chunk),
+                                                        lang=xlat["name"])
+                                 if split
+                                 else _transcribe_prompt(len(chunk), xlat))})
+        items = _call_deepseek([{"role": "user", "content": content}],
+                               model, key, url, temperature, part=part)
+        by_id = {}
+        for n, it in enumerate(items, 1):
+            if not isinstance(it, dict):
+                continue
+            try:
+                by_id[int(it.get("id", n))] = it
+            except (TypeError, ValueError):
+                by_id[n] = it
+        for i in range(1, len(chunk) + 1):
+            r = by_id.get(i, {"text": None, "kind": "none",
+                              "confidence": "low"})
+            if src_only and r.get("src"):
+                r["text"] = r.pop("src")
+            r.setdefault("passes", "deepseek")
+            out.append(r)
+    return out
+
+
+def transcribe_deepseek_route(crops: list[np.ndarray], args,
+                              xl: Optional[dict]) -> list[dict]:
+    """DeepSeek 전사 엔진 공용 경로 — 번역 모드면 원문 전사만 하고
+    번역은 설정된 번역 백엔드(Claude/Gemini/Ollama)로 분리 수행."""
+    model = getattr(args, "deepseek_model", None) or DEEPSEEK_MODEL
+    key = _deepseek_key(args)
+    url = getattr(args, "deepseek_url", None) or DEEPSEEK_URL
+    if xl:
+        results = transcribe_deepseek(crops, model, key, url, xlat=xl,
+                                      src_only=True)
+        translate_texts(results, xl, args.model)
+        return results
+    return transcribe_deepseek(crops, model, key, url)
+
+
 def _norm_text(t) -> str:
     return "\n".join(ln.strip() for ln in (t or "").strip().splitlines())
 
 
+def _agree_key(r: dict, xlat: Optional[dict]) -> str:
+    """합의 비교 기준 텍스트 — 번역 모드에선 원문(src) 기준.
+
+    번역문(text)은 표현 차이로 패스마다 달라질 수 있어 비교 대상이 아님."""
+    return _norm_text(r.get("src") if xlat else r.get("text"))
+
+
 def verify_claude(crops: list[np.ndarray], cand_pairs: list[tuple],
-                  model: str) -> list[dict]:
+                  model: str, xlat: Optional[dict] = None) -> list[dict]:
     """불일치/비확신 크롭들을 후보와 함께 재판독(3차 대조)."""
     import anthropic
     client = anthropic.Anthropic()
@@ -331,8 +968,9 @@ def verify_claude(crops: list[np.ndarray], cand_pairs: list[tuple],
                 cand += f"\n후보B: {json.dumps(b, ensure_ascii=False)}"
             content.append({"type": "text", "text": cand})
         content.append({"type": "text",
-                        "text": VERIFY_PROMPT.format(n=len(chunk))})
-        items = _call_claude(client, model, content, temperature=0.0)
+                        "text": _verify_prompt(len(chunk), xlat)})
+        items = _call_claude(client, model, content, temperature=0.0,
+                             part="검증")
         by_id = {int(it["id"]): it for it in items}
         out += [by_id.get(i, {"text": None, "kind": "none",
                               "confidence": "low"})
@@ -340,15 +978,17 @@ def verify_claude(crops: list[np.ndarray], cand_pairs: list[tuple],
     return out
 
 
-def transcribe_consensus(crops: list[np.ndarray], model: str) -> list[dict]:
+def transcribe_consensus(crops: list[np.ndarray], model: str,
+                         xlat: Optional[dict] = None) -> list[dict]:
     """이중 전사 → 일치 채택, 불일치·비확신만 3차 대조 검증.
 
     반환 dict에 meta 필드 추가: passes(agree/adjudicated/single),
     alt(채택 안 된 후보), fixed(검증에서 고친 내용).
+    번역 모드(xlat)에선 원문(src) 일치 여부로 합의를 판정한다.
     """
-    r1 = transcribe_claude(crops, model, temperature=0.0)
+    r1 = transcribe_claude(crops, model, temperature=0.0, xlat=xlat)
     try:
-        r2 = transcribe_claude(crops, model, temperature=0.5)
+        r2 = transcribe_claude(crops, model, temperature=0.5, xlat=xlat)
     except Exception as e:
         print(f"    !! 2차 전사 실패({e}) — 1차 결과만 사용")
         for r in r1:
@@ -360,7 +1000,7 @@ def transcribe_consensus(crops: list[np.ndarray], model: str) -> list[dict]:
     final: list[dict] = list(r1)
     need_idx: list[int] = []
     for i, (a, b) in enumerate(zip(r1, r2)):
-        agree = (_norm_text(a.get("text")) == _norm_text(b.get("text"))
+        agree = (_agree_key(a, xlat) == _agree_key(b, xlat)
                  and a.get("kind") == b.get("kind"))
         no_text = not (a.get("text") or "").strip() \
             and not (b.get("text") or "").strip()
@@ -377,9 +1017,9 @@ def transcribe_consensus(crops: list[np.ndarray], model: str) -> list[dict]:
         try:
             fixed = verify_claude(
                 [crops[i] for i in need_idx],
-                [(r1[i], None if _norm_text(r1[i].get("text"))
-                  == _norm_text(r2[i].get("text")) else r2[i])
-                 for i in need_idx], model)
+                [(r1[i], None if _agree_key(r1[i], xlat)
+                  == _agree_key(r2[i], xlat) else r2[i])
+                 for i in need_idx], model, xlat=xlat)
             for i, f in zip(need_idx, fixed):
                 f["passes"] = "adjudicated"
                 f["alt"] = {"pass1": r1[i].get("text"),
@@ -434,7 +1074,38 @@ _TESS_GUIDE = (
     "앱이 자동 감지합니다")
 
 
-def _ocr_tesseract(img_bgr: np.ndarray) -> tuple[str, float]:
+def _tessdata_dir(lang: str) -> Optional[Path]:
+    """앱 폴더 tessdata\\에 해당 언어 데이터가 있으면 그 폴더 경로.
+
+    Tesseract 설치 폴더(Program Files — 관리자 권한 필요)를 건드리지
+    않고도 파이프라인 옆 tessdata\\{lang}.traineddata 만으로 언어 추가
+    가능. 없으면 None → 시스템 기본 경로 사용."""
+    cands = [Path(__file__).parent / "tessdata"]
+    if getattr(sys, "frozen", False):   # PyInstaller exe는 실행 파일 기준
+        cands.insert(0, Path(sys.executable).parent / "tessdata")
+    for d in cands:
+        try:
+            if (d / f"{lang}.traineddata").exists():
+                return d
+        except OSError:
+            pass
+    return None
+
+
+def _tess_config(lang: str) -> str:
+    """--tessdata-dir 인자 문자열 (앱 폴더 tessdata 있을 때만).
+
+    ★따옴표 금지: pytesseract는 Windows에서 shlex.split(posix=False)로
+    config를 쪼개므로 따옴표가 인자에 문자 그대로 남아 '존재하지 않는
+    경로'가 된다 (실기기에서 deu 미인식 원인이었음). 공백 포함 경로는
+    여기선 못 다루고 _ocr_tesseract의 TESSDATA_PREFIX 환경변수가 커버."""
+    d = _tessdata_dir(lang)
+    if d and " " not in str(d):
+        return f"--tessdata-dir {d}"
+    return ""
+
+
+def _ocr_tesseract(img_bgr: np.ndarray, lang: str = "kor") -> tuple[str, float]:
     import shutil
     import pytesseract
     if not shutil.which("tesseract"):
@@ -446,20 +1117,34 @@ def _ocr_tesseract(img_bgr: np.ndarray) -> tuple[str, float]:
     g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     g = cv2.resize(g, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
     _, bw = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    cfg = ("--psm 6 " + _tess_config(lang)).strip()
+    # 공백 포함 경로 등 --tessdata-dir로 못 넘기는 경우 대비 이중 안전망:
+    # 호출 동안만 TESSDATA_PREFIX 지정 (finally에서 원상 복구)
+    td = _tessdata_dir(lang)
+    prev = os.environ.get("TESSDATA_PREFIX")
+    if td:
+        os.environ["TESSDATA_PREFIX"] = str(td)
     try:
-        d = pytesseract.image_to_data(bw, lang="kor", config="--psm 6",
+        d = pytesseract.image_to_data(bw, lang=lang, config=cfg,
                                       output_type=pytesseract.Output.DICT)
     except pytesseract.TesseractNotFoundError:
         raise RuntimeError(_TESS_GUIDE)
     except pytesseract.TesseractError as e:
-        if "kor" in str(e).lower() or "language" in str(e).lower():
+        if lang in str(e).lower() or "language" in str(e).lower():
             raise RuntimeError(
-                "Tesseract 한국어(kor) 데이터가 없습니다. 설치 프로그램을 "
-                "다시 실행해 'Additional language data'에서 Korean을 "
-                "추가하거나, kor.traineddata를 tessdata 폴더에 넣으세요.\n"
+                f"Tesseract '{lang}' 언어 데이터가 없습니다. "
+                f"{lang}.traineddata 를 받아 앱 폴더의 tessdata\\ 안에 "
+                "넣거나(권장 — 관리자 권한 불필요), 설치 프로그램을 다시 "
+                "실행해 'Additional language data'에서 추가하세요.\n"
                 "https://github.com/tesseract-ocr/tessdata_best/raw/main/"
-                "kor.traineddata")
+                f"{lang}.traineddata")
         raise
+    finally:   # TESSDATA_PREFIX 원상 복구 (다른 언어의 시스템 경로 보호)
+        if td:
+            if prev is None:
+                os.environ.pop("TESSDATA_PREFIX", None)
+            else:
+                os.environ["TESSDATA_PREFIX"] = prev
     lines: dict = {}
     confs = []
     for i, w in enumerate(d["text"]):
@@ -478,15 +1163,16 @@ def _ocr_tesseract(img_bgr: np.ndarray) -> tuple[str, float]:
     return text, (sum(confs) / len(confs) if confs else 0.0)
 
 
-_EASYOCR_READER = None
+_EASYOCR_READERS: dict = {}
 
 
-def _ocr_easyocr(img_bgr: np.ndarray) -> tuple[str, float]:
-    global _EASYOCR_READER
+def _ocr_easyocr(img_bgr: np.ndarray, lang: str = "ko") -> tuple[str, float]:
     import easyocr
-    if _EASYOCR_READER is None:
-        _EASYOCR_READER = easyocr.Reader(["ko"], gpu=False, verbose=False)
-    res = _EASYOCR_READER.readtext(img_bgr)
+    reader = _EASYOCR_READERS.get(lang)
+    if reader is None:
+        reader = easyocr.Reader([lang], gpu=False, verbose=False)
+        _EASYOCR_READERS[lang] = reader
+    res = reader.readtext(img_bgr)
     items = sorted(res, key=lambda r: (min(p[1] for p in r[0]),
                                        min(p[0] for p in r[0])))
     lines, cur, confs = [], [], []
@@ -505,9 +1191,9 @@ def _ocr_easyocr(img_bgr: np.ndarray) -> tuple[str, float]:
     return "\n".join(lines), (sum(confs) / len(confs) if confs else 0.0)
 
 
-def _ocr_windows(img_bgr: np.ndarray) -> tuple[str, float]:
+def _ocr_windows(img_bgr: np.ndarray, lang: str = "ko") -> tuple[str, float]:
     import winocr
-    r = winocr.recognize_cv2_sync(img_bgr, "ko")
+    r = winocr.recognize_cv2_sync(img_bgr, lang)
     lines = (getattr(r, "lines", None)
              or (r.get("lines") if isinstance(r, dict) else None) or [])
     parts = []
@@ -532,24 +1218,31 @@ _OCR_HINTS = {
 }
 
 
-def transcribe_local(crops: list[np.ndarray], engine: str) -> list[dict]:
+def transcribe_local(crops: list[np.ndarray], engine: str,
+                     lang: str = "ko") -> list[dict]:
     """로컬 OCR 엔진 전사 — API 비용 0.
 
-    한계: kind 분류 불가(한글 있으면 전부 dialogue) → 손글씨·효과음
-    보존 판단이 없으므로 결과를 검수 페이지에서 꼭 확인할 것."""
+    한계: kind 분류 불가(글자 있으면 전부 dialogue) → 손글씨·효과음
+    보존 판단이 없으므로 결과를 검수 페이지에서 꼭 확인할 것.
+    lang: ko(기본)/de/en/ja — 엔진별 언어 코드로 매핑."""
     fn = {"tesseract": _ocr_tesseract, "easyocr": _ocr_easyocr,
           "windows": _ocr_windows}.get(engine)
     if fn is None:
         raise RuntimeError(f"알 수 없는 OCR 엔진: {engine}")
+    codes = _OCR_LANG_CODES.get(lang, _OCR_LANG_CODES["ko"])
+    code = {"tesseract": codes[0], "easyocr": codes[1],
+            "windows": codes[2]}[engine]
+    valid = (_has_hangul_text if lang == "ko"
+             else lambda s: any(ch.isalpha() for ch in s))
     out = []
     for c in crops:
         try:
-            text, conf = fn(c)
+            text, conf = fn(c, code)
         except ImportError:
             raise RuntimeError(
                 f"{engine} OCR 사용 불가 — {_OCR_HINTS.get(engine, '')}")
         text = (text or "").strip()
-        if not text or not _has_hangul_text(text):
+        if not text or not valid(text):
             out.append({"text": None, "kind": "none", "confidence": "low",
                         "passes": f"ocr-{engine}"})
         else:
@@ -557,6 +1250,69 @@ def transcribe_local(crops: list[np.ndarray], engine: str) -> list[dict]:
                         "confidence": _ocr_confidence(conf),
                         "passes": f"ocr-{engine}"})
     return out
+
+
+def translate_texts(results: list[dict], xlat: dict, model: str) -> None:
+    """로컬 OCR 결과(원어 text)를 페이지 단위 한 요청으로 한국어 번역.
+
+    페이지 전체 대사를 읽기 순서대로 한 문맥에 넣어 번역 일관성(말투·
+    지시어)을 확보한다. 이미지 없이 텍스트만 보내므로 vision 대비 저렴.
+    xlat["backend"]가 ollama면 로컬 Ollama 서버 사용 (API 키·비용 0).
+    results를 제자리 수정: src=원어 원문, text=한국어 번역."""
+    todo = [(i, r) for i, r in enumerate(results)
+            if (r.get("text") or "").strip()]
+    if not todo:
+        return
+    listing = "\n\n".join(f"[{n}]\n{r['text']}"
+                          for n, (_, r) in enumerate(todo, 1))
+    prompt = TRANSLATE_PROMPT.format(lang=xlat["name"], gloss=xlat["gloss"])
+    def _invoke() -> list[dict]:
+        if (xlat.get("backend") or "claude") == "ollama":
+            return _call_ollama(xlat, f"{listing}\n\n{prompt}")
+        if xlat.get("backend") == "gemini":
+            return _call_gemini(
+                [{"role": "user", "content": f"{listing}\n\n{prompt}"}],
+                xlat.get("gemini_model") or GEMINI_MODEL,
+                xlat.get("gemini_key") or "", max_tokens=8000, part="번역")
+        import anthropic
+        client = anthropic.Anthropic()
+        content = [{"type": "text", "text": listing},
+                   {"type": "text", "text": prompt}]
+        # 말풍선 많은 페이지(30개+)는 4000 토큰으로 잘릴 수 있어 상향
+        return _call_claude(client, model, content, temperature=0.0,
+                            max_tokens=8000, part="번역")
+
+    try:
+        try:
+            items = _invoke()
+        except Exception as e1:   # 빈 응답·잘림 등 일시 오류 — 1회 재시도
+            print(f"    .. 번역 1차 실패({e1}) — 재시도")
+            items = _invoke()
+        by_id = {int(it.get("id", 0)): it for it in items
+                 if isinstance(it, dict)}
+        if len(by_id) < len(todo) and len(items) == len(todo):
+            # id 누락·중복 응답(로컬 모델에서 간혹) — 순서 기준 매칭 폴백
+            by_id = {n: it for n, it in enumerate(items, 1)
+                     if isinstance(it, dict)}
+    except Exception as e:
+        print(f"    !! 번역 실패({e}) — 원문 유지, 확신도 강등")
+        for _, r in todo:
+            r["src"] = r["text"]
+            if r.get("confidence") == "high":
+                r["confidence"] = "medium"
+            r["passes"] = f"{r.get('passes') or 'ocr'}+xlat-failed"
+        return
+    for n, (_, r) in enumerate(todo, 1):
+        r["src"] = r["text"]
+        tr = by_id.get(n) or {}
+        tv = (tr.get("text") or "").strip()
+        if tv:
+            r["text"] = tv
+        else:   # 번역 누락 — 원문 노출 방지 위해 보류 처리
+            r["text"] = None
+            r["kind"] = "none"
+            r["confidence"] = "low"
+        r["passes"] = f"{r.get('passes') or 'ocr'}+xlat"
 
 
 # ---------------------------------------------------------------------------
@@ -569,17 +1325,57 @@ class BatchCancelled(Exception):
     pass
 
 
-def prepare_crops(page: Path, args) -> list[np.ndarray]:
+def restore_cached(img: np.ndarray, page: Path, args,
+                   out_dir: Optional[Path]) -> tuple:
+    """restore_page 결과 디스크 캐시 — 재조판 반복(검수 적용) 속도 개선.
+
+    v2 보정(디노이즈 포함)이 페이지 처리에서 가장 무거운 단계라,
+    같은 입력·파라미터면 out/_restored/ 캐시를 재사용한다."""
+    if out_dir is None:
+        return restore_page(img, text_black=args.text_black,
+                            text_white=args.text_white,
+                            thicken=args.thicken, paper=args.paper,
+                            denoise=not args.no_denoise)
+    key = (f"{int(page.stat().st_mtime)}-{args.text_black}-"
+           f"{args.text_white}-{args.thicken}-{args.paper}-"
+           f"{int(not args.no_denoise)}")
+    cd = out_dir / "_restored"
+    rp = cd / f"{page.stem}.png"
+    wp = cd / f"{page.stem}_w.png"
+    kp = cd / f"{page.stem}.key"
+    try:
+        if rp.exists() and wp.exists() and kp.exists() \
+                and kp.read_text(encoding="utf-8") == key:
+            r = imread_unicode(rp)
+            wm = imread_unicode(wp)
+            if r is not None and wm is not None \
+                    and r.shape[:2] == img.shape[:2]:
+                return r, cv2.cvtColor(wm, cv2.COLOR_BGR2GRAY)
+    except Exception:
+        pass
+    restored, wmask = restore_page(img, text_black=args.text_black,
+                                   text_white=args.text_white,
+                                   thicken=args.thicken, paper=args.paper,
+                                   denoise=not args.no_denoise)
+    try:
+        cd.mkdir(parents=True, exist_ok=True)
+        imwrite_unicode(rp, restored)
+        imwrite_unicode(wp, wmask)
+        kp.write_text(key, encoding="utf-8")
+    except Exception:
+        pass
+    return restored, wmask
+
+
+def prepare_crops(page: Path, args,
+                  out_dir: Optional[Path] = None) -> list[np.ndarray]:
     """배치 준비용: process_page와 동일한 감지 경로로 크롭만 추출.
 
     감지는 결정적이므로 이후 process_page 재감지와 순서가 일치한다."""
     img = imread_unicode(page)
     if img is None:
         return []
-    restored, _ = restore_page(img, text_black=args.text_black,
-                               text_white=args.text_white,
-                               thicken=args.thicken, paper=args.paper,
-                               denoise=not args.no_denoise)
+    restored, _ = restore_cached(img, page, args, out_dir)
     bubbles = detect_bubbles(cv2.cvtColor(restored, cv2.COLOR_BGR2GRAY))
     return [crop_bubble(restored, b) for b in bubbles]
 
@@ -636,9 +1432,14 @@ def _batch_run(client, requests: list[dict], log, is_cancelled) -> dict:
             time.sleep(BATCH_POLL_SEC)
         for res in client.messages.batches.results(b.id):
             if res.result.type == "succeeded":
+                msg = res.result.message
+                u = getattr(msg, "usage", None)
+                track_usage("전사(배치)", getattr(msg, "model", ""),
+                            getattr(u, "input_tokens", 0),
+                            getattr(u, "output_tokens", 0), batch=True)
                 try:
                     out[res.custom_id] = _parse_json_reply(
-                        res.result.message.content[0].text)
+                        msg.content[0].text)
                 except Exception:
                     out[res.custom_id] = None
             else:
@@ -647,12 +1448,13 @@ def _batch_run(client, requests: list[dict], log, is_cancelled) -> dict:
 
 
 def transcribe_batch(pages: list[tuple], model: str, log=print,
-                     is_cancelled=None, fast: bool = False) -> dict:
+                     is_cancelled=None, fast: bool = False,
+                     xlat: Optional[dict] = None) -> dict:
     """pages: [(page_name, [crop,...]), ...] → {page_name: [entry,...]}.
 
     transcribe_consensus와 같은 합의 로직을 Batch API로 수행 (비용 50%).
     entry: id/text/kind/confidence/passes/alt/fixed/uncertain — process_page의
-    transcript 인자로 바로 사용 가능."""
+    transcript 인자로 바로 사용 가능. xlat 지정 시 번역 모드(src+한국어)."""
     import anthropic
     client = anthropic.Anthropic()
 
@@ -661,7 +1463,8 @@ def transcribe_batch(pages: list[tuple], model: str, log=print,
     for pi, (name, crops) in enumerate(pages):
         for ci, s in enumerate(range(0, len(crops), BATCH)):
             chunk = crops[s:s + BATCH]
-            content = _crops_content(chunk, PROMPT.format(n=len(chunk)))
+            content = _crops_content(chunk,
+                                     _transcribe_prompt(len(chunk), xlat))
             reqs.append(_chunk_request(f"p{pi:04d}-a-{ci:03d}", content,
                                        model, 0.0))
             if not fast:
@@ -713,7 +1516,7 @@ def transcribe_batch(pages: list[tuple], model: str, log=print,
                     r["confidence"] = "medium"
                 finals[i] = r
                 continue
-            agree = (_norm_text(a.get("text")) == _norm_text(b2.get("text"))
+            agree = (_agree_key(a, xlat) == _agree_key(b2, xlat)
                      and a.get("kind") == b2.get("kind"))
             no_text = not (a.get("text") or "").strip() \
                 and not (b2.get("text") or "").strip()
@@ -738,12 +1541,12 @@ def transcribe_batch(pages: list[tuple], model: str, log=print,
                 content.append(_img_block(crops[bi]))
                 r1i, r2i = page_r1r2[pi][0][bi], page_r1r2[pi][1][bi]
                 cand = f"후보A: {json.dumps(r1i, ensure_ascii=False)}"
-                if r2i is not None and _norm_text(r1i.get("text")) \
-                        != _norm_text(r2i.get("text")):
+                if r2i is not None and _agree_key(r1i, xlat) \
+                        != _agree_key(r2i, xlat):
                     cand += f"\n후보B: {json.dumps(r2i, ensure_ascii=False)}"
                 content.append({"type": "text", "text": cand})
             content.append({"type": "text",
-                            "text": VERIFY_PROMPT.format(n=len(idxs))})
+                            "text": _verify_prompt(len(idxs), xlat)})
             verify_reqs.append(_chunk_request(f"v{pi:04d}-{ci:03d}", content,
                                               model, 0.0))
 
@@ -875,6 +1678,11 @@ def render_line_matched(draw: ImageDraw.ImageDraw, b: Bubble, font_path: str,
     size = sizes[len(sizes) // 2]
     if size < 9:
         return False
+    # 밴드 병합 오탐 가드 — 산정 크기가 원본 글자 크기 상한(font_cap)을
+    # 크게 넘으면 글줄 밴드가 한 덩어리로 잘못 잡힌 것 (유럽 대문자
+    # 손레터링 등에서 줄 사이 공백행이 없어 발생) → 리플로 폴백이 안전
+    if b.font_cap >= 10 and size > b.font_cap * 1.5:
+        return False
     f = load_font(font_path, size, font_index)
 
     ox, oy = off
@@ -899,6 +1707,13 @@ def render_line_matched(draw: ImageDraw.ImageDraw, b: Bubble, font_path: str,
             return 0.0
         fac = _dot_factors(ln)
         return sum(a * fc for a, fc in zip(adv[:-1], fac[:-1])) + adv[-1]
+
+    # 폭 초과 사전 검사 — 최대 자간 압축(12%)으로도 원본 줄 폭을 25%
+    # 이상 넘는 줄이 있으면 원위치 정합을 포기하고 리플로 폴백 (번역문이
+    # 원문보다 길 때 말풍선 밖으로 삐져나가는 것 방지). 그리기 전에 검사.
+    for ln, (_gx, _gy, _gw, _gh) in zip(lines, line_boxes):
+        if ln and eff_width(ln) * 0.88 > _gw * 1.25 + 8:
+            return False
 
     for raw_ln, ln, (lx, ly, lw, lh) in zip(raw_lines, lines, line_boxes):
         # 줄 앞 공백(반각·전각) = 사용자 들여쓰기 → 오른쪽 이동량
@@ -1092,6 +1907,36 @@ def save_psd(path: Path, layers: list[tuple[str, np.ndarray, int, int]]) -> bool
     return True
 
 
+def boost_ink(base: np.ndarray, wmask: np.ndarray, amount: float,
+              ink_thresh: int = 160) -> tuple[np.ndarray, np.ndarray]:
+    """업스케일로 가늘어진 원본 글자 획 굵기 보강 (--ink-boost, 기본 끔).
+
+    원본 보존(preserve_bg) 모드에서 재조판하지 않은 말풍선의 원본 글자를
+    min 필터(잉크 팽창)로 amount(px)만큼 두껍게 만든다.
+      - 적용 범위: 화이트니스 마스크(말풍선·캡션) × 실제 잉크 획 주변만.
+        그림 선화·스크린톤·종이 노이즈에는 손대지 않는다 (비파괴 정책).
+      - amount 소수부는 블렌딩으로 반영 (예: 0.5 = 1px 팽창을 절반 강도로).
+    반환: (보강된 이미지, PSD용 BGRA 레이어 — 변경 영역만 알파)"""
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    n_full, frac = int(amount), amount - int(amount)
+    thick = base.copy()
+    for _ in range(n_full):
+        thick = cv2.erode(thick, k)
+    if frac > 0:
+        thick = cv2.addWeighted(thick, 1.0 - frac,
+                                cv2.erode(thick, k), frac, 0)
+    # 실제 글자 획 주변만 허용 — 종이 얼룩이 min 필터로 번지는 것 방지
+    gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
+    ink = ((gray < ink_thresh).astype(np.uint8)) * 255
+    zone = cv2.dilate(ink, k, iterations=max(1, int(np.ceil(amount))))
+    m = ((wmask.astype(np.float32) / 255.0)
+         * (zone.astype(np.float32) / 255.0))
+    out = (base.astype(np.float32) * (1.0 - m[..., None])
+           + thick.astype(np.float32) * m[..., None]).astype(np.uint8)
+    layer = np.dstack([thick, (m * 255).astype(np.uint8)])
+    return out, layer
+
+
 # ---------------------------------------------------------------------------
 # 페이지 처리
 # ---------------------------------------------------------------------------
@@ -1102,10 +1947,7 @@ def process_page(page: Path, out_dir: Path, args,
         return {"file": page.name, "status": "read_error"}
     stem = page.stem
 
-    restored, wmask = restore_page(img, text_black=args.text_black,
-                                   text_white=args.text_white,
-                                   thicken=args.thicken, paper=args.paper,
-                                   denoise=not args.no_denoise)
+    restored, wmask = restore_cached(img, page, args, out_dir)
     rgray = cv2.cvtColor(restored, cv2.COLOR_BGR2GRAY)
     bubbles = detect_bubbles(rgray)
 
@@ -1152,19 +1994,40 @@ def process_page(page: Path, out_dir: Path, args,
         else:
             crops = [crop_bubble(restored, b) for b in bubbles]
             engine = getattr(args, "ocr_engine", "claude")
-            if engine != "claude":
-                results = transcribe_local(crops, engine)
-            elif getattr(args, "fast_transcribe", False):
-                results = transcribe_claude(crops, args.model)
+            xl = xlat_cfg(args, out_dir)
+            # 번역 local-ocr 모드: 엔진이 claude(기본)면 tesseract로 대체
+            if xl and getattr(args, "translate_mode", "vision") \
+                    == "local-ocr" and engine == "claude":
+                engine = "tesseract"
+            if engine == "gemini":
+                # Gemini 비전 — 1회 전사, translate_mode와 무관하게 항상
+                # 비전 경로. 번역 백엔드가 gemini가 아니면 전사만 하고
+                # 번역은 설정된 백엔드로 분리 수행 (route 참조).
+                results = transcribe_gemini_route(crops, args, xl)
+            elif engine == "deepseek":
+                # DeepSeek 비전 — 1회 전사, 항상 비전 경로. 번역은
+                # 설정된 번역 백엔드로 분리 수행 (route 참조).
+                results = transcribe_deepseek_route(crops, args, xl)
+            elif engine != "claude":
+                results = transcribe_local(crops, engine,
+                                           lang=xl["lang"] if xl else "ko")
+                if xl:   # 페이지 전체 문맥으로 텍스트 전용 번역 (저렴)
+                    translate_texts(results, xl, args.model)
+            elif getattr(args, "fast_transcribe", False) \
+                    or (xl and not getattr(args, "translate_consensus",
+                                           False)):
+                # 번역 vision 모드 기본 1회 전사 — 가독성 좋은 원서 전제.
+                # 열화 페이지는 --translate-consensus로 합의 구조 사용.
+                results = transcribe_claude(crops, args.model, xlat=xl)
             else:
-                results = transcribe_consensus(crops, args.model)
+                results = transcribe_consensus(crops, args.model, xlat=xl)
         for b, r in zip(bubbles, results):
-            t = r.get("text") or ""
+            t = _clean_ws(r.get("text") or "")   # 구 review.json 특수공백 정화
             b.text = t if t.strip() else None   # 앞 공백 유지 (수동 들여쓰기)
             b.kind = r.get("kind", "none")
             b.confidence = r.get("confidence", "low")
             b.trans_meta = {k: r.get(k) for k in
-                            ("passes", "alt", "fixed", "uncertain",
+                            ("passes", "alt", "fixed", "uncertain", "src",
                              "manual_bbox", "region_bbox", "clean")
                             if r.get(k)}
             if r.get("font"):   # 말풍선별 폰트 오버라이드 (검수 페이지 지정)
@@ -1177,8 +2040,13 @@ def process_page(page: Path, out_dir: Path, args,
     def _retypable(b: Bubble) -> bool:
         if not b.text or not (b.confidence == "high" or not args.strict):
             return False
-        if b.kind == "dialogue":
+        if b.kind in ("dialogue", "caption", "shout"):
             return True
+        # 효과음은 기본 보존(그림에 가까움) — --retype-sfx + --sfx-font
+        # 를 함께 지정한 경우에만 재조판.
+        if b.kind == "sfx":
+            return (getattr(args, "retype_sfx", False)
+                    and bool(getattr(args, "sfx_font", None)))
         # 손글씨 대사·메모·쪽지는 기본 보존.
         # --retype-hand 와 --hand-font 를 함께 지정한 경우에만 재조판.
         return (b.kind == "hand" and args.retype_hand
@@ -1229,9 +2097,42 @@ def process_page(page: Path, out_dir: Path, args,
         clear_layer[m] = (*_paper_color(m), 255)   # 글자 주변만 정밀 지움
         b.retyped = True
 
+    # 원본 글자 영역 흰 채움 (--erase-fill PAD px, 0=끔) — 재조판 말풍선의
+    # 원본 글줄 밴드를 통째로 종이색으로 채움. 정밀 지움(흰 배경 교집합)이
+    # 놓치는 색 배경·그림 겹침 위의 원본 글자 잔영까지 제거.
+    # 보호 규칙: 밴드 경계 밖으로 이어지는 어두운 성분(말풍선 테두리·
+    # 그림 선이 밴드를 가로지르는 경우)은 칠하지 않고 남긴다.
+    erase_fill = float(getattr(args, "erase_fill", 0) or 0)
+    if erase_fill > 0:
+        rg_full = cv2.cvtColor(restored, cv2.COLOR_BGR2GRAY)
+        pad_ef = int(round(erase_fill))
+        for b in to_retype:
+            rects = b.line_boxes or [b.bbox]
+            for (lx, ly, lw2, lh2) in rects:
+                x0, y0 = max(0, lx - pad_ef), max(0, ly - pad_ef)
+                x1 = min(W, lx + lw2 + pad_ef)
+                y1 = min(H, ly + lh2 + pad_ef)
+                if x1 - x0 < 4 or y1 - y0 < 4:
+                    continue
+                mrect = np.zeros((H, W), bool)
+                mrect[y0:y1, x0:x1] = True
+                col = _paper_color(mrect)
+                sub = rg_full[y0:y1, x0:x1]
+                dark = (sub < 110).astype(np.uint8)
+                ncc, lab_ef = cv2.connectedComponents(dark, connectivity=8)
+                protect = np.zeros(sub.shape, bool)
+                for ci in range(1, ncc):
+                    comp = lab_ef == ci
+                    if comp[0, :].any() or comp[-1, :].any()                             or comp[:, 0].any() or comp[:, -1].any():
+                        protect |= comp   # 경계 접촉 = 통과 선으로 간주
+                paint = np.zeros((H, W), bool)
+                paint[y0:y1, x0:x1] = ~protect
+                clear_layer[paint] = (*col, 255)
+
     # 브러시(검수 페이지) — _paint/{stem}.png 의 alpha>127 픽셀.
     # 청록 획(B>R)=종이색 칠, 빨강 획(R>B)=원본 복원(자동 지움 포함 취소).
     # 재실행에도 유지됨.
+    restore_mask = None   # 브러시 '원본 복원' 획 — 텍스트 배경 채움 제외용
     pm_path = out_dir / "_paint" / f"{stem}.png"
     if pm_path.exists():
         try:
@@ -1258,6 +2159,7 @@ def process_page(page: Path, out_dir: Path, args,
             # 텍스트 레이어는 이후에 얹히므로 영향 없음.
             if restore.any():
                 clear_layer[restore] = 0
+                restore_mask = restore
 
     # 재조판 렌더링: 말풍선별 개별 타일 → PSD에서 각각 독립 레이어
     # (위치가 어긋난 대사는 포토샵 이동툴로 레이어만 옮기면 됨)
@@ -1298,8 +2200,22 @@ def process_page(page: Path, out_dir: Path, args,
         tile = Image.new("RGBA", ((x1 - x0) * SS, (y1 - y0) * SS),
                          (0, 0, 0, 0))
         d = ImageDraw.Draw(tile)
-        fp, fi = ((args.hand_font, args.hand_font_index)
-                  if b.kind == "hand" else (args.font, args.font_index))
+        if b.kind == "hand":
+            fp, fi = args.hand_font, args.hand_font_index
+        elif b.kind == "caption" and getattr(args, "caption_font", None):
+            # 내레이션·캡션 전용 폰트 (미지정 시 본문 폰트)
+            fp = args.caption_font
+            fi = int(getattr(args, "caption_font_index", 0) or 0)
+        elif b.kind == "shout" and getattr(args, "shout_font", None):
+            # 외침 전용 폰트 (미지정 시 본문 폰트)
+            fp = args.shout_font
+            fi = int(getattr(args, "shout_font_index", 0) or 0)
+        elif b.kind == "sfx" and getattr(args, "sfx_font", None):
+            # 효과음 전용 폰트 (--retype-sfx 옵트인 시에만 도달)
+            fp = args.sfx_font
+            fi = int(getattr(args, "sfx_font_index", 0) or 0)
+        else:
+            fp, fi = args.font, args.font_index
         ovf = b.trans_meta.get("font")
         ofi = int(b.trans_meta.get("font_index") or 0)
         if not ovf and sd.get("font"):   # 기본 서식 폰트
@@ -1352,6 +2268,31 @@ def process_page(page: Path, out_dir: Path, args,
         mf = (wmask.astype(np.float32) / 255.0)[..., None]  # 이미 블러됨
         base = (img.astype(np.float32) * (1.0 - mf)
                 + restored.astype(np.float32) * mf).astype(np.uint8)
+    # 글자 굵기 보강 (옵션, 기본 끔) — 보존되는 원본 글자에만 효과.
+    # 재조판 말풍선은 이후 지움 덮개로 덮이므로 영향 없음.
+    boost_layer = None
+    ink_boost = float(getattr(args, "ink_boost", 0) or 0)
+    if ink_boost > 0:
+        base, boost_layer = boost_ink(base, wmask, ink_boost)
+    # 글자 뒤 말풍선 채움 (--text-backing PAD px) — 렌더된 글자 잉크를
+    # PAD px 팽창한 영역을 종이색으로 덮음. 지움 범위 밖으로 나간 글자가
+    # 원본 잔영 위에 얹혀 겹쳐 보이는 문제 해결 (번역 모드에서 흔함).
+    backing = float(getattr(args, "text_backing", 0) or 0)
+    if backing > 0 and text_tiles:
+        k = max(1, int(round(backing)))
+        ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                        (2 * k + 1, 2 * k + 1))
+        for _nm, _arr, _x0, _y0, _b in text_tiles:
+            ink8 = (_arr[..., 3] > 32).astype(np.uint8)
+            padm = cv2.dilate(ink8, ker) > 0
+            _ht, _wt = ink8.shape
+            m2 = np.zeros((H, W), bool)
+            m2[_y0:_y0 + _ht, _x0:_x0 + _wt] = padm
+            if restore_mask is not None:
+                m2 &= ~restore_mask   # 사용자 복원 획은 존중
+            src_m = (_b.mask > 0) if _b.mask is not None else m2
+            clear_layer[m2] = (*_paper_color(src_m), 255)
+
     a = clear_layer[..., 3:4].astype(np.float32) / 255
     base = (base * (1 - a) + clear_layer[..., :3] * a).astype(np.uint8)
     base_gray = cv2.cvtColor(base, cv2.COLOR_BGR2GRAY)
@@ -1391,9 +2332,18 @@ def process_page(page: Path, out_dir: Path, args,
         layers = [("Background", img, 0, 0)]
         if not preserve:   # 원본 보존 모드에선 보정본 레이어 제외
             layers.append(("Restored", restored, 0, 0))
+        if boost_layer is not None:   # 글자 굵기 보강 — 비파괴 별도 레이어
+            layers.append(("InkBoost", boost_layer, 0, 0))
         layers.append(("BubbleClear", clear_layer, 0, 0))
         layers += [(nm, a2, tx, ty) for nm, a2, tx, ty, _ in text_tiles]
-        save_psd(out_dir / f"{stem}.psd", layers)
+        if getattr(args, "async_psd", False):
+            # 앱 검수 적용용 — PSD 저장을 백그라운드로 돌려 응답 단축
+            import threading as _th
+            _th.Thread(target=save_psd,
+                       args=(out_dir / f"{stem}.psd", layers),
+                       daemon=True).start()
+        else:
+            save_psd(out_dir / f"{stem}.psd", layers)
 
     if args.debug:
         dbg = restored.copy()
@@ -1430,8 +2380,14 @@ FONT_PRESETS = [
     ("KoPub 바탕 Bold — 출판 명조 (추천)",
      ["KoPubWorld*Batang*Bold*.ttf", "KoPub*Batang*Bold*.ttf",
       "KoPubWorld*Batang*Bold*.otf", "KoPub*Batang*Bold*.otf"], 0),
+    ("에스코어 드림 6 Bold — 미국 코믹스 대사 (추천)",
+     ["에스코어 드림 6 Bold.ttf", "S-CoreDream*6*.ttf",
+      "SCDream6*.ttf", "S-CoreDream*6*.otf", "SCDream6*.otf"], 0),
     ("나눔명조 Bold — 인쇄체 대사 (추천)",
      ["NanumMyeongjo*Bold*.ttf", "NanumMyeongjoB*.ttf"], 0),
+    ("리디바탕 — 단정한 명조·내레이션",
+     ["리디바탕.ttf", "RIDIBatang*.ttf", "RidiBatang*.ttf",
+      "RIDIBatang*.otf", "RidiBatang*.otf"], 0),
     ("나눔명조 — 가는 인쇄체", ["NanumMyeongjo.ttf"], 0),
     ("함초롬바탕 — 부드러운 명조",
      ["HANBatang*.ttf", "함초롬바탕*.ttf"], 0),
@@ -1439,9 +2395,18 @@ FONT_PRESETS = [
      ["NanumGothicExtraBold*.ttf"], 0),
     ("나눔고딕 Bold — 고딕 대사", ["NanumGothicBold*.ttf"], 0),
     ("나눔바른고딕 Bold", ["NanumBarunGothicBold*.ttf"], 0),
+    ("G마켓 산스 Bold — 둥근 기하학 고딕",
+     ["G마켓 산스 Bold.ttf", "GmarketSans*Bold*.ttf",
+      "GmarketSans*Bold*.otf"], 0),
+    ("에스코어 드림 3 Light — 속삭임·작은 대사",
+     ["에스코어 드림 3 Light.ttf", "S-CoreDream*3*.ttf",
+      "SCDream3*.ttf"], 0),
     ("맑은 고딕 Bold", ["malgunbd.ttf"], 0),
     ("검은고딕 — 아주 굵은 외침·강조",
      ["BlackHanSans*.ttf", "검은고딕*.ttf"], 0),
+    ("에스코어 드림 8 Heavy — 굵은 외침",
+     ["에스코어 드림 8 Heavy.ttf", "S-CoreDream*8*.ttf",
+      "SCDream8*.ttf"], 0),
     ("배민 도현체 — 각지고 힘 있는 강조",
      ["BMDOHYEON*.ttf", "BMDoHyeon*.ttf", "BMDOHYEON*.otf"], 0),
     ("잘난체 — 둥글고 코믹한 외침",
@@ -1518,6 +2483,227 @@ def crop_bubble_hires(img_bgr: np.ndarray, b: Bubble,
     return c
 
 
+# 최종본 ZIP 내보내기 프리셋 — (라벨, 설정 or None=원본 그대로)
+# edge=장변 상한 px(초과 시 LANCZOS 축소), q=JPEG 품질, tag=파일명 접미사.
+# JPEG은 만화 뷰어 호환성이 가장 넓고, 글자 선명도를 위해 크로마
+# 서브샘플링을 끈다(4:4:4).
+ZIP_PRESETS = [
+    ("원본 그대로 (PNG 무손실 — 보관용)", None),
+    ("모바일 고화질 — 장변 2048px · JPEG 90",
+     {"edge": 2048, "q": 90, "tag": "m2048"}),
+    ("모바일 표준 — 장변 1600px · JPEG 85",
+     {"edge": 1600, "q": 85, "tag": "m1600"}),
+    ("모바일 절약 — 장변 1280px · JPEG 80",
+     {"edge": 1280, "q": 80, "tag": "m1280"}),
+]
+
+
+def _auto_crop_bbox(im, tolerance: int = 32, pad: int = 8) -> tuple:
+    """여백 자동 감지 — 네 모서리 색을 배경으로 보고 내용 bbox 반환.
+
+    capture_splitter의 detect_content_bbox 방식 이식. (x, y, w, h)."""
+    from PIL import ImageChops
+    gray = im.convert("L")
+    w, h = gray.size
+    corners = sorted([gray.getpixel((0, 0)), gray.getpixel((w - 1, 0)),
+                      gray.getpixel((0, h - 1)),
+                      gray.getpixel((w - 1, h - 1))])
+    bg = (corners[1] + corners[2]) // 2
+    diff = ImageChops.difference(gray, Image.new("L", (w, h), bg))
+    bbox = diff.point(lambda p: 255 if p > tolerance else 0).getbbox()
+    if not bbox:
+        return (0, 0, w, h)
+    l = max(0, bbox[0] - pad)
+    t = max(0, bbox[1] - pad)
+    r = min(w, bbox[2] + pad)
+    b = min(h, bbox[3] + pad)
+    return (l, t, r - l, b - t)
+
+
+def _clamp_crop(cb, size) -> tuple:
+    """crop [x,y,w,h] → PIL crop box (l,t,r,b), 이미지 경계로 클램프."""
+    W, H = size
+    x = max(0, min(int(cb[0]), W - 1))
+    y = max(0, min(int(cb[1]), H - 1))
+    r = max(x + 1, min(x + int(cb[2]), W))
+    b = max(y + 1, min(y + int(cb[3]), H))
+    return (x, y, r, b)
+
+
+def export_final_zip(out_dir: Path, zip_path=None, preset=None,
+                     log=None, is_cancelled=None) -> tuple:
+    """검수 완료 후 최종 결과물(*_final.png)만 ZIP으로 아카이브.
+
+    파일명은 원본 페이지명으로 복원(_final 제거). preset=None이면 PNG를
+    그대로 담고(ZIP_STORED — PNG는 이미 압축됨), preset={"edge","q","tag"}면
+    모바일용으로 장변 축소 + JPEG 재압축해 담는다. .cbz로 저장하면 만화
+    뷰어에서 바로 열림. 반환: (zip 경로, 담은 페이지 수, 잠금 페이지 수)."""
+    import io
+    import zipfile
+    out_dir = Path(out_dir)
+    finals = sorted(out_dir.glob("*_final.png"))
+    if not finals:
+        raise RuntimeError("최종 결과물(*_final.png)이 없습니다 — "
+                           "먼저 [전체 시작]으로 처리하세요.")
+    if not zip_path:
+        suffix = f"_{preset['tag']}" if preset else ""
+        zip_path = out_dir / f"{out_dir.parent.name}_final{suffix}.zip"
+    zip_path = Path(zip_path)
+    locked_stems = {Path(f).stem for f in load_locked(out_dir) if f}
+    n_locked = sum(1 for p in finals
+                   if p.name[:-len("_final.png")] in locked_stems)
+    # 검수 페이지에서 지정한 출력 크롭 (review.json 페이지 항목의 crop)
+    page_crops = {}
+    rj = out_dir / "review.json"
+    if rj.exists():
+        try:
+            for r in json.loads(rj.read_text(encoding="utf-8")):
+                if r.get("crop") and r.get("file"):
+                    page_crops[Path(r["file"]).stem] = r["crop"]
+        except Exception:
+            pass
+    if page_crops and log:
+        log(f"  출력 크롭 적용: {len(page_crops)}페이지")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+        for i, p in enumerate(finals, 1):
+            if is_cancelled and is_cancelled():
+                zf.close()
+                zip_path.unlink(missing_ok=True)   # 불완전 아카이브 제거
+                raise RuntimeError("사용자가 중지함 — ZIP 생성 취소")
+            stem = p.name[:-len("_final.png")]
+            cb = page_crops.get(stem)
+            if not preset:
+                if not cb:
+                    zf.write(p, stem + ".png")
+                    continue
+                with Image.open(p) as im:   # 크롭만 적용해 PNG 재저장
+                    buf = io.BytesIO()
+                    im.crop(_clamp_crop(cb, im.size)).save(buf, "PNG")
+                zf.writestr(stem + ".png", buf.getvalue())
+                continue
+            if log:
+                log(f"  [{i}/{len(finals)}] {stem} 변환 중…")
+            with Image.open(p) as im:
+                if cb:
+                    im = im.crop(_clamp_crop(cb, im.size))
+                if im.mode != "RGB":
+                    im = im.convert("RGB")
+                edge = int(preset["edge"])
+                sc = edge / max(im.size)
+                if sc < 1:   # 장변 상한 초과 시에만 축소 (확대는 안 함)
+                    im = im.resize((max(1, round(im.width * sc)),
+                                    max(1, round(im.height * sc))),
+                                   Image.LANCZOS)
+                buf = io.BytesIO()
+                im.save(buf, "JPEG", quality=int(preset["q"]),
+                        optimize=True, subsampling=0)
+            zf.writestr(stem + ".jpg", buf.getvalue())
+    return zip_path, len(finals), n_locked
+
+
+# ---------------------------------------------------------------------------
+# 작업 폴더 정리 — 검수 완료 후 재생성 가능한 중간 데이터 삭제
+# ---------------------------------------------------------------------------
+# 카테고리: (키, 라벨, 기본 선택, 설명). 항상 보존: *_final.png, review.json,
+# _paint\(브러시 원본 — 재생성 불가), _style_default.json, _glossary.txt,
+# ZIP/CBZ 아카이브.
+CLEANUP_KINDS = [
+    ("upscaled", "_upscaled — 업스케일 캐시", True,
+     "업스케일 재실행으로 재생성 가능. 단, 삭제 후의 검수 반영·재전사는 "
+     "원본 해상도로 동작해 기존 결과와 크기가 달라질 수 있음 — "
+     "완전히 끝난 작업만 정리하세요."),
+    ("restored", "_restored — 톤 보정 캐시", True,
+     "적용·재합성 시 자동 재생성됩니다 (다음 1회만 조금 느려짐)."),
+    ("cache", "_cache — 샘플 렌더 캐시", True,
+     "샘플 미리보기 실시간 폰트 교체용 — 삭제 안전."),
+    ("sample", "_sample — 샘플 미리보기 출력", True,
+     "샘플 실행 결과 — 삭제 안전."),
+    ("crops", "crops — 전사용 크롭 이미지", True,
+     "--export-crops 산출물 — 재생성 가능."),
+    ("psd", "PSD 레이어 파일", False,
+     "재합성(♻)으로 재생성 가능하지만 포토샵에서 직접 편집했다면 그 "
+     "작업본이 사라집니다. 수동 확정(잠금) 페이지의 PSD는 보존됩니다."),
+]
+
+_CLEANUP_DIRS = {"upscaled": "_upscaled", "restored": "_restored",
+                 "cache": "_cache", "sample": "_sample", "crops": "crops"}
+
+
+def _cleanup_files(out_dir: Path, key: str) -> list:
+    """카테고리에 해당하는 실제 파일 목록 (없으면 빈 리스트)."""
+    out_dir = Path(out_dir)
+    if key in _CLEANUP_DIRS:
+        d = out_dir / _CLEANUP_DIRS[key]
+        if not d.is_dir():
+            return []
+        return [p for p in d.rglob("*") if p.is_file()]
+    if key == "psd":
+        locked = {Path(f).stem for f in load_locked(out_dir) if f}
+        return [p for p in out_dir.glob("*.psd") if p.stem not in locked]
+    return []
+
+
+def scan_cleanup(out_dir: Path) -> list:
+    """정리 가능한 항목 스캔 — 존재하는 카테고리만 반환.
+
+    반환: [{key, label, default, note, count, bytes}] (용량 큰 순)."""
+    items = []
+    for key, label, default, note in CLEANUP_KINDS:
+        files = _cleanup_files(out_dir, key)
+        if not files:
+            continue
+        total = 0
+        for p in files:
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
+        items.append({"key": key, "label": label, "default": default,
+                      "note": note, "count": len(files), "bytes": total})
+    items.sort(key=lambda it: -it["bytes"])
+    return items
+
+
+def cleanup_workdir(out_dir: Path, keys) -> tuple:
+    """선택한 카테고리의 중간 데이터 삭제. 반환 (파일 수, 확보 바이트).
+
+    보존 대상(*_final.png, review.json, _paint 등)은 카테고리에 포함되지
+    않으므로 건드리지 않는다. 빈 폴더는 함께 제거."""
+    import shutil
+    out_dir = Path(out_dir)
+    n = 0
+    freed = 0
+    for key in keys:
+        files = _cleanup_files(out_dir, key)
+        for p in files:
+            try:
+                sz = p.stat().st_size
+                p.unlink()
+                n += 1
+                freed += sz
+            except OSError:
+                pass
+        if key in _CLEANUP_DIRS:   # 남은 빈 폴더 정리 (실패해도 무시)
+            shutil.rmtree(out_dir / _CLEANUP_DIRS[key], ignore_errors=True)
+    return n, freed
+
+
+def _retype_kind_fix(e: dict, args) -> None:
+    """수동 교정 텍스트가 반드시 재조판되도록 kind 보정.
+
+    캡션·외침은 그대로 재조판 대상이라 유지(전용 폰트 적용), 손글씨·
+    효과음은 각각 재조판 설정+폰트가 있을 때만 유지 — 없으면 보존
+    정책에 걸려 글씨가 안 나오므로 dialogue로 강제."""
+    if e.get("kind") not in ("caption", "shout") \
+            and not (e.get("kind") == "hand"
+                     and getattr(args, "retype_hand", False)
+                     and getattr(args, "hand_font", None)) \
+            and not (e.get("kind") == "sfx"
+                     and getattr(args, "retype_sfx", False)
+                     and getattr(args, "sfx_font", None)):
+        e["kind"] = "dialogue"
+
+
 def make_manual_bubble(restored_gray: np.ndarray, bbox) -> Bubble:
     """사용자 지정 영역(감지 누락 보완)을 합성 Bubble로.
 
@@ -1566,107 +2752,145 @@ _REVIEW_HTML = r"""<!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
 <title>재조판 검수</title>
 <style>
- body{font-family:'Malgun Gothic',sans-serif;margin:0;background:#222;color:#eee}
- header{position:fixed;left:0;top:0;bottom:0;width:200px;background:#333;
+ /* ── Comic Restore 디자인 토큰 (Claude Design 프로젝트와 동기) ── */
+ :root{
+  --bg:#14161b; --panel:#1c1f27; --panel2:#242833; --field:#171a20;
+  --line:#333a47; --line2:#3f4756;
+  --tx:#e9ecf2; --tx2:#a4abb8; --tx3:#7b8290;
+  --pri:#2f6fed; --pri-h:#4a83f0; --btn2:#39404e; --btn2-h:#485163;
+  --acc:#19c3e6; --ok:#2eae4f; --warn:#ff9d2e; --mark:#ff2e5f;
+  --manual:#8b6cff; --lock:#d4a017; --danger:#c04545;
+  --region:#ff2ea6; --zoomc:#ffd94a; --src:#ffd27f;
+  --r:8px; --rs:5px; --shadow:0 8px 28px rgba(0,0,0,.45);
+ }
+ body{font-family:'Malgun Gothic','Segoe UI',sans-serif;margin:0;
+      background:var(--bg);color:var(--tx)}
+ header{position:fixed;left:0;top:0;bottom:0;width:200px;
+        background:var(--panel);border-right:1px solid var(--line);
         padding:14px 12px;z-index:10;display:flex;flex-direction:column;
         gap:10px;align-items:stretch;overflow-y:auto;box-sizing:border-box}
  header>button{width:100%}
- button{padding:6px 14px;border:0;border-radius:4px;background:#0b5ed7;
-        color:#fff;cursor:pointer;font-size:14px}
+ button{padding:6px 14px;border:0;border-radius:var(--rs);
+        background:var(--pri);color:#fff;cursor:pointer;font-size:14px;
+        transition:background .12s, transform .05s}
+ button:hover{background:var(--pri-h)}
+ button:active{transform:translateY(1px)}
+ button:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+ button:disabled{opacity:.45;cursor:default;transform:none}
  #pages{margin-left:200px}
- .legend{display:flex;flex-direction:column;gap:4px;border-top:1px solid #555;
-         padding-top:10px}
- .legend span{font-size:12px}
+ .legend{display:flex;flex-direction:column;gap:4px;
+         border-top:1px solid var(--line);padding-top:10px}
+ .legend span{font-size:12px;color:var(--tx2)}
  .zoomrow{display:flex;gap:6px;align-items:center}
- .zoomrow button{flex:1;width:auto;background:#555;padding:6px 0}
+ .zoomrow button{flex:1;width:auto;background:var(--btn2);padding:6px 0}
+ .zoomrow button:hover{background:var(--btn2-h)}
  .symrow{display:flex;gap:5px;flex-wrap:wrap}
- .symrow button{flex:0 0 auto;min-width:34px;background:#555;
+ .symrow button{flex:0 0 auto;min-width:34px;background:var(--btn2);
                 padding:5px 8px;font-size:14px}
- #zl{min-width:44px;text-align:center;font-size:13px}
- .dot{display:inline-block;width:10px;height:10px;border-radius:2px;
+ .symrow button:hover{background:var(--btn2-h)}
+ #zl{min-width:44px;text-align:center;font-size:13px;color:var(--tx2)}
+ .dot{display:inline-block;width:10px;height:10px;border-radius:3px;
       margin-right:3px;vertical-align:middle}
- .page{margin:24px auto;max-width:1200px;padding:0 12px}
- .canvas{position:relative}
- .canvas img{width:100%;display:block}
+ /* content-visibility: 화면 밖 페이지는 레이아웃·페인트 생략 (대량 페이지
+    스크롤 최적화) — contain-intrinsic-size는 페이지별 인라인으로 지정 */
+ .page{margin:24px auto;max-width:1200px;padding:0 12px;
+       content-visibility:auto}
+ .canvas{position:relative;border-radius:3px;
+         box-shadow:0 2px 14px rgba(0,0,0,.5)}
+ .canvas img{width:100%;height:auto;display:block;border-radius:3px}
  .bx{position:absolute;border:2px solid;cursor:pointer;box-sizing:border-box;
-     opacity:var(--bxo,.4)}
- .zoomrow input[type=range]{flex:1;accent-color:#0b5ed7;min-width:0}
- .bx.ok{border-color:#2eae4f}
- .bx.warn{border-color:#ff9d2e}
- .bx.skip{border-color:#888;border-style:dashed}
- .bx.marked{border-color:#ff2e5f;border-width:3px;
+     opacity:var(--bxo,.4);border-radius:3px}
+ .zoomrow input[type=range]{flex:1;accent-color:var(--acc);min-width:0}
+ .bx.ok{border-color:var(--ok)}
+ .bx.warn{border-color:var(--warn)}
+ .bx.skip{border-color:#788;border-style:dashed}
+ .bx.marked{border-color:var(--mark);border-width:3px;
             background:rgba(255,46,95,.15)}
  body.hidebx .bx{display:none}
  body.hidebx .paintcv,body.hidebx .rg{display:none}
- .bx.manual{border-color:#7a5cff}
+ .bx.manual{border-color:var(--manual)}
  body.draw .canvas{cursor:crosshair}
  body.draw .bx{pointer-events:none}
- .lockbtn{margin-left:10px;background:#555;font-size:12px;padding:3px 10px}
+ .lockbtn{margin-left:10px;background:var(--btn2);font-size:12px;
+          padding:4px 11px}
+ .lockbtn:hover{background:var(--btn2-h)}
  .pagefoot{display:flex;gap:2px;margin:8px 0 0;justify-content:flex-end}
- .page.locked .canvas{outline:3px solid #d4a017}
+ .page.locked .canvas{outline:3px solid var(--lock)}
  .page.locked .bx{cursor:not-allowed}
  .page.locked h2::after{content:' — 수동 확정됨 (재조판·전체 실행에서 보호)';
-                        color:#d4a017;font-weight:normal}
+                        color:var(--lock);font-weight:normal}
  .dock{position:sticky;bottom:6px;left:212px;z-index:8;
        max-width:calc(100vw - 248px);
-       background:rgba(10,10,10,.62);backdrop-filter:blur(3px);
-       border-radius:10px;padding:8px 10px;
-       box-shadow:0 6px 24px rgba(0,0,0,.6)}
- .items{background:#242424;border-radius:6px;padding:8px 12px;
-        max-height:38vh;overflow-y:auto}
+       background:rgba(18,20,26,.72);backdrop-filter:blur(6px);
+       border:1px solid var(--line);border-radius:12px;padding:8px 10px;
+       box-shadow:var(--shadow)}
+ .items{background:var(--panel2);border-radius:var(--r);padding:8px 12px;
+        max-height:38vh;overflow-y:auto;border:1px solid var(--line)}
  .dock .pagefoot{margin-top:6px}
  /* 편집 항목이 없을 땐 버튼 크기에 맞는 우측 정렬 필로 축소 */
  .dock:not(:has(.items[style*="block"])){width:fit-content;
                                          margin-left:auto}
  .item{display:flex;gap:10px;margin:8px 0;align-items:flex-start}
- .item textarea{flex:1;background:#1b1b1b;color:#eee;border:1px solid #555;
-                border-radius:4px;padding:6px;font-size:14px;min-height:78px;
-                max-width:720px;max-height:26vh;resize:vertical}
- .item select{background:#1b1b1b;color:#eee;border:1px solid #555;
-              border-radius:4px;padding:4px;max-width:200px;margin-top:6px}
- .layrow{display:flex;gap:6px;align-items:center;font-size:12px;color:#aaa;
-         flex-wrap:wrap;margin:2px 0 6px}
- .layrow input{width:58px;background:#1b1b1b;color:#eee;
-               border:1px solid #555;border-radius:4px;padding:4px}
- .layrow select{background:#1b1b1b;color:#eee;border:1px solid #555;
-                border-radius:4px;padding:4px}
+ .item textarea{flex:1;background:var(--field);color:var(--tx);
+                border:1px solid var(--line2);
+                border-radius:var(--rs);padding:6px;font-size:14px;
+                min-height:78px;max-width:720px;max-height:26vh;
+                resize:vertical}
+ .item textarea:focus-visible{outline:1.5px solid var(--acc);
+                              outline-offset:0}
+ .item select{background:var(--field);color:var(--tx);
+              border:1px solid var(--line2);
+              border-radius:var(--rs);padding:4px;max-width:200px;
+              margin-top:6px}
+ .layrow{display:flex;gap:6px;align-items:center;font-size:12px;
+         color:var(--tx2);flex-wrap:wrap;margin:2px 0 6px}
+ .layrow input{width:58px;background:var(--field);color:var(--tx);
+               border:1px solid var(--line2);border-radius:var(--rs);
+               padding:4px}
+ .layrow select{background:var(--field);color:var(--tx);
+                border:1px solid var(--line2);border-radius:var(--rs);
+                padding:4px}
  .rcol{display:flex;flex-direction:column;gap:6px;min-width:220px}
  .rcol select{margin-top:0;max-width:none}
  .ccol{display:flex;flex-direction:column;gap:8px;font-size:12px;
-       color:#ccc;white-space:nowrap;padding-top:4px}
- .hint{margin-left:auto;color:#aaa;font-size:12px}
- .tf{position:absolute;border:1.5px dashed #19c3e6;cursor:move;
+       color:var(--tx2);white-space:nowrap;padding-top:4px}
+ .hint{margin-left:auto;color:var(--tx3);font-size:12px}
+ .tf{position:absolute;border:1.5px dashed var(--acc);cursor:move;
      box-sizing:border-box;background:rgba(25,195,230,.07);z-index:5}
- .tfh{position:absolute;right:-7px;bottom:-7px;width:13px;height:13px;
-      background:#19c3e6;cursor:nwse-resize;border-radius:3px}
- .tfe{position:absolute;right:-7px;top:50%;margin-top:-7px;width:13px;
-      height:13px;background:#19c3e6;cursor:ew-resize;border-radius:3px}
- .tfs{position:absolute;bottom:-7px;left:50%;margin-left:-7px;width:13px;
-      height:13px;background:#19c3e6;cursor:ns-resize;border-radius:3px}
- #busy{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;
+ .tfh,.tfe,.tfw,.tfs,.tfn{position:absolute;width:9px;height:9px;
+      background:var(--acc);border-radius:2px;opacity:var(--bxo,.4)}
+ .tfh{right:-5px;bottom:-5px;cursor:nwse-resize}
+ .tfe{right:-5px;top:50%;margin-top:-5px;cursor:ew-resize}
+ .tfw{left:-5px;top:50%;margin-top:-5px;cursor:ew-resize}
+ .tfs{bottom:-5px;left:50%;margin-left:-5px;cursor:ns-resize}
+ .tfn{top:-5px;left:50%;margin-left:-5px;cursor:ns-resize}
+ #busy{position:fixed;inset:0;background:rgba(8,9,12,.6);z-index:200;
        display:none;align-items:center;justify-content:center;
-       flex-direction:column;gap:14px}
+       flex-direction:column;gap:14px;backdrop-filter:blur(2px)}
  #busy.on{display:flex}
- .spin{width:46px;height:46px;border:5px solid #555;
-       border-top-color:#19c3e6;border-radius:50%;
+ .spin{width:46px;height:46px;border:5px solid var(--btn2);
+       border-top-color:var(--acc);border-radius:50%;
        animation:sp 1s linear infinite}
  @keyframes sp{to{transform:rotate(360deg)}}
- #busytext{color:#eee;font-size:15px;text-shadow:0 1px 4px #000}
- #ctx{position:fixed;z-index:99;background:#333;border:1px solid #555;
-      border-radius:6px;padding:4px;display:none;min-width:200px;
-      box-shadow:0 4px 14px rgba(0,0,0,.5)}
- .ctxi{padding:7px 12px;font-size:13px;cursor:pointer;border-radius:4px}
- .ctxi:hover{background:#0b5ed7}
- .rg{position:absolute;border:2px dashed #ff2ea6;box-sizing:border-box;
-     background:rgba(255,46,166,.08);cursor:move;z-index:6}
+ #busytext{color:var(--tx);font-size:15px;text-shadow:0 1px 4px #000}
+ #ctx{position:fixed;z-index:99;background:var(--panel);
+      border:1px solid var(--line2);
+      border-radius:var(--r);padding:4px;display:none;min-width:200px;
+      box-shadow:var(--shadow)}
+ .ctxi{padding:7px 12px;font-size:13px;cursor:pointer;
+       border-radius:var(--rs);color:var(--tx)}
+ .ctxi:hover{background:var(--pri)}
+ .rg{position:absolute;border:2px dashed var(--region);
+     box-sizing:border-box;background:rgba(255,46,166,.08);cursor:move;
+     z-index:6}
  .rgh{position:absolute;right:-7px;bottom:-7px;width:13px;height:13px;
-      background:#ff2ea6;cursor:nwse-resize;border-radius:3px}
+      background:var(--region);cursor:nwse-resize;border-radius:3px}
  .bx.clean{background:rgba(255,255,255,.35)}
  .paintcv{position:absolute;left:0;top:0;width:100%;height:100%;
           opacity:var(--bxo,.4);pointer-events:none;z-index:3}
  body.brush .canvas{cursor:crosshair}
  body.brush .bx,body.brush .tf,body.brush .rg{pointer-events:none}
- .zr{position:absolute;border:2px dashed #ffd94a;box-sizing:border-box;
+ .zr{position:absolute;border:2px dashed var(--zoomc);box-sizing:border-box;
      background:rgba(255,217,74,.12);z-index:7}
  body.zsel .canvas{cursor:zoom-in}
  body.zsel .bx,body.zsel .tf,body.zsel .rg{pointer-events:none}
@@ -1674,20 +2898,47 @@ _REVIEW_HTML = r"""<!doctype html>
  body.pan.panning, body.pan.panning *{cursor:grabbing !important}
  body.hidebx .tf{display:none}
  body.draw .tf{pointer-events:none}
- .tag{font-size:12px;color:#aaa;white-space:nowrap;padding-top:8px}
+ .tag{font-size:12px;color:var(--tx2);white-space:nowrap;padding-top:8px}
+ .srct{max-width:230px;min-width:120px;font-size:12px;color:var(--src);
+       white-space:pre-wrap;padding:8px 6px 0 0;
+       border-right:1px solid var(--line);overflow-wrap:break-word}
+ .scol{display:flex;flex-direction:column;gap:4px;
+       border-right:1px solid var(--line);padding-right:6px}
+ .item textarea.srcta{flex:none;width:220px;min-width:140px;font-size:12px;
+       color:var(--src);background:#242018;border:1px solid #6b5a33;
+       min-height:64px}
+ .scopy{font-size:11px;background:#3a3325;color:var(--src);border:1px solid
+       #6b5a33;border-radius:var(--rs);cursor:pointer;padding:2px 4px}
+ .scopy:hover{background:#4a4230}
  .tagbtn{cursor:pointer;color:#8fc7ff}
  .tagbtn:hover{text-decoration:underline}
  .bx.flash{box-shadow:0 0 0 5px rgba(255,226,90,.95);
            opacity:1 !important}
- h2{font-size:16px;color:#ccc}
- #count{color:#ff9d2e}
+ body.cropm .canvas{cursor:crosshair}
+ body.cropm .bx,body.cropm .tf,body.cropm .rg{pointer-events:none}
+ .cropshade{position:absolute;background:rgba(0,0,0,.45);
+            pointer-events:none;z-index:4}
+ .croprect{position:absolute;border:2px dashed #ffd23f;
+           pointer-events:none;z-index:4;box-sizing:border-box}
+ h2{font-size:15px;color:var(--tx2);font-weight:600;
+    letter-spacing:.2px}
+ #count{color:var(--warn)}
 </style></head><body>
 <header>
  <button onclick="save()">rework.json 저장</button>
+ <select id="pgf" onchange="setPageFilter(this.value)"
+         title="페이지 필터 — 완료본만: 미처리(주황) 박스가 없는 페이지"
+         style="background:#1b1b1b;color:#eee;border:1px solid #555;
+                border-radius:4px;padding:4px">
+  <option value="all">표시: 전체 페이지</option>
+  <option value="done">표시: 완료본만</option>
+  <option value="todo">표시: 검수 필요만</option>
+ </select>
+ <span id="pgfn" style="font-size:12px;color:#aaa"></span>
  <button id="tgl" onclick="toggleBoxes()"
          style="background:#555">박스 숨기기 (H)</button>
  <button id="ov" onclick="toggleOrig()"
-         style="background:#555">원본 보기 (O)</button>
+         style="background:#555">보기: 결과 (O)</button>
  <button id="dm" onclick="toggleDraw()"
          style="background:#555">✏ 영역 추가 (D)</button>
  <button id="br" onclick="toggleBrush()"
@@ -1699,6 +2950,12 @@ _REVIEW_HTML = r"""<!doctype html>
  </div>
  <button id="zs" onclick="toggleZoomSel()"
          style="background:#555">🔍 영역 확대 (Z)</button>
+ <button id="cm" onclick="toggleCrop()" title="출력 크롭 — 드래그로 지정, 최종본 ZIP에만 적용 (작업 파일·좌표는 그대로)"
+         style="background:#555">✂ 페이지 크롭</button>
+ <div class="zoomrow" id="cmrow" style="display:none">
+  <button onclick="cropAuto()" title="현재 페이지 여백 자동 감지 (적용 시 계산)">🪄 자동 여백</button>
+  <button onclick="cropClear()" title="현재 페이지 크롭 해제">✕ 해제</button>
+ </div>
  <button id="ud" onclick="doUndo()"
          style="background:#555">↶ 실행취소 (Ctrl+Z)</button>
  <span style="font-size:12px;color:#aaa">특수문자 (커서 위치에 삽입)</span>
@@ -1733,6 +2990,8 @@ _REVIEW_HTML = r"""<!doctype html>
 const DATA = __DATA__;
 const FONTS = __FONTS__;
 const DEF_STYLE = __DEF__;
+const OUTKEY = __OUTKEY__;   // 출력 폴더 경로 — 작품별 위치 기억 분리용
+const LPKEY = 'rvLastPos:' + OUTKEY;
 const SERVER = location.protocol === 'http:'
             || location.protocol === 'https:';
 const marked = {};
@@ -1785,16 +3044,22 @@ function toggleBoxes(){
   document.getElementById('tgl').textContent =
     on ? '박스 보이기 (H)' : '박스 숨기기 (H)';
 }
-let showOrig = false;
+let viewMode = 0;   // 0=결과 1=업스케일본 2=원본(소스)
 function toggleOrig(){
-  showOrig = !showOrig;
+  viewMode = (viewMode + 1) % 3;
+  if (viewMode === 1 && !DATA.some(pg => pg.orig)) viewMode = 2;
+  if (viewMode === 2 && !SERVER) viewMode = 0;   // 소스는 서버 모드 전용
   DATA.forEach(pg => {
-    if (pg.orig && pg._im) pg._im.src = showOrig ? pg.orig : pg.img;
+    if (!pg._im) return;
+    if (viewMode === 1 && pg.orig) pg._im.src = pg.orig;
+    else if (viewMode === 2)
+      pg._im.src = '/_srcimg/' + encodeURIComponent(pg.file);
+    else pg._im.src = pg.img;
   });
-  document.getElementById('ov').textContent =
-    showOrig ? '결과 보기 (O)' : '원본 보기 (O)';
-  document.getElementById('ov').style.background =
-    showOrig ? '#0b5ed7' : '#555';
+  const b = document.getElementById('ov');
+  b.textContent = ['보기: 결과 (O)', '보기: 업스케일본 (O)',
+                   '보기: 원본 소스 (O)'][viewMode];
+  b.style.background = viewMode ? 'var(--pri)' : 'var(--btn2)';
 }
 let zoom = 1;
 try { zoom = +(localStorage.getItem('rvZoom') || 1) || 1; } catch (e) {}
@@ -1902,7 +3167,7 @@ function toggleDraw(){
   document.body.classList.toggle('draw', drawMode);
   const b = document.getElementById('dm');
   b.textContent = drawMode ? '✏ 그리기 종료 (D)' : '✏ 영역 추가 (D)';
-  b.style.background = drawMode ? '#0b5ed7' : '#555';
+  b.style.background = drawMode ? 'var(--pri)' : 'var(--btn2)';
 }
 // ---- 실행취소 (브러시 획·트랜스폼·영역 조작) ----
 const undoStack = [];
@@ -1965,7 +3230,7 @@ function toggleZoomSel(){
   document.body.classList.toggle('zsel', zoomSel);
   const b = document.getElementById('zs');
   b.textContent = zoomSel ? '🔍 확대할 부분 드래그… (Z)' : '🔍 영역 확대 (Z)';
-  b.style.background = zoomSel ? '#0b5ed7' : '#555';
+  b.style.background = zoomSel ? 'var(--pri)' : 'var(--btn2)';
 }
 function startZoomRect(pg, cv, ev){
   ev.preventDefault();
@@ -2013,14 +3278,14 @@ function toggleBrush(){
   document.body.classList.toggle('brush', brushOn);
   const b = document.getElementById('br');
   b.textContent = brushOn ? '🧹 브러시 종료 (B)' : '🧹 브러시 칠하기 (B)';
-  b.style.background = brushOn ? '#0b5ed7' : '#555';
+  b.style.background = brushOn ? 'var(--pri)' : 'var(--btn2)';
   document.getElementById('brrow').style.display = brushOn ? 'flex' : 'none';
 }
 function toggleBrushMode(){
   brushMode = (brushMode + 1) % 3;
   const b = document.getElementById('brm');
   b.textContent = ['칠하기', '지우개(원본 복원)', '마크 지우기'][brushMode];
-  b.style.background = ['#0b5ed7', '#a04040', '#555'][brushMode];
+  b.style.background = ['var(--pri)', 'var(--danger)', 'var(--btn2)'][brushMode];
 }
 function ensurePaint(pg, cv){
   if (pg._pcv) return pg._pcv;
@@ -2132,30 +3397,171 @@ document.addEventListener('keydown', ev => {
       applyPage(pg, pg._aps[0]);
   }
 });
+// ---- 페이지 크롭 (출력 크롭): 드래그 지정 → 최종본 ZIP에만 적용 ----
+let cropMode = false;
+function toggleCrop(){
+  cropMode = !cropMode;
+  if (cropMode) {
+    if (typeof drawMode !== 'undefined' && drawMode) toggleDraw();
+    if (typeof brushOn !== 'undefined' && brushOn) toggleBrush();
+    if (typeof zoomSel !== 'undefined' && zoomSel) toggleZoomSel();
+  }
+  document.getElementById('cm').style.background =
+    cropMode ? 'var(--pri)' : 'var(--btn2)';
+  document.getElementById('cmrow').style.display =
+    cropMode ? 'flex' : 'none';
+  document.body.classList.toggle('cropm', cropMode);
+}
+function showCrop(pg){
+  (pg._cropEls || []).forEach(e => e.remove());
+  pg._cropEls = [];
+  const c = pg._crop;
+  if (!c || c === 'auto' || !pg._cv) return;
+  const x = c[0] / pg.w, y = c[1] / pg.h;
+  const w = c[2] / pg.w, h = c[3] / pg.h;
+  const pc = v => (Math.max(0, v) * 100) + '%';
+  const mk = (l, t, ww, hh, cls) => {
+    const d = document.createElement('div'); d.className = cls;
+    d.style.left = pc(l); d.style.top = pc(t);
+    d.style.width = pc(ww); d.style.height = pc(hh);
+    pg._cv.appendChild(d); pg._cropEls.push(d);
+  };
+  mk(0, 0, 1, y, 'cropshade');
+  mk(0, y + h, 1, 1 - y - h, 'cropshade');
+  mk(0, y, x, h, 'cropshade');
+  mk(x + w, y, 1 - x - w, h, 'cropshade');
+  mk(x, y, w, h, 'croprect');
+}
+function startCropRect(pg, cv, ev){
+  if (pg._locked) return;
+  ev.preventDefault(); ev.stopPropagation();
+  const r = cv.getBoundingClientRect();
+  const sx = ev.clientX - r.left, sy = ev.clientY - r.top;
+  const el = document.createElement('div'); el.className = 'croprect';
+  cv.appendChild(el);
+  let cur = null;
+  const mv = e2 => {
+    const x2 = e2.clientX - r.left, y2 = e2.clientY - r.top;
+    const l = Math.min(sx, x2), t = Math.min(sy, y2);
+    const w = Math.abs(x2 - sx), hh = Math.abs(y2 - sy);
+    el.style.left = (l / r.width * 100) + '%';
+    el.style.top = (t / r.height * 100) + '%';
+    el.style.width = (w / r.width * 100) + '%';
+    el.style.height = (hh / r.height * 100) + '%';
+    cur = [l, t, w, hh];
+  };
+  const up = () => {
+    document.removeEventListener('mousemove', mv, true);
+    document.removeEventListener('mouseup', up, true);
+    el.remove();
+    if (!cur || cur[2] < 12 || cur[3] < 12) return;   // 단순 클릭 무시
+    pg._crop = [cur[0] / r.width * pg.w, cur[1] / r.height * pg.h,
+                cur[2] / r.width * pg.w, cur[3] / r.height * pg.h]
+               .map(Math.round);
+    pg._cropDirty = true;
+    showCrop(pg);
+  };
+  document.addEventListener('mousemove', mv, true);
+  document.addEventListener('mouseup', up, true);
+}
+function cropAuto(){
+  const pg = pageInView();
+  if (!pg || pg._locked) return;
+  pg._crop = 'auto'; pg._cropDirty = true;
+  showCrop(pg);
+  const h2 = pg._sec && pg._sec.querySelector('h2');
+  if (h2) {
+    h2.textContent = pg.file + '  — 자동 여백 크롭 예약됨 (적용 시 계산)';
+    h2.style.color = '#ffd23f';
+  }
+}
+function cropClear(){
+  const pg = pageInView();
+  if (!pg || pg._locked) return;
+  pg._crop = null; pg._cropDirty = true;
+  showCrop(pg);
+}
 const root = document.getElementById('pages');
+// ---- 페이지 필터: 전체 / 완료본만(미처리 주황 박스 없음) / 검수 필요만 ----
+let pageFilter = 'all';
+try { pageFilter = localStorage.getItem('rvPgFilter') || 'all'; } catch (e) {}
+function pageNeedsWork(pg){
+  // 미처리 = 재조판 안 됐는데 글자로 분류된 말풍선 (검수 페이지의 주황)
+  return pg.review.some(e => !e.retyped
+    && (e.kind === 'dialogue' || e.kind === 'caption'
+        || e.kind === 'shout' || e.kind === 'hand'));
+}
+function applyPageFilter(){
+  let shown = 0;
+  DATA.forEach(pg => {
+    if (!pg._sec) return;
+    const todo = pageNeedsWork(pg);
+    const vis = pageFilter === 'all' || (pageFilter === 'todo' ? todo : !todo);
+    pg._sec.style.display = vis ? '' : 'none';
+    if (vis) shown++;
+  });
+  const lbl = document.getElementById('pgfn');
+  if (lbl) lbl.textContent = shown + '/' + DATA.length + '장';
+  const sel = document.getElementById('pgf');
+  if (sel) sel.value = pageFilter;
+}
+function setPageFilter(v){
+  pageFilter = v;
+  try { localStorage.setItem('rvPgFilter', v); } catch (e) {}
+  applyPageFilter();
+}
+// 화면 근처에 왔을 때만 브러시 마스크 캔버스 생성 (대량 페이지 메모리 절약)
+const lazyObs = ('IntersectionObserver' in window)
+  ? new IntersectionObserver(ents => ents.forEach(en => {
+      if (!en.isIntersecting) return;
+      const pg = en.target._pg;
+      lazyObs.unobserve(en.target);
+      if (pg && pg.paint && !pg._pcv) ensurePaint(pg, pg._cv);
+    }), {rootMargin: '1500px 0px'})
+  : null;
 DATA.forEach(pg => {
   pg._locked = !!pg.locked;
   pg._boxes = [];
   const sec = document.createElement('div'); sec.className = 'page';
+  // 렌더 전 자리표시 크기 (auto = 한 번 렌더된 실제 크기 기억) — 스크롤바
+  // 안정화. 폭 1200 기준 이미지 높이 + 제목·도크 여유 90px.
+  sec.style.containIntrinsicSize = 'auto 1200px auto '
+    + (Math.round(1200 * pg.h / pg.w) + 90) + 'px';
   pg._sec = sec;
   pg._lks = [];
   pg._rbs = [];
   pg._aps = [];
   pg._rebuild = false;
   pg._adds = [];
+  pg._crop = pg.crop || null;   // 저장된 출력 크롭 (ZIP에만 적용)
+  pg._cropDirty = false;
   const h = document.createElement('h2'); h.textContent = pg.file;
-  h.appendChild(pageButtons(pg, sec));   // 상단 버튼
-  sec.appendChild(h);
+  if (pg.nodata) {
+    h.textContent += '  — 검수 데이터 없음 (열람만 가능 · 검수하려면 '
+                     + "'완료된 페이지 건너뛰기' 해제 후 재실행)";
+    h.style.color = '#e0a34f';
+  }
+  sec.appendChild(h);   // 버튼은 하단 고정 도크에만 (중복 제거)
   const cv = document.createElement('div'); cv.className = 'canvas';
-  const im = document.createElement('img'); im.src = pg.img;
+  pg._cv = cv;
+  const im = document.createElement('img');
+  // lazy: 화면 근처 이미지만 로드·디코드 — width/height 속성으로
+  // 로드 전에도 종횡비 확보 (레이아웃 점프 방지)
+  im.width = pg.w; im.height = pg.h;
+  im.loading = 'lazy'; im.decoding = 'async';
+  im.src = pg.img;
   pg._im = im;
   cv.appendChild(im);
-  if (pg.paint) ensurePaint(pg, cv);   // 저장된 브러시 마스크 표시
+  if (pg.paint) {   // 저장된 브러시 마스크 — 화면 근처에서만 복원
+    if (lazyObs) { sec._pg = pg; lazyObs.observe(sec); }
+    else ensurePaint(pg, cv);
+  }
   // 수동 영역 드래그 지정 + 브러시
   let drag = null;
   cv.addEventListener('mousedown', ev => {
     if (zoomSel) { startZoomRect(pg, cv, ev); return; }
     if (brushOn) { startPaint(pg, cv, ev); return; }
+    if (cropMode) { startCropRect(pg, cv, ev); return; }
     if (!drawMode || pg._locked) return;
     ev.preventDefault();
     const r = cv.getBoundingClientRect();
@@ -2189,7 +3595,8 @@ DATA.forEach(pg => {
   pg.review.forEach(e => {
     const b = document.createElement('div');
     const cls = e.retyped ? 'ok'
-      : ((e.kind === 'dialogue' || e.kind === 'hand') ? 'warn' : 'skip');
+      : ((e.kind === 'dialogue' || e.kind === 'caption'
+          || e.kind === 'shout' || e.kind === 'hand') ? 'warn' : 'skip');
     b.className = 'bx ' + cls;
     const bb = e.bbox;
     b.style.left = (bb[0] / pg.w * 100) + '%';
@@ -2197,7 +3604,8 @@ DATA.forEach(pg => {
     b.style.width = (bb[2] / pg.w * 100) + '%';
     b.style.height = (bb[3] / pg.h * 100) + '%';
     b.title = '#' + e.id + ' ' + (e.kind || '') + ' ' + (e.confidence || '')
-              + '\n' + (e.text || '');
+              + '\n' + (e.text || '')
+              + (e.src ? '\n── 원문 ──\n' + e.src : '');
     b.onclick = () => toggle(pg, e, b, sec);
     b.oncontextmenu = ev => bubbleMenu(ev, pg, e, b, sec);
     if (e.clean) b.classList.add('clean');
@@ -2212,12 +3620,19 @@ DATA.forEach(pg => {
   items.className = 'items'; items.style.display = 'none';
   dock.appendChild(items);
   const foot = document.createElement('div'); foot.className = 'pagefoot';
+  // 어느 페이지의 버튼인지 표시 (도크가 여러 개 보일 때 구분)
+  const pfl = document.createElement('span'); pfl.className = 'tag';
+  pfl.style.padding = '4px 8px 0 0';
+  pfl.textContent = pg.file.replace(/\.[^.]+$/, '');
+  foot.appendChild(pfl);
   foot.appendChild(pageButtons(pg, sec));
   dock.appendChild(foot);
   sec.appendChild(dock);
   root.appendChild(sec);
   setLockUI(pg, sec);
+  showCrop(pg);   // 저장된 출력 크롭 오버레이 표시
 });
+applyPageFilter();   // 저장된 페이지 필터 적용 (rvPgFilter)
 function pageButtons(pg, sec){
   const box = document.createElement('span');
   const lk = document.createElement('button'); lk.className = 'lockbtn';
@@ -2257,7 +3672,7 @@ async function revertPage(pg, btn){
     if (!res.ok)
       throw new Error(res.status === 409
         ? '앱이 다른 작업을 실행 중입니다' : 'HTTP ' + res.status);
-    sessionStorage.setItem('rvScroll', String(window.scrollY));
+    saveScroll(pg);
     location.reload();
   } catch (err) {
     hideBusy();
@@ -2290,7 +3705,7 @@ function setLockUI(pg, sec){
 function setRebuildUI(pg){
   pg._rbs.forEach(rb => {
     rb.textContent = pg._rebuild ? '♻ 재합성 예약됨' : '♻ 재합성';
-    rb.style.background = pg._rebuild ? '#0b5ed7' : '#555';
+    rb.style.background = pg._rebuild ? 'var(--pri)' : 'var(--btn2)';
   });
 }
 function toggleRebuild(pg){
@@ -2390,6 +3805,26 @@ function toggle(pg, e, box, sec){
       setTimeout(() => box.classList.remove('flash'), 1500);
     };
     row.appendChild(tag);
+    if (e.src) {   // 번역 모드 — 원문(전사)을 수정 가능한 칸으로 표시
+      const scol = document.createElement('div'); scol.className = 'scol';
+      const sta = document.createElement('textarea');
+      sta.className = 'srcta';
+      sta.value = e.src;
+      sta.title = '인식된 원문 — 오인식을 고치고 적용하면 교정된 원문으로 '
+                  + '재번역됩니다 (번역칸도 함께 고치면 그 번역을 그대로 사용)';
+      scol.appendChild(sta);
+      const cp = document.createElement('button'); cp.className = 'scopy';
+      cp.textContent = '→ 번역칸 복사';
+      cp.title = '원문 텍스트를 번역칸에 복사 (원문 그대로 두고 다듬을 때)';
+      cp.onclick = () => {
+        const t2 = marked[k] && marked[k].ta;
+        if (t2) { t2.value = sta.value; t2.dispatchEvent(new Event('input')); }
+      };
+      scol.appendChild(cp);
+      row.appendChild(scol);
+      m.srcta = sta;
+      m.origSrc = e.src;
+    }
     const ta = document.createElement('textarea'); ta.value = e.text || '';
     row.appendChild(ta);
     // 우측 컬럼 — 폰트 선택 + (아래에 리셋·안내)
@@ -2608,7 +4043,7 @@ async function postDefault(style){
     alert(style
       ? '기본 서식으로 저장했습니다.\n페이지에 반영하려면 재합성 또는 적용을 실행하세요.'
       : '기본 서식을 해제했습니다.\n페이지에 반영하려면 재합성 또는 적용을 실행하세요.');
-    sessionStorage.setItem('rvScroll', String(window.scrollY));
+    saveScroll(null);
     location.reload();
   } catch (err) {
     alert('실패: ' + err.message);
@@ -2720,11 +4155,14 @@ function makeTransform(pg, e, m, cv){
   // 포토샵 자유 변형식 조절 박스 — 드래그=이동(dx/dy),
   // 모서리=비례 크기 / 우측=장평(가로만) / 하단=세로만(장평 자동 보정).
   const tf = document.createElement('div'); tf.className = 'tf';
-  tf.title = '드래그=이동 / 모서리=비례 / 우측=가로 / 하단=세로';
+  tf.title = '드래그=이동 / 모서리=비례 / 상하좌우 핸들=그 방향으로 늘림';
   const hd = document.createElement('div'); hd.className = 'tfh';
   const he = document.createElement('div'); he.className = 'tfe';
+  const hw = document.createElement('div'); hw.className = 'tfw';
   const hs = document.createElement('div'); hs.className = 'tfs';
-  tf.appendChild(hd); tf.appendChild(he); tf.appendChild(hs);
+  const hn = document.createElement('div'); hn.className = 'tfn';
+  tf.appendChild(hd); tf.appendChild(he); tf.appendChild(hw);
+  tf.appendChild(hs); tf.appendChild(hn);
   cv.appendChild(tf);
   m.tf = tf;
   // 마킹 시 트랜스폼 박스가 말풍선을 덮어 우클릭을 가로챔 — 메뉴 연결
@@ -2777,22 +4215,36 @@ function makeTransform(pg, e, m, cv){
       if (mode === 'move') {
         m.lay.dx.value = Math.round(st.dx + ddx);
         m.lay.dy.value = Math.round(st.dy + ddy);
-      } else if (mode === 'w') {           // 가로만 — 장평
-        const nw = Math.max(10, st.w0 + ddx);
+      } else if (mode === 'e' || mode === 'w2') {  // 좌우 — 장평
+        const grow = mode === 'e' ? ddx : -ddx;    // 당기는 방향으로 확장
+        const nw = Math.max(10, st.w0 + grow);
         const ws = nw / (st.w0 / st.ws);
         m.lay.ws.value = Math.max(0.2, Math.round(ws * 100) / 100);
-      } else {                             // 세로 (비례 or 세로만)
-        const nh = Math.max(10, st.h0 + ddy);
+        // 반대편 변 고정 — 중심을 절반만큼 이동
+        const shift = (nw - st.w0) / 2 * (mode === 'e' ? 1 : -1);
+        m.lay.dx.value = Math.round(st.dx + shift);
+      } else if (mode === 'n' || mode === 'v') {   // 상하 — 세로만
+        const grow = mode === 'v' ? ddy : -ddy;
+        const nh = Math.max(10, st.h0 + grow);
         if (st.fill) {                     // 영역 유지 — 폰트 크기만 비율로
           m.lay.size.value = Math.max(6,
             Math.round(st.s0 * nh / st.h0));
         } else {
           m.lay.size.value = Math.max(6,
             Math.round(nh / (spacing() * nLines())));
-          if (mode === 'v') {              // 세로만 — 폭 유지 장평 보정
-            const ws = st.ws * st.h0 / nh;
-            m.lay.ws.value = Math.max(0.2, Math.round(ws * 100) / 100);
-          }
+          const ws = st.ws * st.h0 / nh;   // 폭 유지 장평 보정
+          m.lay.ws.value = Math.max(0.2, Math.round(ws * 100) / 100);
+        }
+        const shift = (nh - st.h0) / 2 * (mode === 'v' ? 1 : -1);
+        m.lay.dy.value = Math.round(st.dy + shift);
+      } else {                             // 모서리 — 비례 (중심 기준)
+        const nh = Math.max(10, st.h0 + ddy);
+        if (st.fill) {
+          m.lay.size.value = Math.max(6,
+            Math.round(st.s0 * nh / st.h0));
+        } else {
+          m.lay.size.value = Math.max(6,
+            Math.round(nh / (spacing() * nLines())));
         }
       }
       paint();
@@ -2818,8 +4270,10 @@ function makeTransform(pg, e, m, cv){
     startDrag(ev, 'move');
   });
   hd.addEventListener('mousedown', ev => startDrag(ev, 'size'));
-  he.addEventListener('mousedown', ev => startDrag(ev, 'w'));
+  he.addEventListener('mousedown', ev => startDrag(ev, 'e'));
+  hw.addEventListener('mousedown', ev => startDrag(ev, 'w2'));
   hs.addEventListener('mousedown', ev => startDrag(ev, 'v'));
+  hn.addEventListener('mousedown', ev => startDrag(ev, 'n'));
 }
 function collectActions(pageFile){
   const out = [];
@@ -2830,6 +4284,9 @@ function collectActions(pageFile){
     if (pg._locked) return;
     if (pg._rebuild)
       out.push({page: pg.file, action: 'rebuild'});
+    if (pg._cropDirty)
+      out.push({page: pg.file, action: 'page_crop',
+                bbox: pg._crop === 'auto' ? 'auto' : pg._crop});
     (pg._adds || []).forEach(a => {
       const it = {page: pg.file, action: 'add', bbox: a.bbox};
       const t = a.ta.value.trim();
@@ -2883,13 +4340,19 @@ function collectActions(pageFile){
       if (lchg) it.layout = layObj;
       return it;
     };
+    const sv = m.srcta ? m.srcta.value : null;
+    const schg = m.srcta && sv.trim() !== (m.origSrc || '').trim();
     if (m.keep && m.keep.checked)
       out.push({page: m.page, id: m.id, action: 'keep'});
     else if (t.trim() !== m.orig.trim()) {
       if (!t.trim()) continue;   // 안전장치: 지우다 만 빈 텍스트는 미적용
                                  // (글자를 없애려면 '원본 보존' 체크 사용)
-      out.push(withExtra({page: m.page, id: m.id, action: 'text', text: t}));
+      const it = withExtra({page: m.page, id: m.id, action: 'text', text: t});
+      if (schg && sv.trim()) it.src = sv;   // 교정 원문도 함께 저장
+      out.push(it);
     }
+    else if (schg && sv.trim())   // 원문만 교정 → 교정 원문으로 재번역
+      out.push(withExtra({page: m.page, id: m.id, action: 'src', src: sv}));
     else if (fchg || lchg)
       out.push(withExtra({page: m.page, id: m.id, action: 'style'}));
     else
@@ -2926,6 +4389,21 @@ function hideBusy(){
   busyEl.classList.remove('on');
   if (busyTimer) { clearInterval(busyTimer); busyTimer = null; }
 }
+function saveScroll(pg){
+  // 절대 scrollY 대신 페이지 앵커+화면 오프셋 저장 — 이미지 lazy 로딩으로
+  // 로드 직후엔 위쪽 페이지 높이가 추정치(placeholder)라 절대 좌표가
+  // 다른 페이지에 착지하는 문제 방지. 복원 시 같은 페이지 기준으로 안착.
+  try {
+    const p = (pg && pg._sec) ? pg : pageInView();
+    if (p && p._sec) {
+      sessionStorage.setItem('rvScroll', JSON.stringify(
+        {p: p.file, dy: Math.round(p._sec.getBoundingClientRect().top)}));
+      return;
+    }
+  } catch (e) {}
+  try { sessionStorage.setItem('rvScroll', String(window.scrollY)); }
+  catch (e) {}
+}
 function saveRemark(pageFile){
   // 새로고침 후에도 작업하던 마킹을 복원 — 편집 흐름 유지
   const ids = [];
@@ -2942,7 +4420,7 @@ async function applyPage(pg, btn){
   btn.disabled = true;
   const old = btn.textContent;
   btn.textContent = '적용 중…';
-  const hasAI = acts.some(a => a.action === 'ai'
+  const hasAI = acts.some(a => a.action === 'ai' || a.action === 'src'
     || (a.action === 'add' && !a.text));
   showBusy(hasAI
     ? '적용 중 (AI 재전사 포함 — 수십 초 걸릴 수 있음)'
@@ -2955,7 +4433,7 @@ async function applyPage(pg, btn){
       throw new Error(res.status === 409
         ? '앱이 다른 작업을 실행 중입니다' : 'HTTP ' + res.status);
     saveRemark(pg.file);
-    sessionStorage.setItem('rvScroll', String(window.scrollY));
+    saveScroll(pg);
     location.reload();   // 오버레이는 새 화면 로드까지 유지
   } catch (err) {
     hideBusy();
@@ -2970,8 +4448,30 @@ window.addEventListener('load', () => {
   let bo = null;
   try { bo = localStorage.getItem('rvBxo'); } catch (e) {}
   if (bo && +bo !== 40) setBoxOpacity(+bo);
+  function restoreAnchor(o){
+    // 저장된 {p: 페이지, dy: 화면 오프셋} 위치로 복원
+    const pg2 = o && DATA.find(p => p.file === o.p);
+    if (!pg2 || !pg2._sec) return false;
+    const fix = () => window.scrollTo(0, window.scrollY
+      + pg2._sec.getBoundingClientRect().top - (o.dy || 0));
+    fix();
+    // lazy 렌더로 위쪽 높이가 확정되며 밀리는 것 재보정 (2회)
+    requestAnimationFrame(fix);
+    setTimeout(fix, 300);
+    return true;
+  }
   const s = sessionStorage.getItem('rvScroll');
-  if (s) { window.scrollTo(0, +s); sessionStorage.removeItem('rvScroll'); }
+  if (s) {   // 적용·되돌리기 직후 새로고침 — 1회성, 최우선
+    sessionStorage.removeItem('rvScroll');
+    if (s.charAt(0) === '{') {
+      try { restoreAnchor(JSON.parse(s)); } catch (e) {}
+    } else window.scrollTo(0, +s);   // 구형 절대좌표 호환
+  } else {   // 검수 페이지를 닫았다 다시 열 때 — 마지막 본 페이지 복원
+    try {
+      const lp = localStorage.getItem(LPKEY);
+      if (lp) restoreAnchor(JSON.parse(lp));
+    } catch (e) {}
+  }
   // 적용 직전 마킹 복원 — 패널이 사라지지 않고 이어서 편집 가능
   try {
     const rm = JSON.parse(sessionStorage.getItem('rvRemark') || 'null');
@@ -2987,7 +4487,32 @@ window.addEventListener('load', () => {
     }
   } catch (e) {}
 });
+// 마지막으로 보던 페이지 기억 — 탭을 닫았다 다시 열 때 그 자리로 복원
+let _lpTimer = null;
+function saveLastPos(){
+  try {
+    const p = pageInView();
+    if (p && p._sec)
+      localStorage.setItem(LPKEY, JSON.stringify(
+        {p: p.file, dy: Math.round(p._sec.getBoundingClientRect().top)}));
+  } catch (e) {}
+}
+window.addEventListener('scroll', () => {
+  clearTimeout(_lpTimer);
+  _lpTimer = setTimeout(saveLastPos, 400);   // 스크롤 멈춘 뒤 저장
+}, {passive: true});
+window.addEventListener('pagehide', saveLastPos);
 </script></body></html>"""
+
+
+def _flush_review_cli(out_dir: Path, results: list) -> None:
+    """페이지마다 review.json 즉시 병합 저장 (원자적 교체) — 작업이 다
+    끝나지 않아도 --html-only/검수 페이지로 중간 검수 가능."""
+    data = json.dumps(merge_review(out_dir, results),
+                      ensure_ascii=False, indent=2)
+    tmp_rj = out_dir / "review.json.tmp"
+    tmp_rj.write_text(data, encoding="utf-8")
+    os.replace(tmp_rj, out_dir / "review.json")
 
 
 def merge_review(out_dir: Path, results: list) -> list:
@@ -3051,6 +4576,7 @@ def write_review_html(out_dir: Path) -> Optional[Path]:
                 "w": w, "h": h,
                 "locked": bool(r.get("locked")),
                 "has_prev": bool(r.get("prev")),
+                "crop": r.get("crop"),
                 "review": r["review"]}
         up = out_dir / "_upscaled" / f"{stem}.png"
         if up.exists():   # 업스케일 원본 (재조판 전) — 비교 보기용
@@ -3059,6 +4585,25 @@ def write_review_html(out_dir: Path) -> Optional[Path]:
         if pm.exists():   # 저장된 브러시 마스크 — 캔버스에 복원
             page["paint"] = f"_paint/{pm.name}?t={int(pm.stat().st_mtime)}"
         pages.append(page)
+    # 리뷰 데이터가 없는 완료본(*_final.png)도 열람용으로 포함 —
+    # 구버전 실행이 review.json을 남기지 못하고 중단됐거나, resume으로
+    # 건너뛴 페이지. 마킹·적용은 막고(locked) 보기만 가능. 검수하려면
+    # '완료된 페이지 건너뛰기'를 끄고 해당 페이지를 재실행.
+    listed = {Path(p["file"]).stem for p in pages}
+    for img in sorted(out_dir.glob("*_final.png")):
+        stem = img.name[:-len("_final.png")]
+        if stem in listed:
+            continue
+        try:
+            with Image.open(img) as im:
+                w, h = im.size
+        except Exception:
+            continue
+        pages.append({"file": f"{stem}.png",
+                      "img": f"{img.name}?t={int(img.stat().st_mtime)}",
+                      "w": w, "h": h, "locked": True, "nodata": True,
+                      "has_prev": False, "review": []})
+    pages.sort(key=lambda p: p["file"])
     if not pages:
         return None
     fonts = [{"label": lb, "path": pth, "index": ix}
@@ -3073,7 +4618,9 @@ def write_review_html(out_dir: Path) -> Optional[Path]:
     html = (_REVIEW_HTML
             .replace("__DATA__", json.dumps(pages, ensure_ascii=False))
             .replace("__FONTS__", json.dumps(fonts, ensure_ascii=False))
-            .replace("__DEF__", json.dumps(defstyle, ensure_ascii=False)))
+            .replace("__DEF__", json.dumps(defstyle, ensure_ascii=False))
+            .replace("__OUTKEY__",
+                     json.dumps(str(out_dir.resolve()), ensure_ascii=False)))
     p = out_dir / "review.html"
     p.write_text(html, encoding="utf-8")
     return p
@@ -3099,6 +4646,8 @@ def _entries_from_review(r: dict) -> list:
         ent = {"id": e["id"], "text": e.get("text"),
                "kind": e.get("kind", "none"),
                "confidence": e.get("confidence", "low")}
+        if e.get("src"):   # 번역 모드 원문 — 재조판 왕복에도 보존
+            ent["src"] = e["src"]
         if e.get("manual_bbox"):
             ent["manual_bbox"] = e["manual_bbox"]
         if e.get("font"):
@@ -3151,9 +4700,22 @@ def apply_rework(out_dir: Path, rework_path: Path, args, pages_dir: Path,
 
     def _transcribe(cs: list) -> list[dict]:
         eng = getattr(args, "ocr_engine", "claude")
+        xl = xlat_cfg(args, out_dir)
+        if xl and getattr(args, "translate_mode", "vision") \
+                == "local-ocr" and eng == "claude":
+            eng = "tesseract"
+        if eng == "gemini":
+            return transcribe_gemini_route(cs, args, xl)
+        if eng == "deepseek":
+            return transcribe_deepseek_route(cs, args, xl)
         if eng != "claude":
-            return transcribe_local(cs, eng)
-        return transcribe_consensus(cs, args.model)
+            rs = transcribe_local(cs, eng, lang=xl["lang"] if xl else "ko")
+            if xl:
+                translate_texts(rs, xl, args.model)
+            return rs
+        if xl and not getattr(args, "translate_consensus", False):
+            return transcribe_claude(cs, args.model, xlat=xl)
+        return transcribe_consensus(cs, args.model, xlat=xl)
     per_page: dict = {}
     for it in items:
         if it.get("action") in ("lock", "unlock"):
@@ -3170,6 +4732,30 @@ def apply_rework(out_dir: Path, rework_path: Path, args, pages_dir: Path,
             # 말풍선 변경 없이 페이지 재합성 — 기존 전사 재사용 (API 비용 0).
             # 배경 처리 방식 변경 등을 기존 결과물에 적용할 때 사용.
             per_page.setdefault(it["page"], [])
+            continue
+        if it.get("action") == "page_crop":
+            # 출력 크롭 — review.json에만 저장, 최종본 ZIP 내보내기에서
+            # 적용. 작업 파일·좌표계는 그대로 (재조판·API 비용 0).
+            r = by_page.get(it["page"])
+            if r is None:
+                log(f"  !! review.json에 없는 페이지: {it['page']} — "
+                    "크롭 건너뜀")
+                continue
+            bb = it.get("bbox")
+            if bb == "auto":   # 여백 자동 감지 (최종 결과물 기준)
+                fp_img = out_dir / f"{Path(it['page']).stem}_final.png"
+                if fp_img.exists():
+                    with Image.open(fp_img) as im_c:
+                        bb = list(_auto_crop_bbox(im_c))
+                else:
+                    bb = None
+            if bb and len(bb) == 4 and int(bb[2]) >= 16 and int(bb[3]) >= 16:
+                r["crop"] = [int(v) for v in bb]
+                log(f"  {it['page']}: 출력 크롭 {r['crop']} "
+                    "(최종본 ZIP에 적용)")
+            else:
+                r.pop("crop", None)
+                log(f"  {it['page']}: 출력 크롭 해제")
             continue
         if it.get("action") == "revert":
             continue   # 아래 별도 패스에서 처리
@@ -3232,17 +4818,39 @@ def apply_rework(out_dir: Path, rework_path: Path, args, pages_dir: Path,
                 log(f"  !! {page_name} id {it['id']} 없음 — 건너뜀")
                 continue
             if it.get("action") == "text":
-                tv = it.get("text") or ""
+                tv = _clean_ws(it.get("text") or "")
                 e["text"] = tv if tv.strip() else None  # 들여쓰기 공백 유지
                 e["confidence"] = "high"
-                # 직접 입력한 텍스트는 반드시 재조판되도록 kind 보정.
-                # 손글씨(hand)는 손글씨 재조판 설정+폰트가 있을 때만 유지
-                # (없으면 보존 정책에 걸려 글씨가 안 나옴)
-                if not (e.get("kind") == "hand"
-                        and getattr(args, "retype_hand", False)
-                        and getattr(args, "hand_font", None)):
-                    e["kind"] = "dialogue"
+                if (it.get("src") or "").strip():   # 교정 원문 함께 저장
+                    e["src"] = _clean_ws(it["src"])
+                _retype_kind_fix(e, args)
                 e["passes"] = "manual"
+                _apply_font(e, it)
+                _apply_layout(e, it)
+            elif it.get("action") == "src":
+                # 원문(전사) 교정 — 교정된 원문으로 재번역 (텍스트 요청
+                # 1건, 이미지 재전사 없음). 번역 모드가 아니면 저장만.
+                sv = _clean_ws(it.get("src") or "")
+                if sv.strip():
+                    e["src"] = sv
+                    xl = xlat_cfg(args, out_dir)
+                    if xl:
+                        tmp = {"text": sv, "confidence": "high"}
+                        translate_texts([tmp], xl,
+                                        getattr(args, "model",
+                                                "claude-sonnet-4-5"))
+                        if (tmp.get("text") or "").strip():
+                            e["text"] = tmp["text"]
+                            e["confidence"] = "high"
+                            _retype_kind_fix(e, args)
+                            e["passes"] = "src-edit+xlat"
+                            log(f"  {page_name} id {it['id']}: "
+                                f"교정 원문으로 재번역 완료")
+                        else:
+                            log(f"  !! {page_name} id {it['id']}: 재번역 "
+                                f"실패 — 기존 번역 유지 (교정 원문만 저장)")
+                    else:
+                        e["passes"] = "src-edit"
                 _apply_font(e, it)
                 _apply_layout(e, it)
             elif it.get("action") == "keep":
@@ -3274,10 +4882,7 @@ def apply_rework(out_dir: Path, rework_path: Path, args, pages_dir: Path,
 
         if ai_ids or adds:
             img = imread_unicode(pf)
-            restored, _ = restore_page(img, text_black=args.text_black,
-                                       text_white=args.text_white,
-                                       thicken=args.thicken, paper=args.paper,
-                                       denoise=not args.no_denoise)
+            restored, _ = restore_cached(img, pf, args, out_dir)
             rgray = cv2.cvtColor(restored, cv2.COLOR_BGR2GRAY)
             bubbles = detect_bubbles(rgray)
             # 기존 수동 영역도 감지 목록 뒤에 붙여 id 정합 유지
@@ -3304,9 +4909,13 @@ def apply_rework(out_dir: Path, rework_path: Path, args, pages_dir: Path,
                     hand_ok = (new_kind == "hand"
                                and getattr(args, "retype_hand", False)
                                and getattr(args, "hand_font", None))
+                    sfx_ok = (new_kind == "sfx"
+                              and getattr(args, "retype_sfx", False)
+                              and getattr(args, "sfx_font", None))
                     will_show = bool((rr.get("text") or "").strip()) \
                         and new_conf == "high" \
-                        and (new_kind == "dialogue" or hand_ok)
+                        and (new_kind in ("dialogue", "caption", "shout")
+                             or hand_ok or sfx_ok)
                     if old_retyped.get(bid) and not will_show:
                         # 회귀 방지 — 재전사 결과가 비확신/비대사 분류라
                         # 이미 보이던 글씨가 사라질 상황이면 기존 텍스트를
@@ -3322,7 +4931,7 @@ def apply_rework(out_dir: Path, rework_path: Path, args, pages_dir: Path,
                     e["text"] = rr.get("text")
                     e["kind"] = new_kind
                     e["confidence"] = new_conf
-                    for k in ("alt", "fixed", "uncertain"):
+                    for k in ("alt", "fixed", "uncertain", "src"):
                         if rr.get(k):
                             e[k] = rr[k]
                     e["passes"] = f"rework-{rr.get('passes') or 'ai'}"
@@ -3330,8 +4939,11 @@ def apply_rework(out_dir: Path, rework_path: Path, args, pages_dir: Path,
                             and (rr.get("text") or "").strip():
                         # 미처리(주황) 말풍선을 사용자가 마킹해 적용 =
                         # 처리 지시 — 분류·확신도와 무관하게 재조판 승격
-                        if not hand_ok:
-                            e["kind"] = "dialogue"
+                        if not (hand_ok or sfx_ok):
+                            # 캡션·외침 분류는 유지 (전용 폰트 적용 대상)
+                            e["kind"] = (new_kind if new_kind in
+                                         ("caption", "shout")
+                                         else "dialogue")
                         e["confidence"] = "high"
                         e["passes"] = "rework-forced"
                         log(f"  {page_name} id {bid}: {new_kind}/{new_conf}"
@@ -3368,7 +4980,7 @@ def apply_rework(out_dir: Path, rework_path: Path, args, pages_dir: Path,
                     ent["text"] = rr.get("text")
                     ent["kind"] = rr.get("kind") or "dialogue"
                     ent["confidence"] = rr.get("confidence", "low")
-                    for k in ("alt", "fixed", "uncertain"):
+                    for k in ("alt", "fixed", "uncertain", "src"):
                         if rr.get(k):
                             ent[k] = rr[k]
                     ent["passes"] = f"add-{rr.get('passes') or 'ai'}"
@@ -3434,7 +5046,32 @@ def main() -> int:
     ap.add_argument("--hand-font", default=None,
                     help="손글씨 대사용 폰트 .ttf (예: NanumBrush.ttf)")
     ap.add_argument("--hand-font-index", type=int, default=0)
+    ap.add_argument("--caption-font", default=None,
+                    help="내레이션·캡션(kind=caption) 전용 폰트 경로 "
+                         "(미지정 시 본문 폰트 사용)")
+    ap.add_argument("--caption-font-index", type=int, default=0)
+    ap.add_argument("--shout-font", default=None,
+                    help="외침(kind=shout) 전용 폰트 경로 "
+                         "(미지정 시 본문 폰트 사용)")
+    ap.add_argument("--shout-font-index", type=int, default=0)
+    ap.add_argument("--retype-sfx", action="store_true",
+                    help="효과음(sfx)도 재조판 (기본 보존 — "
+                         "--sfx-font 필수)")
+    ap.add_argument("--sfx-font", default=None,
+                    help="효과음 전용 폰트 경로 (검은고딕·을지로체 등)")
+    ap.add_argument("--sfx-font-index", type=int, default=0)
+    ap.add_argument("--erase-fill", type=float, default=0.0,
+                    help="재조판 말풍선의 원본 글줄 영역을 통째로 종이색 "
+                         "채움 패드 px (0=끔, 6 권장 — 색 배경 위 잔영 제거,"
+                         " 밴드를 가로지르는 테두리·그림 선은 보호)")
+    ap.add_argument("--text-backing", type=float, default=0.0,
+                    help="재조판 글자 뒤를 종이색으로 채우는 패드 px "
+                         "(0=끔, 8 권장 — 지움 범위 밖 잔영 가림)")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--range", dest="page_range", default="",
+                    help="처리할 페이지 범위 — 파일 정렬 순서 기준 1부터. "
+                         "'5-20'(5~20장), '5-'(5장부터 끝), '-20'(20장까지), "
+                         "'7'(7장만). --limit는 범위 안에서 추가 적용")
     ap.add_argument("--ext", default=".png,.jpg,.jpeg,.webp")
     ap.add_argument("--debug", action="store_true")
     ap.add_argument("--no-psd", action="store_true")
@@ -3448,22 +5085,71 @@ def main() -> int:
                          "(기본은 건너뜀 — 크레딧 절약)")
     ap.add_argument("--no-preserve-bg", dest="preserve_bg",
                     action="store_false", default=True,
-                    help="원본 배경 100% 보존 끄기 — 근백색 영역만 "
+                    help="원본 배경 100%% 보존 끄기 — 근백색 영역만 "
                          "v2 보정 블렌딩 (구 중간 단계 동작)")
     ap.add_argument("--batch", action="store_true",
-                    help="Message Batches API로 전사 (비용 50% 할인, "
+                    help="Message Batches API로 전사 (비용 50%% 할인, "
                          "완료까지 폴링 대기)")
     ap.add_argument("--ocr-engine", default="claude",
-                    choices=["claude", "windows", "tesseract", "easyocr"],
-                    help="전사 엔진 — claude(기본·정확) 외 로컬 OCR은 "
-                         "무료지만 정확도 낮고 손글씨/효과음 분류 불가")
+                    choices=["claude", "gemini", "deepseek", "windows", "tesseract",
+                             "easyocr"],
+                    help="전사 엔진 — claude(기본·정확·합의 검증), "
+                         "gemini(저가 비전 — 1회 전사, Google API 키 필요, "
+                         "kind 분류·번역 지원), 나머지 로컬 OCR은 무료지만 "
+                         "정확도 낮고 손글씨/효과음 분류 불가")
+    ap.add_argument("--source-lang", default="ko",
+                    choices=["ko", "de", "en", "ja"],
+                    help="원서 언어 — ko(기본)=한글 복원, 그 외=한글 번역 "
+                         "모드 (예: de=독일어 원서를 한글로 번역해 재조판)")
+    ap.add_argument("--translate-mode", default="vision",
+                    choices=["vision", "local-ocr"],
+                    help="번역 방식 — vision(기본)=Claude가 이미지에서 원문 "
+                         "전사+번역을 한 번에(정확), local-ocr=로컬 OCR로 "
+                         "원문 추출 후 페이지 단위 텍스트 번역(저렴, "
+                         "--ocr-engine의 로컬 엔진 사용·claude면 tesseract)")
+    ap.add_argument("--translate-consensus", action="store_true",
+                    help="번역 vision 모드에서도 이중 전사+검증 합의 사용 "
+                         "(기본은 1회 전사 — 가독성 좋은 원서 전제, 열화 "
+                         "페이지용 옵션)")
+    ap.add_argument("--glossary", default=None,
+                    help="번역 용어집 파일 경로 (기본: 출력폴더/_glossary.txt "
+                         "자동 인식 — 등장인물 이름 표기·말투 규칙 등)")
+    ap.add_argument("--translate-backend", default="claude",
+                    choices=["claude", "gemini", "ollama"],
+                    help="텍스트 번역 엔진 — claude(기본), gemini(저렴), "
+                         "ollama(로컬 무료·API 키 불필요). local-ocr 번역 "
+                         "방식에서만 쓰임 (vision 방식은 전사+번역이 한 "
+                         "요청이라 전사 엔진을 따름)")
+    ap.add_argument("--ollama-model", default=OLLAMA_MODEL,
+                    help=f"Ollama 모델 이름 (기본 {OLLAMA_MODEL} — "
+                         "미리 ollama pull 로 받아둘 것)")
+    ap.add_argument("--ollama-url", default=OLLAMA_URL,
+                    help=f"Ollama 서버 주소 (기본 {OLLAMA_URL})")
+    ap.add_argument("--gemini-model", default=GEMINI_MODEL,
+                    help=f"Gemini 모델 (기본 {GEMINI_MODEL})")
+    ap.add_argument("--gemini-key", default=None,
+                    help="Gemini API 키 (기본: GEMINI_API_KEY 환경변수)")
+    ap.add_argument("--deepseek-model", default=DEEPSEEK_MODEL,
+                    help=f"DeepSeek 모델 (기본 {DEEPSEEK_MODEL})")
+    ap.add_argument("--deepseek-key", default=None,
+                    help="DeepSeek API 키 (기본: DEEPSEEK_API_KEY 환경변수)")
+    ap.add_argument("--deepseek-url", default=DEEPSEEK_URL,
+                    help="OpenAI 호환 서버 URL — 공식 API가 이미지를 "
+                         "거부하면 비전 지원 호환 서버로 교체")
     ap.add_argument("--rework", default=None,
                     help="검수 페이지에서 저장한 rework.json 경로 — "
                          "마킹된 말풍선만 재조판 (--src는 원래 재조판 "
                          "입력 폴더)")
+    ap.add_argument("--export-zip", nargs="?", const="auto", default=None,
+                    help="최종 결과물(*_final.png)만 ZIP 아카이브 후 종료 "
+                         "(경로 생략 시 출력폴더\\<폴더명>_final.zip, "
+                         ".cbz 확장자로 지정하면 만화 뷰어용)")
     ap.add_argument("--html-only", action="store_true",
                     help="재조판 없이 review.json으로 검수 페이지만 "
                          "재생성하고 종료")
+    ap.add_argument("--skip-retype", action="store_true",
+                    help="전사·재조판 건너뛰기 — 감지·결과 생성만 수행 "
+                         "(API 비용 0, 이후 검수 페이지에서 선별 전사)")
     ap.add_argument("--strict", action="store_true", default=True,
                     help="high 확신도만 재조판 (기본 켜짐)")
     ap.add_argument("--no-strict", dest="strict", action="store_false",
@@ -3479,15 +5165,30 @@ def main() -> int:
     ap.add_argument("--text-black", type=int, default=80)
     ap.add_argument("--text-white", type=int, default=210)
     ap.add_argument("--thicken", type=float, default=0.5)
+    ap.add_argument("--ink-boost", type=float, default=0.0,
+                    help="원본 글자 획 굵기 보강 px (기본 0=끔, 0.5~2 권장 — "
+                         "업스케일로 가늘어진 폰트 복구, 말풍선 글자만 적용)")
     ap.add_argument("--paper", type=int, default=215)
     ap.add_argument("--no-denoise", action="store_true")
     args = ap.parse_args()
 
+    # Claude 전사 또는 Claude 번역 호출이 있을 때만 API 키 필요
     if not args.export_crops and not args.transcript \
-            and args.ocr_engine == "claude" \
+            and not args.skip_retype \
+            and needs_api_key(args) \
             and not os.environ.get("ANTHROPIC_API_KEY"):
         print("ERROR: ANTHROPIC_API_KEY 환경변수가 없습니다. API 없이 "
-              "쓰려면 --export-crops 또는 --ocr-engine 로컬 엔진을 쓰세요.",
+              "쓰려면 --export-crops 또는 --ocr-engine 로컬 엔진을 쓰세요 "
+              "(번역 모드는 --translate-backend gemini/ollama 로 바꾸면 "
+              "Anthropic 키 없이 동작).",
+              file=sys.stderr)
+        return 2
+    if not args.export_crops and not args.transcript \
+            and not args.skip_retype \
+            and needs_gemini_key(args) and not _gemini_key(args):
+        print("ERROR: Gemini API 키가 없습니다 — --gemini-key 또는 "
+              "GEMINI_API_KEY 환경변수를 설정하세요 "
+              "(https://aistudio.google.com/apikey 무료 발급).",
               file=sys.stderr)
         return 2
 
@@ -3501,6 +5202,13 @@ def main() -> int:
     src, out = Path(args.src), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
+    # 최종본 ZIP 아카이브만 수행하고 종료
+    if args.export_zip:
+        zp = None if args.export_zip == "auto" else Path(args.export_zip)
+        zp, n, nl = export_final_zip(out, zp)
+        print(f"최종본 아카이브: {zp} ({n}페이지, 수동확정 잠금 {nl}페이지)")
+        return 0
+
     # 검수 페이지만 재생성 (재조판·API 없음)
     if args.html_only:
         hp = write_review_html(out)
@@ -3513,10 +5221,18 @@ def main() -> int:
         n = apply_rework(out, Path(args.rework), args, src)
         print(f"검수 반영 완료 — {n}페이지 재조판. "
               f"검수 페이지: {out / 'review.html'}")
+        us = usage_summary()
+        if us:
+            print(us)
         return 0
 
     exts = {e.strip().lower() for e in args.ext.split(",") if e.strip()}
     files = sorted(p for p in src.iterdir() if p.suffix.lower() in exts)
+    if args.page_range:
+        total = len(files)
+        files = apply_page_range(files, args.page_range)
+        print(f"페이지 범위 {args.page_range} — 전체 {total}장 중 "
+              f"{len(files)}장 처리")
     if args.limit:
         files = files[:args.limit]
     if not files:
@@ -3525,9 +5241,17 @@ def main() -> int:
 
     locked = load_locked(out)   # 수동 확정 페이지 — 절대 재처리 안 함
 
+    # 전사·재조판 스킵 — 감지·결과 생성만 (검수에서 선별 전사)
+    if args.skip_retype and transcript is None:
+        transcript = {}
+        print("전사·재조판 건너뜀 — 감지만 수행", flush=True)
+
     # Batch API 전사: 전 페이지 크롭 수집 → 배치 제출 → transcript로 주입
+    # (번역 local-ocr 모드는 로컬 추출이라 배치 대상 아님)
+    xl_main = xlat_cfg(args, out)
     if args.batch and not args.export_crops and transcript is None \
-            and args.ocr_engine == "claude":
+            and args.ocr_engine == "claude" \
+            and not (xl_main and args.translate_mode == "local-ocr"):
         todo = [f for f in files if f.name not in locked
                 and (args.no_resume
                      or not (out / f"{f.stem}_final.png").exists())]
@@ -3536,11 +5260,15 @@ def main() -> int:
                   flush=True)
             pages = []
             for f in todo:
-                crops = prepare_crops(f, args)
+                crops = prepare_crops(f, args, out)
                 pages.append((f.name, crops))
                 print(f"  {f.name}: 말풍선 {len(crops)}개", flush=True)
-            transcript = transcribe_batch(pages, args.model,
-                                          fast=args.fast_transcribe)
+            transcript = transcribe_batch(
+                pages, args.model,
+                fast=(args.fast_transcribe
+                      or (xl_main is not None
+                          and not args.translate_consensus)),
+                xlat=xl_main)
             print("배치 전사 완료 — 재조판 시작", flush=True)
 
     results = []
@@ -3548,10 +5276,12 @@ def main() -> int:
         if f.name in locked:
             print(f"[{i}/{len(files)}] {f.name} — 수동 확정 잠금, 건너뜀")
             results.append({"file": f.name, "status": "locked"})
+            _flush_review_cli(out, results)
             continue
         if not args.no_resume and (out / f"{f.stem}_final.png").exists():
             print(f"[{i}/{len(files)}] {f.name} — 완료본 있음, 건너뜀")
             results.append({"file": f.name, "status": "skipped"})
+            _flush_review_cli(out, results)
             continue
         print(f"[{i}/{len(files)}] {f.name}", flush=True)
         try:
@@ -3560,6 +5290,19 @@ def main() -> int:
             r = {"file": f.name, "status": "error", "error": str(e),
                  "trace": traceback.format_exc()}
             results.append(r)
+            _flush_review_cli(out, results)
+            if "이미지 입력을 지원하지 않는" in str(e):
+                print("!! DeepSeek 서버가 이미지를 거부 — 남은 페이지를 "
+                      "중단합니다. 'DeepSeek URL'을 비전 지원 서버로 "
+                      "바꾸세요. 예: https://api.deepinfra.com/v1/openai "
+                      "+ 모델 deepseek-ai/DeepSeek-OCR + DeepInfra 키",
+                      file=sys.stderr)
+                break
+            if "API 오류 401" in str(e) or "API 오류 403" in str(e):
+                print("!! API 키 인증 실패 — 같은 오류가 반복되므로 남은 "
+                      "페이지를 중단합니다. 키를 확인하고 재실행하세요.",
+                      file=sys.stderr)
+                break
             if "credit balance" in str(e).lower():
                 print("!! API 크레딧 소진 — 남은 페이지를 중단합니다. "
                       "충전 후 재실행하면 완료된 페이지는 건너뜁니다.",
@@ -3568,14 +5311,16 @@ def main() -> int:
             print(f"    -> 오류: {e}", file=sys.stderr)
             continue
         results.append(r)
+        _flush_review_cli(out, results)   # 실행 중에도 검수 페이지 생성 가능
         if r.get("status") == "ok":
             print(f"    -> 말풍선 {r['bubbles']}개, 재조판 {r['retyped']}개")
 
-    (out / "review.json").write_text(
-        json.dumps(merge_review(out, results), ensure_ascii=False, indent=2),
-        encoding="utf-8")
+    _flush_review_cli(out, results)
     ok = sum(1 for r in results if r.get("status") in ("ok", "crops_exported"))
     print(f"\n완료 {ok}/{len(results)}장. 리포트: {out / 'review.json'}")
+    us = usage_summary()
+    if us:
+        print(us)
     hp = write_review_html(out)
     if hp:
         print(f"검수 페이지: {hp} — 브라우저로 열어 재작업할 말풍선을 "

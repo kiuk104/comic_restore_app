@@ -18,7 +18,7 @@ set "PS1=%TEMP%\make_comic_shortcut.ps1"
 >>"%PS1%" echo   $s.TargetPath = $env:ComSpec
 >>"%PS1%" echo   $s.Arguments = '/c "' + $here + 'run_app.bat"'
 >>"%PS1%" echo   $s.WorkingDirectory = $here
->>"%PS1%" echo   $s.IconLocation = $env:SystemRoot + '\System32\imageres.dll,74'
+>>"%PS1%" echo   $s.IconLocation = $here + 'app_icon.ico'
 >>"%PS1%" echo   $s.Description = 'Comic Restore App'
 >>"%PS1%" echo   $s.Save()
 >>"%PS1%" echo   Write-Host ('Created: ' + (Join-Path $d 'ComicRestore.lnk'))
