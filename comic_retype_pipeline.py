@@ -39,7 +39,7 @@ v2(comic_restore_pipeline)의 비파괴 톤 보정을 베이스로 깔고, 그 �
 
 from __future__ import annotations
 
-__version__ = "0.16.3"   # Gemini 전사+별도 백엔드 번역 분리, 파트별 API 요금 표시
+__version__ = "0.16.6"   # JSON 후행 콤마 관용 (Gemini 응답 파싱 실패 구제)
 
 import argparse
 import base64
@@ -586,7 +586,15 @@ def _parse_json_reply(raw: str) -> list[dict]:
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.strip("`").lstrip("json").strip()
-    out = json.loads(raw)
+    try:
+        out = json.loads(raw)
+    except json.JSONDecodeError:
+        # 후행 콤마 관용 (Gemini가 간혹 [{...},] 형태로 응답 — 실기기
+        # 2026-07-15 발생). 문자열 밖의 ",]"/",}"만 제거하는 정규식이
+        # 이상적이나, 전사 텍스트에 그 패턴이 실제로 들어갈 일은 없어
+        # 단순 치환 후 재시도로 충분.
+        import re as _re
+        out = json.loads(_re.sub(r",\s*([\]}])", r"\1", raw))
     if isinstance(out, list):   # 전사/번역 텍스트의 특수 공백 정규화
         for it in out:
             if isinstance(it, dict):
@@ -3389,7 +3397,9 @@ document.addEventListener('keydown', ev => {
   if (ev.key === 'Escape' && zoomSel) toggleZoomSel();
   if (ev.key === 'Enter' && SERVER) {
     const ae = document.activeElement;   // 편집 중이면 적용 금지 (2중 가드)
-    if (ae && ['TEXTAREA', 'INPUT', 'SELECT'].includes(ae.tagName))
+    if (ae && ae.tagName === 'SELECT')
+      ae.blur();   // 폰트 셀렉트에서 Enter = 적용 진행 (조용한 무시 방지)
+    else if (ae && ['TEXTAREA', 'INPUT'].includes(ae.tagName))
       return;
     ev.preventDefault();
     const pg = pageInView();   // 화면에 보이는 페이지에 적용
@@ -4405,13 +4415,29 @@ function saveScroll(pg){
   catch (e) {}
 }
 function saveRemark(pageFile){
-  // 새로고침 후에도 작업하던 마킹을 복원 — 편집 흐름 유지
-  const ids = [];
-  for (const k in marked)
-    if (marked[k].page === pageFile) ids.push(marked[k].id);
+  // 새로고침 후에도 작업하던 마킹·입력 내용을 복원 — 적용한 페이지
+  // (pageFile)는 서버가 새 값을 가지므로 마킹 위치만, 다른 페이지는
+  // 편집 중이던 텍스트·원문·폰트·레이아웃까지 저장. (예전엔 적용
+  // 페이지 id만 저장해 다른 페이지의 미적용 수정이 리로드로 통째
+  // 소실됐음 — '폰트 바꾸다 본문이 원래대로' 증상의 원인)
+  const items = [];
+  for (const k in marked) {
+    const m = marked[k];
+    const it = {page: m.page, id: m.id};
+    if (m.page !== pageFile) {
+      it.text = m.ta.value;
+      if (m.srcta) it.src = m.srcta.value;
+      if (m.font) it.font = m.font.value;
+      if (m.keep) it.keep = m.keep.checked;
+      if (m.lay) it.lay = {s: m.lay.size.value, x: m.lay.dx.value,
+        y: m.lay.dy.value, p: m.lay.sp.value, t: m.lay.tr.value,
+        w: m.lay.ws.value, d: m.lay.dt.value, a: m.lay.al.value,
+        f: m.lay.fill.checked};
+    }
+    items.push(it);
+  }
   try {
-    sessionStorage.setItem('rvRemark',
-      JSON.stringify({page: pageFile, ids: ids}));
+    sessionStorage.setItem('rvRemark', JSON.stringify({items: items}));
   } catch (e) {}
 }
 async function applyPage(pg, btn){
@@ -4476,15 +4502,32 @@ window.addEventListener('load', () => {
   try {
     const rm = JSON.parse(sessionStorage.getItem('rvRemark') || 'null');
     sessionStorage.removeItem('rvRemark');
-    if (rm && rm.ids && rm.ids.length) {
-      const pg2 = DATA.find(p => p.file === rm.page);
-      if (pg2 && !pg2._locked) {
-        rm.ids.forEach(id => {
-          const e2 = pg2.review.find(x => x.id === id);
-          if (e2 && e2._box) toggle(pg2, e2, e2._box, pg2._sec);
-        });
+    const items = rm && (rm.items
+      || (rm.ids || []).map(id => ({page: rm.page, id: id})));
+    (items || []).forEach(it => {
+      const pg2 = DATA.find(p => p.file === it.page);
+      if (!pg2 || pg2._locked) return;
+      const e2 = pg2.review.find(x => x.id === it.id);
+      if (!e2 || !e2._box) return;
+      toggle(pg2, e2, e2._box, pg2._sec);
+      const m = marked[key(it.page, it.id)];
+      if (!m) return;
+      if (it.text !== undefined && it.text !== m.ta.value) {
+        m.ta.value = it.text;
+        m.ta.dispatchEvent(new Event('input'));
       }
-    }
+      if (it.src !== undefined && m.srcta) m.srcta.value = it.src;
+      if (it.font !== undefined && m.font) m.font.value = it.font;
+      if (it.keep !== undefined && m.keep) m.keep.checked = it.keep;
+      if (it.lay && m.lay) {
+        m.lay.size.value = it.lay.s; m.lay.dx.value = it.lay.x;
+        m.lay.dy.value = it.lay.y; m.lay.sp.value = it.lay.p;
+        m.lay.tr.value = it.lay.t; m.lay.ws.value = it.lay.w;
+        m.lay.dt.value = it.lay.d; m.lay.al.value = it.lay.a;
+        m.lay.fill.checked = !!it.lay.f;
+        m.lay.size.dispatchEvent(new Event('input'));
+      }
+    });
   } catch (e) {}
 });
 // 마지막으로 보던 페이지 기억 — 탭을 닫았다 다시 열 때 그 자리로 복원
@@ -4505,14 +4548,47 @@ window.addEventListener('pagehide', saveLastPos);
 </script></body></html>"""
 
 
+def _replace_retry(tmp: Path, dst: Path, retries: int = 6) -> None:
+    """os.replace 재시도 — Windows에서 검수 서버·백신·클라우드 동기화가
+    대상을 잠깐 잡고 있으면 WinError 5/32(액세스 거부)가 나므로, 잠시
+    기다렸다 재시도하고 읽기 전용 속성이면 해제한다. 끝내 안 되면
+    비원자적 직접 쓰기로 폴백 (반쪽 JSON 위험 < 저장 소실)."""
+    import stat
+    import time
+    for n in range(retries):
+        try:
+            os.replace(tmp, dst)
+            return
+        except OSError:
+            try:   # 읽기 전용 속성이었다면 해제 후 재시도
+                if dst.exists():
+                    os.chmod(dst, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
+            time.sleep(0.2 * (n + 1))
+    dst.write_text(tmp.read_text(encoding="utf-8"), encoding="utf-8")
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+
+
 def _flush_review_cli(out_dir: Path, results: list) -> None:
     """페이지마다 review.json 즉시 병합 저장 (원자적 교체) — 작업이 다
-    끝나지 않아도 --html-only/검수 페이지로 중간 검수 가능."""
-    data = json.dumps(merge_review(out_dir, results),
-                      ensure_ascii=False, indent=2)
-    tmp_rj = out_dir / "review.json.tmp"
-    tmp_rj.write_text(data, encoding="utf-8")
-    os.replace(tmp_rj, out_dir / "review.json")
+    끝나지 않아도 --html-only/검수 페이지로 중간 검수 가능.
+
+    저장 실패는 경고만 하고 계속 진행 — 다음 페이지 플러시가 전체를
+    병합 재저장하므로 실행을 중단시킬 이유가 없다 (실기기 305장 실행이
+    WinError 5 한 번으로 통째로 중단됐던 사고의 재발 방지)."""
+    try:
+        data = json.dumps(merge_review(out_dir, results),
+                          ensure_ascii=False, indent=2)
+        tmp_rj = out_dir / "review.json.tmp"
+        tmp_rj.write_text(data, encoding="utf-8")
+        _replace_retry(tmp_rj, out_dir / "review.json")
+    except OSError as e:
+        print(f"    !! review.json 저장 실패(다음 플러시에서 재시도): {e}",
+              flush=True)
 
 
 def merge_review(out_dir: Path, results: list) -> list:

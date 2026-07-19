@@ -28,7 +28,7 @@ Claude 번역. 실행이 끝나면(취소 포함) 전사/번역 파트별 API �
 """
 from __future__ import annotations
 
-__version__ = "0.11.2"  # 모바일 검수: 홈 화면 아이콘 (GAS 파비콘)
+__version__ = "0.13.7"  # 읽기 폰트(제목 포함)·연속 공백 유지·버전 표시
 
 import argparse
 import html
@@ -757,10 +757,103 @@ def write_txt(path: Path, paras_ko: list[str]) -> None:
     path.write_text("\n\n".join(paras_ko) + "\n", encoding="utf-8")
 
 
+# 인라인 서식 마커 — 편집칸에서 입력, EPUB에서 실제 서식으로.
+#   ~~취소선~~  ++밑줄++  **굵게**  *기울임*   / 문단 내 줄바꿈은 <br/>
+#   줄 맨 앞 '>> ' = 그 줄만 오른쪽 정렬 (예: 헌사·서명 — 줄마다 지정)
+_INLINE = [(re.compile(r"\*\*(.+?)\*\*", re.S), "strong"),
+           (re.compile(r"~~(.+?)~~", re.S), "s"),
+           (re.compile(r"\+\+(.+?)\+\+", re.S), "u"),
+           (re.compile(r"\*([^*\n]+?)\*"), "em")]
+
+
+def _cover_jpg(cfg: dict, book: dict):
+    """EPUB 표지 이미지 — book["cover"](없으면 첫 페이지) 스캔을 JPEG로.
+
+    소스 접근이 필요하므로 PC에서 재생성할 때만 만들어진다. 실패하면
+    None → 표지 없는 EPUB (기존과 동일)."""
+    try:
+        import cv2
+        src = Path(cfg.get("src") or "")
+        labels = (book or {}).get("page_labels") or []
+        label = (book or {}).get("cover") or (labels[0] if labels else "")
+        if not label or not src.exists():
+            return None
+        kind, _n = probe_source(src)
+        if kind == "pdf-text":
+            kind = "pdf-scan"                  # 표지는 렌더가 필요
+        pg = (src / label) if kind == "images" else int(label[1:]) - 1
+        img = load_page_image(src, kind, pg)
+        h, w = img.shape[:2]
+        if max(h, w) > 1600:
+            sc = 1600 / max(h, w)
+            img = cv2.resize(img, (int(w * sc), int(h * sc)),
+                             interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        return buf.tobytes() if ok else None
+    except Exception:
+        return None
+
+
+_ALIGN_RX = re.compile(r"^[ \t\u3000]*(?:&gt;&gt;|＞＞)\s+")
+
+
+def _inline_html(s: str) -> str:
+    """이스케이프 후 마커 → 태그, 개행 → <br/>, '>> ' 줄은 오른쪽 정렬."""
+    out = html.escape(s or "")
+    for rx, tag in _INLINE:
+        out = rx.sub(rf"<{tag}>\1</{tag}>", out)
+    out = re.sub(r" {2,}",                      # 연속 공백 유지 (&#160;)
+                 lambda m: "&#160;" * (len(m.group()) - 1) + " ", out)
+    parts, buf = [], []
+
+    def _flush():
+        if buf:
+            parts.append("<br/>".join(buf))
+            buf.clear()
+
+    for ln in out.split("\n"):
+        m = _ALIGN_RX.match(ln)                 # '>> '(앞 공백·전각 허용)
+        if m:
+            _flush()
+            parts.append('<span style="display:block;text-align:right;'
+                         'text-indent:0">'
+                         + ln[m.end():].lstrip() + "</span>")
+        elif not ln.strip():                    # 빈 줄 → 명시적 여백
+            _flush()
+            parts.append("<br/><br/>")
+        else:
+            buf.append(ln)
+    _flush()
+    return "".join(parts)
+
+
+def _strip_inline(s: str) -> str:
+    """마커 제거한 플레인 텍스트 (TXT 출력·목차 라벨용, 개행은 유지)."""
+    out = re.sub(r"(?m)^[ \t\u3000]*(?:>>|＞＞)\s+", "", s or "")
+    for rx, _tag in _INLINE:
+        out = rx.sub(r"\1", out)
+    return out
+
+
+def _clean_para(s) -> str:
+    """원문(src) 저장 정리 — 빈 줄은 1개 개행으로 축약 (_src.txt의 문단
+    구분 "\n\n"과 충돌 방지), 비표준 공백 정리."""
+    s = re.sub(r"[ \t]*\n[ \t]*\n+", "\n", str(s))
+    return retype._clean_ws(s.strip())
+
+
+def _clean_text(s) -> str:
+    """번역(text) 저장 정리 — 빈 줄은 1개까지 유지 (문단 내 여백,
+    번역은 "\n\n" 구분 파일 왕복이 없어 안전). 3연속 이상만 축약."""
+    s = re.sub(r"[ \t]+\n", "\n", str(s))
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return retype._clean_ws(s.strip())
+
+
 def _xhtml(title: str, paras: list[str]) -> str:
     body = "\n".join(
-        (f"<h2>{html.escape(p)}</h2>" if i == 0 and p and len(p) <= 60
-         else f"<p>{html.escape(p)}</p>")
+        (f"<h2>{_inline_html(p)}</h2>" if i == 0 and p and len(p) <= 60
+         else f"<p>{_inline_html(p)}</p>")
         for i, p in enumerate(paras) if p)
     return ('<?xml version="1.0" encoding="utf-8"?>\n'
             '<!DOCTYPE html>\n'
@@ -773,7 +866,7 @@ def _xhtml(title: str, paras: list[str]) -> str:
 
 
 def write_epub(path: Path, title: str, chapters: list[tuple[str, list[str]]],
-               src_lang: str) -> None:
+               src_lang: str, cover: bytes = None) -> None:
     """최소 구조 EPUB3 생성 — mimetype은 첫 항목·무압축(규격)."""
     uid = "ebook-xlat-" + re.sub(r"\W+", "-", title.lower()).strip("-")
     manifest, spine, navli, files = [], [], [], []
@@ -783,9 +876,26 @@ def write_epub(path: Path, title: str, chapters: list[tuple[str, list[str]]],
         manifest.append(f'<item id="c{i}" href="{fn}" '
                         'media-type="application/xhtml+xml"/>')
         spine.append(f'<itemref idref="c{i}"/>')
-        navli.append(f'<li><a href="{fn}">{html.escape(label)}</a></li>')
+        navli.append(f'<li><a href="{fn}">{html.escape(_strip_inline(label))}</a></li>')
         files.append((fn, _xhtml(label if ct else title, paras)))
-    nav = ('<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n'
+    cov_meta = cov_manifest = cov_spine = ""
+    if cover:
+        cov_meta = '<meta name="cover" content="cimg"/>\n'
+        cov_manifest = ('<item id="cimg" href="cover.jpg" '
+                        'media-type="image/jpeg" properties="cover-image"/>\n'
+                        '<item id="cpg" href="cover.xhtml" '
+                        'media-type="application/xhtml+xml"/>\n')
+        cov_spine = '<itemref idref="cpg"/>\n'
+        files.insert(0, ("cover.xhtml",
+                         '<?xml version="1.0" encoding="utf-8"?>\n'
+                         '<!DOCTYPE html>\n'
+                         '<html xmlns="http://www.w3.org/1999/xhtml" '
+                         'xml:lang="ko"><head><title>표지</title></head>\n'
+                         '<body style="margin:0;text-align:center">'
+                         '<img src="cover.jpg" alt="표지" '
+                         'style="max-width:100%;height:auto"/>'
+                         '</body></html>\n'))
+    nav = ('<?xml version="1.0" encoding="utf-8"?>\n<!DOCTYPE html>\n' 
            '<html xmlns="http://www.w3.org/1999/xhtml" '
            'xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="ko">\n'
            f"<head><title>{html.escape(title)}</title></head>\n"
@@ -801,11 +911,13 @@ def write_epub(path: Path, title: str, chapters: list[tuple[str, list[str]]],
            f"<dc:source>{src_lang} 원서 스캔 개인 번역</dc:source>\n"
            "<meta property=\"dcterms:modified\">"
            "2026-01-01T00:00:00Z</meta>\n"
+           + cov_meta +
            "</metadata>\n<manifest>\n"
            '<item id="nav" href="nav.xhtml" '
            'media-type="application/xhtml+xml" properties="nav"/>\n'
-           + "\n".join(manifest) + "\n</manifest>\n<spine>\n"
-           + "\n".join(spine) + "\n</spine>\n</package>\n")
+           + cov_manifest + "\n".join(manifest)
+           + "\n</manifest>\n<spine>\n"
+           + cov_spine + "\n".join(spine) + "\n</spine>\n</package>\n")
     container = ('<?xml version="1.0" encoding="utf-8"?>\n'
                  '<container version="1.0" xmlns="urn:oasis:names:tc:'
                  'opendocument:xmlns:container">\n<rootfiles>\n'
@@ -821,13 +933,17 @@ def write_epub(path: Path, title: str, chapters: list[tuple[str, list[str]]],
                    compress_type=zipfile.ZIP_DEFLATED)
         z.writestr("OEBPS/nav.xhtml", nav,
                    compress_type=zipfile.ZIP_DEFLATED)
+        if cover:
+            z.writestr("OEBPS/cover.jpg", cover,
+                       compress_type=zipfile.ZIP_STORED)
         for fn, content in files:
             z.writestr(f"OEBPS/{fn}", content,
                        compress_type=zipfile.ZIP_DEFLATED)
 
 
 def export_outputs(out: Path, title: str, src_lang: str,
-                   paras: list[str], done: dict) -> dict:
+                   paras: list[str], done: dict,
+                   cover: bytes = None) -> dict:
     """번역본 TXT+EPUB 생성 (run_book·편집 모드 공용).
 
     done: {문단 인덱스: 번역 or None} — None/누락은 원문 그대로.
@@ -842,8 +958,9 @@ def export_outputs(out: Path, title: str, src_lang: str,
         chapters.append((ct_ko, paras_ko[start:end]))
     txt_path = out / f"{title}_ko.txt"
     epub_path = out / f"{title}_ko.epub"
-    write_txt(txt_path, paras_ko)
-    write_epub(epub_path, title, chapters, LANG_NAMES.get(src_lang, src_lang))
+    write_txt(txt_path, [_strip_inline(p) for p in paras_ko])
+    write_epub(epub_path, title, chapters,
+               LANG_NAMES.get(src_lang, src_lang), cover=cover)
     return {"txt": txt_path, "epub": epub_path, "chapters": len(chapters)}
 
 
@@ -1253,7 +1370,8 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
         log(f"  !! {n_fail}문단 번역 실패 — 원문 그대로 출력됩니다")
 
     # ---- 출력 ----
-    r = export_outputs(out, title, cfg["source_lang"], paras, done)
+    r = export_outputs(out, title, cfg["source_lang"], paras, done,
+                       cover=_cover_jpg(cfg, load_book(out)))
     log(f"완료: {r['epub'].name} / {r['txt'].name} "
         f"({r['chapters']}개 장, {len(paras)}문단)")
     log("검토·수정: GUI [편집 페이지] 버튼 또는 --edit 옵션")
@@ -1319,15 +1437,48 @@ textarea.src{color:var(--src);background:#fffbf3}
  button{min-height:36px}header{gap:8px}}
 body.nosrc textarea.src{display:none}
 body.nosrc .row{padding-top:6px}
+#help{display:none;position:fixed;top:0;left:0;right:0;bottom:0;
+ z-index:50;background:#fff;overflow:auto;padding:16px 16px 40px}
+#help.on{display:block}
+#help h3{margin:4px 0 12px}
+#help table{border-collapse:collapse;width:100%;font-size:14px}
+#help td{border:1px solid var(--bd);padding:7px 9px;vertical-align:top;
+ line-height:1.55}
+#help td:first-child{white-space:nowrap;color:var(--src);
+ font-family:Consolas,monospace}
+#help .hnote{color:#666;font-size:12px;margin:12px 0 0;line-height:1.8}
+#help .hclose{margin:14px 0 0;padding:9px 22px}
+#bmenu{display:none;position:fixed;z-index:40;background:#fff;
+ border:1px solid var(--bd);border-radius:10px;padding:8px;
+ box-shadow:0 4px 16px rgba(0,0,0,.18)}
+#bmenu.on{display:block}
+#bmenu div{color:#888;font-size:12px;margin:0 2px 6px}
+#bmenu button{display:block;width:100%;text-align:left;margin:4px 0;
+ min-height:36px}
+.rd{display:none;font-family:Batang,'Noto Serif KR',Georgia,serif;
+ font-size:16px;line-height:1.8;color:#1c1c1c;padding:1px 4px;
+ cursor:pointer;text-indent:1em}
+.rd.untr{color:#8a6d3b}
+.rd.rdh{font-weight:700;font-size:1.15em;text-indent:0;margin:8px 0 4px}
+body.rdmode .row{border:0;background:none;padding:1px 6px;margin:0;
+ box-shadow:none;contain-intrinsic-size:60px}
+body.rdmode .row .rh,body.rdmode .row textarea{display:none}
+body.rdmode .rd{display:block}
+body.rdmode .pgh{opacity:.45;font-size:11px;margin:10px 4px 2px}
+body.rdmode .pgh button{display:none}
 @media (max-width:640px){
  main{padding:6px 6px 60vh}
  .row{padding:7px 8px;margin:5px 0;border-radius:10px;
   contain-intrinsic-size:110px}
  .rh{margin-bottom:2px;flex-wrap:wrap}
- header{padding:6px 8px;gap:6px}
- header b{font-size:14px;max-width:38vw;overflow:hidden;
+ header{padding:6px 6px;gap:4px}
+ header::before{content:"";flex-basis:100%;order:1;height:0}
+ header select,header button{order:2;padding:4px 6px;font-size:12px;
+  min-height:34px}
+ #hpv{display:none!important}
+ header b{font-size:14px;max-width:44vw;overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
- #cnt{font-size:11px}
+ #cnt{font-size:11px;flex-grow:1}
  #st{flex-basis:100%;order:9}
  .pgh{margin:14px 2px 4px}
  textarea{margin-bottom:3px}
@@ -1340,11 +1491,20 @@ body.nosrc .row{padding-top:6px}
  <b>__TITLE__</b><span id="cnt"></span>
  <select id="flt"><option value="all">전체</option>
  <option value="fail">번역 실패만</option>
- <option value="dirty">수정됨만</option></select>
+ <option value="dirty">수정됨만</option>
+ <option value="help">❓ 기호 도움말</option></select>
  <select id="ocrsel" title="🔄 재전사에 사용할 전사 방식"></select>
  <button id="save" disabled>💾 저장</button>
  <button id="mexp" style="display:none"
   title="수정분 JSON 내보내기 — 오프라인 폴백, PC 웹앱 [📥 파일 반영]으로 적용">📤</button>
+ <button id="hpv" style="display:none"
+  title="지금 보이는 페이지의 출력(TXT/EPUB) 미리보기">👁</button>
+ <button id="bmk" style="display:none"
+  title="현재 위치를 북마크로 저장 — 다음에 열 때 이 문단에서 이어서">🔖</button>
+ <button id="mode"
+  title="읽기 모드 ↔ 편집 모드 — 읽기 모드에서 문단을 탭하면 편집">📖 읽기</button>
+ <button id="fsm" style="display:none" title="글자 작게">A−</button>
+ <button id="fsp" style="display:none" title="글자 크게">A+</button>
  <button id="exp">📖 TXT/EPUB 재생성</button>
  <span id="st"></span>
 </header>
@@ -1355,6 +1515,30 @@ body.nosrc .row{padding-top:6px}
 <span id="ipl"></span>
 <button onclick="ipOff()">닫기</button></div><img id="pimg" alt="">
 <div id="pv"></div></aside>
+</div>
+<div id="help">
+ <h3>❓ 본문 편집 기호 <small style="color:#999">v__VER__</small></h3>
+ <table>
+  <tr><td>## </td><td>문단 맨 앞 — 제목/소제목 (EPUB 장 분할·목차,
+   [§ 제목] 버튼과 동일)</td></tr>
+  <tr><td>&gt;&gt; </td><td>줄 맨 앞 — 그 줄만 오른쪽 정렬 (헌사·서명·날짜.
+   전각 ＞＞·앞 공백 인식, 뒤 공백 필수)</td></tr>
+  <tr><td>**굵게**</td><td><strong>굵게</strong></td></tr>
+  <tr><td>*기울임*</td><td><em>기울임</em></td></tr>
+  <tr><td>~~취소선~~</td><td><s>취소선</s></td></tr>
+  <tr><td>++밑줄++</td><td><u>밑줄</u></td></tr>
+  <tr><td>엔터</td><td>문단 안 줄바꿈 유지</td></tr>
+  <tr><td>빈 줄</td><td>번역 칸만 세로 여백으로 유지 (원문 칸은 자동
+   정리 — 문단 구분과 충돌 방지)</td></tr>
+  <tr><td>(비우기)</td><td>번역 칸을 비우면 그 문단은 원문 그대로 출력
+   — 페이지 단위는 [↩ 원문] 버튼</td></tr>
+ </table>
+ <div class="hnote">· 기호는 쌍이어야 변환 — 홀수 개는 문자 그대로<br>
+  · TXT 출력·목차에는 기호 제거(플레인)<br>
+  · 👁 미리보기·📖 읽기 모드에서 실제 서식 확인<br>
+  · 출력 반영은 [📖 TXT/EPUB 재생성] 시 · 상세: docs/편집기호_참조.md</div>
+ <button class="hclose" onclick="document.getElementById('help')
+  .classList.remove('on')">닫기</button>
 </div>
 <script>
 const D=__DATA__;
@@ -1381,7 +1565,24 @@ D.paras.forEach((e,i)=>{
    const rs=document.createElement('button');rs.textContent='🔄 재전사';
    rs.title='이 페이지만 다시 전사 — 해당 문단들의 원문·번역이 새로 '
     +'만들어지고 다른 페이지 번역은 유지됩니다';
-   rs.onclick=()=>rescan(e.page,rs);h.appendChild(rs);}
+   rs.onclick=()=>rescan(e.page,rs);h.appendChild(rs);
+   const cvb=document.createElement('button');cvb.textContent='🖼 표지';
+   cvb.title='이 페이지 스캔을 EPUB 표지 이미지로 (재생성 시 반영)';
+   if(D.cover===pvpg){cvb.style.background='var(--acc)';
+    cvb.style.color='#fff';cvb.style.borderColor='var(--acc)';}
+   cvb.onclick=async()=>{try{await api('/api/cover',{page:pvpg});
+    sessionStorage.setItem('edScroll',String(scrollY));location.reload();}
+    catch(er){st.textContent='표지 설정 실패: '+er.message;}};
+   h.appendChild(cvb);}
+  if(e.page){const rvb=document.createElement('button');
+   rvb.textContent='↩ 원문';
+   rvb.title='이 페이지 문단들의 번역을 비워 원문 그대로 출력되게 합니다 '
+    +'(문단 하나만은 번역칸을 직접 비우면 됨)';
+   rvb.onclick=()=>{if(!confirm('『'+pvpg+'』 페이지의 번역을 모두 비우고 '
+     +'원문 그대로 출력할까요?'))return;
+    D.paras.forEach((x,j)=>{if(x.page!==pvpg||!rows[j])return;
+     if(rows[j].tk.value){rows[j].tk.value='';mark(j,'text','');}});};
+   h.appendChild(rvb);}
   list.appendChild(h);}
  const t=D.xlat[String(i)];
  const r=document.createElement('div');r.className='row';
@@ -1421,18 +1622,100 @@ D.paras.forEach((e,i)=>{
   Math.ceil((x.value.length||60)/60)));});
  ts.addEventListener('input',()=>mark(i,'src',ts.value));
  tk.addEventListener('input',()=>mark(i,'text',tk.value));
- r.append(rh,ts,tk);list.appendChild(r);
- rows[i]={r,ts,tk};
+ const rd=document.createElement('div');rd.className='rd';
+ rd.title='탭하면 이 문단을 편집합니다';
+ rd.onclick=()=>{setMode(false);r.scrollIntoView();tk.focus();};
+ r.append(rh,ts,tk,rd);list.appendChild(r);
+ rows[i]={r,ts,tk,rd};
 });
 function mark(i,k,v){const d=dirty.get(i)||{};d[k]=v;dirty.set(i,d);
- rows[i].r.classList.add('dirty');upd();if(CLOUD)cloudQueue();}
+ rows[i].r.classList.add('dirty');upd();if(CLOUD)cloudQueue();
+ rdDirty.add(i);}
+function curIdx(){const hh=document.querySelector('header').offsetHeight+4;
+ for(let i=0;i<rows.length;i++){
+  const rc=rows[i].r.getBoundingClientRect();
+  if(rc.bottom>hh&&(rc.bottom||rc.top))return i;}
+ return 0;}
+const rdDirty=new Set();let rdFilled=false;
+const NARROW=matchMedia('(max-width:640px)').matches;
+function rdFill(i){const o=rows[i];if(!o||!o.rd)return;
+ const ko=(o.tk.value||'').trim();
+ o.rd.innerHTML=fmtHtml(stripMark(ko||o.ts.value));
+ o.rd.classList.toggle('untr',!ko);
+ o.rd.classList.toggle('rdh',o.ts.value.indexOf('## ')===0);}
+function setMode(on){
+ const ci=curIdx();
+ document.body.classList.toggle('rdmode',on);
+ document.getElementById('mode').textContent=
+  on?(NARROW?'✏':'✏ 편집'):(NARROW?'📖':'📖 읽기');
+ if(on){if(!rdFilled){rows.forEach((o,i)=>rdFill(i));rdFilled=true;}
+  else{rdDirty.forEach(i=>rdFill(i));rdDirty.clear();}}
+ try{localStorage.setItem('edMode',on?'1':'')}catch(e){}
+ const o=rows[ci];if(o)o.r.scrollIntoView();}
+document.getElementById('mode').onclick=()=>
+ setMode(!document.body.classList.contains('rdmode'));
+if(NARROW)document.getElementById('mode').textContent='📖';
+if(localStorage.getItem('edMode')==='1')setMode(true);
+const BKEY='ebookBmk:'+(D.title||'');
+function initBmk(cloud){
+ const bk=document.getElementById('bmk');bk.style.display='';
+ let cur=null;
+ const mnu=document.createElement('div');mnu.id='bmenu';
+ const info=document.createElement('div');
+ const b1=document.createElement('button');b1.textContent='📍 현재 위치 저장';
+ const b2=document.createElement('button');b2.textContent='➡ 북마크로 이동';
+ const b3=document.createElement('button');b3.textContent='🗑 북마크 삭제';
+ mnu.append(info,b1,b2,b3);document.body.appendChild(mnu);
+ const close=()=>mnu.classList.remove('on');
+ bk.onclick=()=>{
+  if(mnu.classList.contains('on')){close();return}
+  info.textContent=cur!=null?'저장된 북마크: #'+(cur+1)
+   :'저장된 북마크 없음';
+  b2.disabled=b3.disabled=cur==null;
+  mnu.style.top=(bk.getBoundingClientRect().bottom+6)+'px';
+  mnu.style.right='8px';
+  mnu.classList.add('on');};
+ document.addEventListener('click',e=>{
+  if(!mnu.contains(e.target)&&e.target!==bk)close();},true);
+ const go=j=>{j=parseInt(j,10);
+  if(isNaN(j)||j<0)return false;
+  j=Math.min(j,rows.length-1);
+  const o=rows[j];if(!o)return false;
+  o.r.scrollIntoView();
+  o.r.style.boxShadow='0 0 0 2px var(--acc)';
+  setTimeout(()=>{o.r.style.boxShadow=''},1600);
+  st.textContent='🔖 #'+(j+1)+'에서 이어서';return true;};
+ b1.onclick=async()=>{const i=curIdx();cur=i;close();
+  try{localStorage.setItem(BKEY,String(i))}catch(e){}
+  st.textContent='🔖 #'+(i+1)+' 위치 저장됨';
+  if(cloud){try{await gasCall({op:'state',pos:i});
+    st.textContent='🔖 #'+(i+1)+' 위치 저장됨 ☁';}catch(e){}}};
+ b2.onclick=()=>{close();if(cur!=null)go(cur);};
+ b3.onclick=async()=>{cur=null;close();
+  try{localStorage.removeItem(BKEY)}catch(e){}
+  st.textContent='🔖 북마크 삭제됨';
+  if(cloud){try{await gasCall({op:'state',pos:null});
+    st.textContent='🔖 북마크 삭제됨 ☁ (서재 진행률도 초기화)';}
+   catch(e){}}};
+ const li=localStorage.getItem(BKEY);
+ if(cloud)gasCall({op:'get'}).then(q=>{
+   const sp=q&&q.state&&q.state.pos;
+   if(sp!=null){if(go(sp))cur=parseInt(sp,10);}
+   else if(li!=null&&go(li))cur=parseInt(li,10);}).catch(()=>{
+   if(li!=null&&go(li))cur=parseInt(li,10);});
+ else if(li!=null&&go(li))cur=parseInt(li,10);}
 if(matchMedia('(pointer:coarse)').matches){
- const grow=t=>{t.style.overflowY='hidden';t.style.height='auto';
-  t.style.height=Math.min(t.scrollHeight+2,innerHeight*0.5)+'px';};
+ const grow=t=>{t.style.height='auto';
+  const cap=Math.max(160,innerHeight*0.5),h=t.scrollHeight+2;
+  if(h>cap){t.style.height=cap+'px';t.style.overflowY='auto';}
+  else{t.style.height=h+'px';t.style.overflowY='hidden';}};
  list.addEventListener('focusin',e=>{
   if(e.target.tagName==='TEXTAREA')grow(e.target);});
  list.addEventListener('input',e=>{
-  if(e.target.tagName==='TEXTAREA')grow(e.target);});}
+  if(e.target.tagName==='TEXTAREA')grow(e.target);});
+ addEventListener('resize',()=>{   // 키보드 개폐 → 포커스 칸 재계산
+  const a=document.activeElement;
+  if(a&&a.tagName==='TEXTAREA'&&list.contains(a))grow(a);});}
 function upd(){
  document.getElementById('save').disabled=!dirty.size||(!SRV&&!CLOUD);
  const nf=rows.filter(o=>o.r.classList.contains('fail')).length;
@@ -1477,6 +1760,9 @@ document.getElementById('exp').onclick=async()=>{
  catch(e){st.textContent='재생성 실패: '+e.message;}};
 document.getElementById('flt').onchange=function(){
  const m=this.value;
+ if(m==='help'){this.value=window._pflt||'all';
+  document.getElementById('help').classList.add('on');return}
+ window._pflt=m;
  rows.forEach(o=>{o.r.style.display=
   m==='all'||(m==='fail'&&o.r.classList.contains('fail'))
   ||(m==='dirty'&&o.r.classList.contains('dirty'))?'':'none';});};
@@ -1485,6 +1771,23 @@ const pimg=document.getElementById('pimg');
 const pv=document.getElementById('pv');
 let ipCur=-1,ipMode='img';
 function stripMark(s){return (s||'').replace(/^##\s*/,'');}
+function fmtHtml(s){s=(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
+ .replace(/>/g,'&gt;');
+ s=s.replace(/\*\*([\s\S]+?)\*\*/g,'<strong>$1</strong>')
+  .replace(/~~([\s\S]+?)~~/g,'<s>$1</s>')
+  .replace(/\+\+([\s\S]+?)\+\+/g,'<u>$1</u>')
+  .replace(/\*([^*\\n]+?)\*/g,'<em>$1</em>')
+  .replace(/ {2,}/g,m=>' '.repeat(m.length-1)+' ');
+ const out=[];let buf=[];
+ const fl=()=>{if(buf.length){out.push(buf.join('<br>'));buf=[];}};
+ s.split('\\n').forEach(ln=>{
+  const m=ln.match(/^[ \t　]*(?:&gt;&gt;|＞＞)\s+/);
+  if(m){fl();
+   out.push('<span style="display:block;text-align:right;text-indent:0">'
+    +ln.slice(m[0].length)+'</span>');}
+  else if(!ln.trim()){fl();out.push('<br><br>');}
+  else buf.push(ln);});
+ fl();return out.join('');}
 function ipHead(pg,suffix){ip.classList.add('on');
  ipCur=D.pages.indexOf(pg);
  document.getElementById('ipl').textContent=pg+(suffix||'');
@@ -1505,7 +1808,7 @@ function showPv(pg){ipMode='pv';ipHead(pg,' — 출력 미리보기');
   const ko=rows[i]?rows[i].tk.value:(D.xlat[String(i)]||'');
   const isHead=src.startsWith('## ');
   const el=document.createElement(isHead?'h2':'p');
-  el.textContent=stripMark(ko.trim()||src);
+  el.innerHTML=fmtHtml(stripMark(ko.trim()||src));
   if(!ko.trim())el.classList.add('untr');   // 미번역 — 원문 그대로
   pv.appendChild(el);});
  if(!n){const d2=document.createElement('div');d2.className='empty';
@@ -1595,6 +1898,27 @@ function initCloud(){
   const b=new Blob([JSON.stringify(pl,null,1)],{type:'application/json'});
   const a=document.createElement('a');a.href=URL.createObjectURL(b);
   a.download=(D.title||'이북')+'_edits.json';a.click();};
+ function setFs(px){window._fs=px;
+  try{localStorage.setItem('edFs',String(px))}catch(e){}
+  let se=document.getElementById('fscss');
+  if(!se){se=document.createElement('style');se.id='fscss';
+   document.head.appendChild(se);}
+  se.textContent='#list textarea{font-size:'+px+'px}'
+   +'#pv{font-size:'+(px+1)+'px}'
+   +'#list .rd{font-size:'+(px+1)+'px}'
+   +'#list .rd.rdh{font-size:'+Math.round((px+1)*1.15)+'px}';}
+ if(matchMedia('(max-width:640px)').matches)
+  document.getElementById('save').textContent='💾';
+ const fsm=document.getElementById('fsm'),fsp=document.getElementById('fsp');
+ fsm.style.display=fsp.style.display='';
+ const fs0=parseInt(localStorage.getItem('edFs')||'16',10);
+ setFs(isNaN(fs0)?16:Math.min(24,Math.max(12,fs0)));
+ fsm.onclick=()=>setFs(Math.max(12,(window._fs||16)-2));
+ fsp.onclick=()=>setFs(Math.min(24,(window._fs||16)+2));
+ const hb2=document.getElementById('hpv');hb2.style.display='';
+ hb2.onclick=()=>{const pg=D.paras[curIdx()]
+   &&D.paras[curIdx()].page||D.pages[0];
+  if(pg)showPv(pg);};
  const sb=document.createElement('button');
  sb.textContent='원문';sb.title='원문(전사) 칸 접기/펼치기 — 번역만 읽으며 검수';
  mx.after(sb);
@@ -1611,8 +1935,10 @@ function initCloud(){
  window.addEventListener('beforeunload',e=>{
   if(dirty.size){e.preventDefault();e.returnValue='';}});
  if(dirty.size){upd();cloudQueue(500);}
- st.textContent='☁ 클라우드 검수 — 수정은 자동 저장됩니다';}
+ st.textContent='☁ 클라우드 검수 — 수정은 자동 저장됩니다';
+ initBmk(true);}
 if(CLOUD)initCloud();
+else if(SRV)initBmk(false);
 else if(!SRV){st.textContent=
  '파일로 열림 — 저장·재번역은 GUI [편집 페이지] 또는 --edit 로 여세요';
  document.getElementById('exp').disabled=true;}
@@ -1630,10 +1956,12 @@ def write_edit_html(out: Path) -> Optional[Path]:
     data = {"title": book.get("title") or "", "paras": book["paras"],
             "pages": book.get("page_labels") or [],
             "fp": book_fingerprint(book), "count": len(book["paras"]),
+            "cover": book.get("cover") or "",
             "ocr_modes": [["실행 설정", ""]] + [[lb, k]
                                                for lb, k in OCR_MODES],
             "xlat": {str(k): v for k, v in done.items()}}
     page = (EDIT_HTML
+            .replace("__VER__", __version__)
             .replace("__TITLE__", html.escape(data["title"] or "이북"))
             .replace("__DATA__", json.dumps(data, ensure_ascii=False)
                      .replace("</", "<\\/")))
@@ -1657,10 +1985,10 @@ def _edit_save(out: Path, edits: list, log) -> dict:
         if not 0 <= i < len(book["paras"]):
             continue
         if "src" in e:
-            book["paras"][i]["src"] = retype._clean_ws(str(e["src"]).strip())
+            book["paras"][i]["src"] = _clean_para(e["src"])
             ns += 1
         if "text" in e:
-            t = retype._clean_ws(str(e["text"]).strip())
+            t = _clean_text(e["text"])
             done[i] = t or None
             nt += 1
     work = out / "_work"
@@ -1710,17 +2038,31 @@ def _edit_xlat(out: Path, cfg: dict, ids: list, log) -> dict:
     return {str(i): t for i, t in res.items()}
 
 
-def _edit_export(out: Path, log) -> dict:
+def _edit_export(out: Path, cfg: dict, log) -> dict:
     book = load_book(out)
     if not book:
         raise RuntimeError("편집 데이터(book.json)가 없습니다")
     done = load_xlat(out)
     paras = [e.get("src") or "" for e in book["paras"]]
     r = export_outputs(out, book.get("title") or "book",
-                       book.get("source_lang") or "de", paras, done)
+                       book.get("source_lang") or "de", paras, done,
+                       cover=_cover_jpg(cfg, book))
     log(f"재생성: {r['txt'].name} / {r['epub'].name} ({r['chapters']}개 장)")
     return {"files": [r["txt"].name, r["epub"].name],
             "chapters": r["chapters"]}
+
+
+def _edit_cover(out: Path, label: str, log) -> dict:
+    """편집 페이지 [🖼 표지] — EPUB 표지로 쓸 페이지를 book.json에 저장."""
+    book = load_book(out)
+    if not book:
+        raise RuntimeError("편집 데이터(book.json)가 없습니다")
+    if label not in (book.get("page_labels") or []):
+        raise RuntimeError(f"페이지 정보가 없습니다: {label}")
+    book["cover"] = label
+    _atomic_json(out / "_work" / "book.json", book)
+    log(f"EPUB 표지 지정: {label} — 재생성 시 반영")
+    return {"ok": True, "cover": label}
 
 
 def _edit_page_image(handler, out: Path, cfg: dict, label: str) -> None:
@@ -1968,7 +2310,7 @@ def run_edit_server(cfg: dict, log, is_busy=None) -> Optional[str]:
         def do_POST(self):
             p = self.path.split("?")[0]
             if p not in ("/api/save", "/api/xlat", "/api/export",
-                         "/api/rescan"):
+                         "/api/rescan", "/api/cover"):
                 self.send_error(404)
                 return
             if busy["on"] or ext_busy():
@@ -1991,8 +2333,11 @@ def run_edit_server(cfg: dict, log, is_busy=None) -> Optional[str]:
                         c2["ocr"] = req["ocr"]   # 편집 페이지에서 선택
                     self._json(_edit_rescan(out, c2,
                                             req.get("page") or "", log))
+                elif p == "/api/cover":
+                    self._json(_edit_cover(out, req.get("page") or "",
+                                           log))
                 else:
-                    self._json(_edit_export(out, log))
+                    self._json(_edit_export(out, cfg, log))
             except Exception as e:
                 log(f"!! 편집 서버 오류: {e}")
                 try:

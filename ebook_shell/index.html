@@ -119,11 +119,25 @@ async function loadList() {
     const d = await r.json();
     if (d.err) throw new Error(d.err);
     bx.innerHTML = "";
-    (d.books || []).forEach(b => {
+    const items = d.info || (d.books || []).map(n => ({name: n}));
+    items.forEach(it => {
       const el = document.createElement("button");
       el.className = "bk";
-      el.innerHTML = "📖 " + b.replace(/[<>&]/g, "");
-      el.onclick = () => openBook(b);
+      const nm = String(it.name).replace(/[<>&]/g, "");
+      let sub = "";
+      if (it.count) {
+        if (it.pos != null) {
+          const pct = Math.min(100,
+            Math.round((it.pos + 1) / it.count * 100));
+          sub = "🔖 #" + (it.pos + 1) + "까지 검수 / " + it.count
+              + "문단 (" + pct + "%)";
+        } else sub = it.count + "문단 · 북마크 없음";
+      }
+      if (it.pending)
+        sub += (sub ? " · " : "") + "☁ PC 반영 대기 " + it.pending + "건";
+      el.innerHTML = "📖 " + nm
+        + (sub ? "<small>" + sub + "</small>" : "");
+      el.onclick = () => openBook(it.name);
       bx.appendChild(el);
     });
     if (!(d.books || []).length)

@@ -664,14 +664,11 @@ def run_job(cfg: dict, log, is_cancelled) -> None:
     results = []
 
     def _flush_review() -> None:
-        # 페이지마다 review.json 즉시 병합 저장 (임시파일→교체로 원자적) —
-        # 작업이 다 끝나지 않아도 [검수 페이지]로 처리된 페이지를 바로
-        # 검수할 수 있다. 열 때마다 HTML이 재생성되므로 이걸로 충분.
-        data = json.dumps(retype.merge_review(out, results),
-                          ensure_ascii=False, indent=2)
-        tmp_rj = out / "review.json.tmp"
-        tmp_rj.write_text(data, encoding="utf-8")
-        os.replace(tmp_rj, out / "review.json")
+        # 페이지마다 review.json 즉시 병합 저장 — 파이프라인 공용 함수
+        # 사용 (원자적 교체 + WinError 5/32 재시도 + 실패해도 실행 계속.
+        # 검수 서버·백신이 파일을 잠깐 잡아 전체 실행이 중단됐던 사고
+        # 재발 방지 — 경고는 콘솔에 출력됨)
+        retype._flush_review_cli(out, results)
 
     for i, f in enumerate(up_files, 1):
         if is_cancelled():

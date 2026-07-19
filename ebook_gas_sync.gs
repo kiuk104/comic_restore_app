@@ -30,7 +30,7 @@
  *   clear  : 반영 완료 후 큐 비움 (fp 일치할 때만)
  *   state  : 읽던 위치 저장 (뷰어 확장 예약)
  *   icon   : 홈 화면 아이콘 업로드 (PC가 1회 전송 → 공개 링크로 파비콘)
- *   list   : 업로드된 책 목록 (PWA 셸 서재용)
+ *   list   : 책 목록+진행 정보 {name,count,pos,pending} (PWA 셸 서재용)
  */
 
 var SECRET = 'CHANGE_ME';               // ★ 반드시 직접 정한 값으로 변경
@@ -118,6 +118,23 @@ function _json(o) {
 // ---------------------------------------------------------------- 핵심
 function handleOp(q) {
   if (!q || q.key !== SECRET) return {err: '인증 실패 — 동기화 키 불일치'};
+  if (q.op === 'list') {                 // book 불필요 — 서재 목록
+    var names = [], lfs = _folder().getFiles();
+    while (lfs.hasNext()) {
+      var lnm = lfs.next().getName();
+      if (lnm.slice(-5) === '.html') names.push(lnm.slice(0, -5));
+    }
+    names.sort();
+    var info = [];                       // 책별 진행 정보 (서재 표시용)
+    for (var li = 0; li < names.length; li++) {
+      var e2 = _readq(names[li]);
+      info.push({name: names[li], count: e2.snap_count,
+                 pos: (e2.state && e2.state.pos != null)
+                      ? e2.state.pos : null,
+                 pending: Object.keys(e2.edits || {}).length});
+    }
+    return {ok: true, books: names, info: info};
+  }
   var book = _san(q.book);
   if (!book) return {err: 'book(책 제목) 누락'};
 
@@ -154,15 +171,6 @@ function handleOp(q) {
     e.state = {pos: q.pos, ts: Date.now()};
     _writeq(book, e);
     return {ok: true};
-  }
-  if (q.op === 'list') {
-    var names = [], fs = _folder().getFiles();
-    while (fs.hasNext()) {
-      var nm = fs.next().getName();
-      if (nm.slice(-5) === '.html') names.push(nm.slice(0, -5));
-    }
-    names.sort();
-    return {ok: true, books: names};
   }
   if (q.op === 'icon') {
     if (!q.png) return {err: 'png(base64) 누락'};
