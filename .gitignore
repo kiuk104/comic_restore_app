@@ -2,6 +2,10 @@
 app_config.json
 ebook_config.json
 
+# 로컬 UI 상태 (개인 경로·창 크기 — 기기마다 다름)
+ebook_recents.json
+ebook_winsize.json
+
 # 파이썬
 __pycache__/
 *.pyc

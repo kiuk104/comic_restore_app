@@ -28,7 +28,7 @@ Claude 번역. 실행이 끝나면(취소 포함) 전사/번역 파트별 API �
 """
 from __future__ import annotations
 
-__version__ = "0.13.7"  # 읽기 폰트(제목 포함)·연속 공백 유지·버전 표시
+__version__ = "0.16.2"  # 자동 복원 시 파란 강조 제거 + 하이라이트 변화 없으면 리프레쉬 안 함
 
 import argparse
 import html
@@ -76,6 +76,11 @@ GEMINI_TIMEOUT = 180
 DEEPSEEK_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 
+# Kimi (Moonshot AI) — OpenAI 호환, 저가 번역 백엔드 (번역 전용).
+# 키 발급: https://platform.moonshot.ai (MOONSHOT_API_KEY 환경변수 가능)
+KIMI_URL = "https://api.moonshot.ai/v1"
+KIMI_MODEL = "kimi-k2.5"
+
 
 # ---------------------------------------------------------------------------
 # 프롬프트
@@ -119,21 +124,35 @@ JSON 배열만 출력 (설명 금지):
 # 설정
 # ---------------------------------------------------------------------------
 def load_defaults() -> dict:
-    """ebook_config.json + 코믹스 앱 설정(api_key·모델)에서 기본값."""
-    cfg = {}
+    """ebook_config.json 우선 + 코믹스 앱 설정(app_config.json)에서 키·모델
+    공유. 이북 설정이 비어 있는 항목만 코믹스 값으로 채운다 — 이북에서
+    직접 넣은 값은 그대로 두고, 안 넣은 키(예: DeepSeek)는 코믹스 것을
+    그대로 쓴다. (코믹스 저장 키명 → 이북 키명 매핑)"""
+    comic, cfg = {}, {}
     try:
         if COMIC_CONFIG.exists():
-            c = json.loads(COMIC_CONFIG.read_text(encoding="utf-8"))
-            cfg["api_key"] = c.get("api_key", "")
-            cfg["claude_model"] = c.get("claude_model", "claude-sonnet-4-5")
-            cfg["ollama_model"] = c.get("ollama_model") or retype.OLLAMA_MODEL
+            comic = json.loads(COMIC_CONFIG.read_text(encoding="utf-8"))
     except Exception:
-        pass
+        comic = {}
     try:
         if CONFIG_PATH.exists():
-            cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
-        pass
+        cfg = {}
+    # (이북 키, 코믹스 키) — 이북 쪽이 비어 있을 때만 코믹스에서 가져옴
+    share = [("api_key", "api_key"),
+             ("claude_model", "claude_model"),
+             ("ollama_model", "ollama_model"),
+             ("gemini_key", "gemini_api_key"),
+             ("gemini_model", "gemini_model"),
+             ("deepseek_key", "deepseek_api_key"),
+             ("deepseek_model", "deepseek_model"),
+             ("deepseek_url", "deepseek_url"),
+             ("kimi_key", "kimi_api_key"),
+             ("kimi_model", "kimi_model")]
+    for ek, ck in share:
+        if not cfg.get(ek) and comic.get(ck):
+            cfg[ek] = comic[ck]
     return cfg
 
 
@@ -279,28 +298,58 @@ def _call_oai(base_url: str, messages: list, model: str, key: str,
                "max_tokens": max_tokens, "messages": messages}
     if extra:
         payload.update(extra)
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{base_url.rstrip('/')}/chat/completions", data=body,
-        headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {key}"})
-    try:
+    url = f"{base_url.rstrip('/')}/chat/completions"
+
+    def _post(pl):
+        req = urllib.request.Request(
+            url, data=json.dumps(pl).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {key}"})
         with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        data = _post(payload)
     except urllib.error.HTTPError as e:
         try:
             detail = e.read().decode("utf-8", "replace")[:300]
         except Exception:
             detail = ""
-        hint = (f" — API 키 확인{key_hint}" if e.code in (401, 403) else "")
-        raise RuntimeError(f"{name} 오류 {e.code}{hint}: {detail}")
+        # 일부 Kimi 모델은 모드별로 특정 temperature만 허용 — 에러에서 값을
+        # 읽어 1회 자동 재시도 ("only 0.6 is allowed" / "only 1 is allowed").
+        m = re.search(r"only\s*([0-9]*\.?[0-9]+)\s*is allowed", detail, re.I)
+        if e.code == 400 and "temperature" in detail.lower() and m:
+            try:
+                data = _post(dict(payload, temperature=float(m.group(1))))
+            except urllib.error.HTTPError as e2:
+                try:
+                    d2 = e2.read().decode("utf-8", "replace")[:300]
+                except Exception:
+                    d2 = ""
+                raise RuntimeError(f"{name} 오류 {e2.code}: {d2}")
+            except urllib.error.URLError as e2:
+                raise RuntimeError(f"{name} 연결 실패: {e2}")
+        else:
+            hint = (f" — API 키 확인{key_hint}"
+                    if e.code in (401, 403) else "")
+            raise RuntimeError(f"{name} 오류 {e.code}{hint}: {detail}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"{name} 연결 실패: {e}")
+    if isinstance(data, dict) and data.get("error"):   # 200인데 error 객체
+        raise RuntimeError(f"{name} 오류(200+error): "
+                           + json.dumps(data["error"], ensure_ascii=False)[:400])
     uu = data.get("usage") or {}
     retype.track_usage(part, model, uu.get("prompt_tokens"),
                        uu.get("completion_tokens"))
-    return ((data.get("choices") or [{}])[0].get("message", {})
-            .get("content") or "")
+    ch = (data.get("choices") or [{}])[0]
+    content = ((ch.get("message") or {}).get("content") or "").strip()
+    if not content:                                    # 빈 응답 — 진짜 이유 노출
+        fr = ch.get("finish_reason")
+        raise RuntimeError(
+            f"{name} 빈 응답 (finish_reason={fr}) — 내용 필터·토큰 초과·"
+            "모델 문제일 수 있습니다. 원본 응답: "
+            + json.dumps(data, ensure_ascii=False)[:400])
+    return content
 
 
 def _call_gemini(messages: list, model: str, key: str,
@@ -308,6 +357,18 @@ def _call_gemini(messages: list, model: str, key: str,
     return _call_oai(GEMINI_URL, messages, model, key, max_tokens, part,
                      name="Gemini API",
                      key_hint=" (https://aistudio.google.com/apikey)")
+
+
+def _call_kimi(messages: list, model: str, key: str,
+               max_tokens: int = 8000, part: str = "번역") -> str:
+    # kimi-k2.x: thinking을 끄면(추론이 max_tokens를 다 먹는 것 방지) 이 모드는
+    # temperature=0.6만 허용한다. 값이 안 맞아도 _call_oai가 에러에서 허용값을
+    # 읽어 자동 재시도하므로(0.6/1 등) 모델·모드가 바뀌어도 안전.
+    return _call_oai(KIMI_URL, messages, model, key, max_tokens, part,
+                     extra={"temperature": 0.6,
+                            "thinking": {"type": "disabled"}},
+                     name="Kimi API",
+                     key_hint=" (https://platform.moonshot.ai)")
 
 
 def _repair_json(raw: str) -> str:
@@ -724,6 +785,11 @@ def translate_chunk(items: list[tuple[int, str]], cfg: dict, gloss: str,
             [{"role": "user", "content": body}],
             cfg.get("gemini_model") or GEMINI_MODEL,
             cfg.get("gemini_key") or "", max_tokens=8000, part="번역"))
+    elif cfg["backend"] == "kimi":
+        parsed = _parse_loose(_call_kimi(
+            [{"role": "user", "content": body}],
+            cfg.get("kimi_model") or KIMI_MODEL,
+            cfg.get("kimi_key") or "", max_tokens=16000, part="번역"))
     else:
         # retype._call_claude는 엄격 json.loads라 대사 따옴표에 취약 —
         # 직접 호출해 _parse_loose(따옴표 보정 폴백)로 파싱한다.
@@ -1074,6 +1140,8 @@ def _apply_keys(cfg: dict) -> None:
                          or os.environ.get("GEMINI_API_KEY") or "").strip()
     cfg["deepseek_key"] = (cfg.get("deepseek_key")
                            or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    cfg["kimi_key"] = (cfg.get("kimi_key")
+                       or os.environ.get("MOONSHOT_API_KEY") or "").strip()
 
 
 def detect_lang(text: str) -> tuple[str, dict]:
@@ -1171,6 +1239,11 @@ def _uses_gemini(cfg: dict) -> bool:
     return cfg["ocr"] == "gemini" or cfg["backend"] == "gemini"
 
 
+def _uses_kimi(cfg: dict) -> bool:
+    """Kimi는 번역 백엔드 전용 (전사엔 없음)."""
+    return cfg["backend"] == "kimi"
+
+
 def _fatal_api_error(e: Exception) -> bool:
     """페이지 단위로 건너뛰면 안 되는 오류 — 키·크레딧·비전 미지원은
     즉시 중단 (전 페이지가 똑같이 실패할 문제)."""
@@ -1178,6 +1251,25 @@ def _fatal_api_error(e: Exception) -> bool:
     return any(k in s for k in ("credit balance", "api key", "api 키",
                                 "unauthorized", "401", "403",
                                 "비전 미지원"))
+
+
+def _note_error(work: Path, cfg: dict, msg: str) -> None:
+    """번역/전사 오류를 _work/last_error.txt에 남긴다 (복사·공유용).
+    항상 최신 오류로 덮어써서, 총실패 시 이 파일만 열면 원인이 보인다."""
+    try:
+        import datetime
+        be = cfg.get("backend", "?")
+        model = {"kimi": cfg.get("kimi_model"),
+                 "gemini": cfg.get("gemini_model"),
+                 "claude": cfg.get("claude_model"),
+                 "ollama": cfg.get("ollama_model")}.get(be, "")
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "last_error.txt").write_text(
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            + f"  (번역 백엔드: {be} {model or ''})\n\n{msg}\n",
+            encoding="utf-8")
+    except Exception:
+        pass
 
 
 def run_book(cfg: dict, log, is_cancelled) -> dict:
@@ -1209,6 +1301,11 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
             "DeepSeek API 키가 없습니다 — 'DeepSeek API 키'에 입력하거나 "
             "DEEPSEEK_API_KEY 환경변수를 설정하세요 "
             "(https://platform.deepseek.com 발급).")
+    if _uses_kimi(cfg) and not cfg["kimi_key"]:
+        raise RuntimeError(
+            "Kimi API 키가 없습니다 — GUI의 'Kimi API 키'에 입력하거나 "
+            "MOONSHOT_API_KEY 환경변수를 설정하세요 "
+            "(https://platform.moonshot.ai).")
 
     kind_ko = {"images": "이미지 폴더", "pdf-text": "텍스트 PDF",
                "pdf-scan": "스캔 PDF"}[kind]
@@ -1324,7 +1421,9 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
         log(msg)
     be = {"ollama": "Ollama " + str(cfg.get("ollama_model")),
           "gemini": "Gemini " + str(cfg.get("gemini_model")
-                                    or GEMINI_MODEL)}.get(
+                                    or GEMINI_MODEL),
+          "kimi": "Kimi " + str(cfg.get("kimi_model")
+                                or KIMI_MODEL)}.get(
         cfg["backend"], cfg["claude_model"])
     log(f"번역 시작 — {be}, {len(paras)}문단")
     chunk: list = []
@@ -1340,10 +1439,18 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
             raise Cancelled()
         try:
             res = translate_chunk(chunk, cfg, gloss, prev_ctx)
+            if res and all(v is None for v in res.values()):
+                _note_error(                       # 200인데 번역이 안 나온 경우
+                    work, cfg,
+                    "[번역 비었음] API 응답을 번역으로 해석하지 못했습니다 "
+                    "— 200 응답이나 형식 불일치일 수 있습니다. "
+                    "백엔드·모델·프롬프트를 확인하세요.")
         except Exception as e:
+            _note_error(work, cfg, f"[번역 실패] {e}")
             if _fatal_api_error(e):
                 raise
-            log(f"  !! 청크 번역 실패({e}) — 원문 유지")
+            log(f"  !! 청크 번역 실패({e}) — 원문 유지 "
+                "(자세한 오류: _work/last_error.txt)")
             res = {gi: None for gi, _ in chunk}
         for gi, t in res.items():
             if t is None:
@@ -1367,7 +1474,8 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
             flush()
     flush()
     if n_fail:
-        log(f"  !! {n_fail}문단 번역 실패 — 원문 그대로 출력됩니다")
+        log(f"  !! {n_fail}문단 번역 실패 — 원문 그대로 출력됩니다 "
+            f"(오류 내용: {xp.parent / 'last_error.txt'})")
 
     # ---- 출력 ----
     r = export_outputs(out, title, cfg["source_lang"], paras, done,
@@ -1396,7 +1504,16 @@ body{font-family:'Malgun Gothic',sans-serif;margin:0;background:#f5f5f4;
  color:#222}
 header{position:sticky;top:0;z-index:9;background:#fff;
  border-bottom:1px solid var(--bd);padding:8px 12px;display:flex;gap:10px;
- align-items:center;flex-wrap:wrap}
+ align-items:center;flex-wrap:wrap;transition:transform .25s ease}
+body.hdhide header{transform:translateY(-108%)}   /* 스크롤·편집 시 자동 숨김 */
+/* 편집 카드 활성 시 홈(셸) 대신 뜨는 반투명 완료 버튼 */
+#edfab{display:none;position:fixed;right:14px;
+ bottom:calc(env(safe-area-inset-bottom) + 16px);z-index:45;
+ width:50px;height:50px;border-radius:50%;border:0;color:#fff;font-size:23px;
+ background:rgba(16,129,90,.5);box-shadow:0 2px 10px rgba(0,0,0,.28);
+ cursor:pointer;align-items:center;justify-content:center}
+body.hascard #edfab{display:flex}
+#edfab:active{background:rgba(16,129,90,.82)}
 header b{font-size:15px}
 button{cursor:pointer;padding:4px 10px;border:1px solid #999;
  border-radius:6px;background:#fff;font-size:12px}
@@ -1422,7 +1539,7 @@ aside .cap{padding:6px 10px;color:#666;font-size:12px;display:flex;
  display:flex;gap:8px;align-items:center}
 .row{background:#fff;border:1px solid var(--bd);border-radius:8px;
  padding:8px 10px;margin:6px 0;content-visibility:auto;
- contain-intrinsic-size:130px}
+ contain-intrinsic-size:auto 130px}   /* auto: 한 번 렌더한 높이를 기억 → 위치 튐 방지 */
 .row.dirty{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc)}
 .row.fail{border-left:4px solid var(--fail)}
 .rh{display:flex;gap:8px;align-items:center;font-size:12px;color:#888;
@@ -1448,28 +1565,77 @@ body.nosrc .row{padding-top:6px}
  font-family:Consolas,monospace}
 #help .hnote{color:#666;font-size:12px;margin:12px 0 0;line-height:1.8}
 #help .hclose{margin:14px 0 0;padding:9px 22px}
-#bmenu{display:none;position:fixed;z-index:40;background:#fff;
+#bmenu,#setmenu{display:none;position:fixed;z-index:40;background:#fff;
  border:1px solid var(--bd);border-radius:10px;padding:8px;
  box-shadow:0 4px 16px rgba(0,0,0,.18)}
-#bmenu.on{display:block}
-#bmenu div{color:#888;font-size:12px;margin:0 2px 6px}
+#bmenu{min-width:238px;max-width:82vw;max-height:64vh;overflow:auto}
+#bmenu.on,#setmenu.on{display:block}
+#bmenu div,#setmenu .lbl{color:#888;font-size:12px;margin:0 2px 6px}
 #bmenu button{display:block;width:100%;text-align:left;margin:4px 0;
  min-height:36px}
+#bmenu .bmh{color:#888;font-size:12px;font-weight:700;margin:0 2px 6px}
+#bmenu .bmadd{color:var(--acc);font-weight:700;margin-bottom:8px}
+#bmenu .bmempty{color:#aaa;font-size:12px;padding:8px 2px;margin:0}
+#bmenu .bmrow{display:flex;gap:5px;margin:5px 0}
+#bmenu .bmrow button{margin:0;width:auto}
+#bmenu .bmgo{flex:1;min-height:40px;overflow:hidden;white-space:nowrap;
+ text-overflow:ellipsis}
+#bmenu .bmgo b{color:var(--acc);margin-right:6px}
+#bmenu .bmgo span{color:#555;font-size:12px}
+#bmenu .bmdel{flex:0 0 44px;min-height:40px;text-align:center}
+#setmenu{min-width:196px}
+#setmenu .fsrow{display:flex;align-items:center;gap:8px;margin:0 0 12px}
+#setmenu .fsrow button{min-width:44px;min-height:38px;font-weight:700}
+#setmenu .fsrow span{flex:1;text-align:center;font-size:14px;color:#333}
+#setmenu select{width:100%;min-height:38px;font-size:14px;padding:5px 6px;
+ border:1px solid var(--bd);border-radius:6px;background:#fff}
 .rd{display:none;font-family:Batang,'Noto Serif KR',Georgia,serif;
  font-size:16px;line-height:1.8;color:#1c1c1c;padding:1px 4px;
  cursor:pointer;text-indent:1em}
+.rd .rdo{color:#8a6d3b;font-size:.9em;line-height:1.6;text-indent:0;
+ margin:0 0 3px;padding:0 0 3px;border-bottom:1px dashed #e5dcc8}
+.rd .rdt{text-indent:1em}
+.rd.rdsronly{color:#6b4f2a}      /* 원문만 보기 — 원문임을 색으로 구분 */
+mark.hl{background:#fff2a8;color:inherit;border-radius:2px;padding:0 1px;
+ cursor:pointer;-webkit-box-decoration-break:clone;box-decoration-break:clone}
+#hlpop{display:none;position:fixed;z-index:50;background:#222;color:#fff;
+ border-radius:9px;padding:2px;box-shadow:0 3px 14px rgba(0,0,0,.35)}
+#hlpop.on{display:block}
+#hlpop button{background:none;border:0;color:#fff;font-size:14px;
+ padding:8px 13px;min-height:40px;cursor:pointer;white-space:nowrap}
 .rd.untr{color:#8a6d3b}
 .rd.rdh{font-weight:700;font-size:1.15em;text-indent:0;margin:8px 0 4px}
 body.rdmode .row{border:0;background:none;padding:1px 6px;margin:0;
- box-shadow:none;contain-intrinsic-size:60px}
+ box-shadow:none;contain-intrinsic-size:auto 60px}
 body.rdmode .row .rh,body.rdmode .row textarea{display:none}
 body.rdmode .rd{display:block}
+/* 읽기모드에서 탭한 문단만 인라인 '편집 카드'로 펼침 (지연 생성) */
+body.rdmode .row.ed{border:1px solid var(--acc);background:#fff;
+ border-radius:10px;padding:9px 10px;margin:10px 2px;
+ box-shadow:0 2px 10px rgba(0,0,0,.13);content-visibility:visible;
+ scroll-margin-top:calc(env(safe-area-inset-top) + 54px)}
+body.hdhide .row.ed{scroll-margin-top:calc(env(safe-area-inset-top) + 8px)}
+body.rdmode .row.ed .rd{display:none}
+body.rdmode .row.ed .rh{display:flex;margin-bottom:4px;align-items:center}
+/* 카드에선 원문·번역 둘 다 표시 (대조하며 수정) */
+body.rdmode .row.ed textarea{display:block}
+body.rdmode .row.ed textarea.src{display:block!important}
+.edbmk{display:none}
+body.rdmode .row.ed .rh .edbmk{display:inline-block;margin-left:auto;
+ background:#fff;color:var(--acc);border-color:var(--acc);font-weight:700}
+body.rdmode .row.ed .rh .edbmk.on{background:var(--acc);color:#fff}
+/* 카드 안 원문/번역 라벨 (편집 모드 전체에선 숨김) */
+.fldl{display:none}
+body.rdmode .row.ed .fldl{display:block;font-size:11px;font-weight:700;
+ margin:2px 2px 1px}
+body.rdmode .row.ed .fldl-o{color:#8a6d3b}
+body.rdmode .row.ed .fldl-t{color:#127a53;margin-top:6px}
 body.rdmode .pgh{opacity:.45;font-size:11px;margin:10px 4px 2px}
 body.rdmode .pgh button{display:none}
 @media (max-width:640px){
  main{padding:6px 6px 60vh}
  .row{padding:7px 8px;margin:5px 0;border-radius:10px;
-  contain-intrinsic-size:110px}
+  contain-intrinsic-size:auto 110px}
  .rh{margin-bottom:2px;flex-wrap:wrap}
  header{padding:6px 6px;gap:4px}
  header::before{content:"";flex-basis:100%;order:1;height:0}
@@ -1503,8 +1669,8 @@ body.rdmode .pgh button{display:none}
   title="현재 위치를 북마크로 저장 — 다음에 열 때 이 문단에서 이어서">🔖</button>
  <button id="mode"
   title="읽기 모드 ↔ 편집 모드 — 읽기 모드에서 문단을 탭하면 편집">📖 읽기</button>
- <button id="fsm" style="display:none" title="글자 작게">A−</button>
- <button id="fsp" style="display:none" title="글자 크게">A+</button>
+ <button id="cfg" style="display:none"
+  title="보기 설정 — 글자 크기·글꼴">⚙</button>
  <button id="exp">📖 TXT/EPUB 재생성</button>
  <span id="st"></span>
 </header>
@@ -1581,11 +1747,13 @@ D.paras.forEach((e,i)=>{
    rvb.onclick=()=>{if(!confirm('『'+pvpg+'』 페이지의 번역을 모두 비우고 '
      +'원문 그대로 출력할까요?'))return;
     D.paras.forEach((x,j)=>{if(x.page!==pvpg||!rows[j])return;
-     if(rows[j].tk.value){rows[j].tk.value='';mark(j,'text','');}});};
+     if(gtv(j)){stv(j,'');mark(j,'text','');}});
+    if(document.body.classList.contains('rdmode')){
+     rdDirty.forEach(j=>rdFill(j));rdDirty.clear();}};
    h.appendChild(rvb);}
   list.appendChild(h);}
  const t=D.xlat[String(i)];
- const r=document.createElement('div');r.className='row';
+ const r=document.createElement('div');r.className='row';r.dataset.i=i;
  if(t==null)r.classList.add('fail');
  const rh=document.createElement('div');rh.className='rh';
  const sp=document.createElement('span');sp.textContent='#'+(i+1);
@@ -1598,11 +1766,21 @@ D.paras.forEach((e,i)=>{
   sb.title='페이지 경계에서 병합된 문단 — 뒷부분은 이 페이지에 있습니다';
   if(SRV)sb.onclick=()=>showImg(e.page_end);
   rh.appendChild(sb);}
- if(SRV){const rb=document.createElement('button');rb.textContent='🌐 재번역';
-  rb.title='원문을 고쳤으면 이 버튼으로 해당 문단만 다시 번역합니다';
-  rb.onclick=()=>retx(i,rb);rh.appendChild(rb);}
+ const rd=document.createElement('div');rd.className='rd';
+ rd.title='탭하면 편집 · 드래그하면 하이라이트';
+ rd.onclick=()=>{
+  const sel=getSelection();                 // 드래그로 선택 중이면 카드 안 엶
+  if(sel&&!sel.isCollapsed&&(sel.toString()||'').trim())return;
+  if(CLOUD){showEd(i);}
+  else{setMode(false);const o=mkEdit(i);r.scrollIntoView();o.tk.focus();}};
+ r.append(rh,rd);list.appendChild(r);
+ rows[i]={r,rh,rd,sv:e.src,tv:(t==null?'':t),ts:null,tk:null};
+ if(!CLOUD)mkEdit(i);           // 데스크톱: 즉시 편집기 (기존 동작)
+});
+/* 지연 편집기 생성 — 해당 문단을 탭하거나 전체 편집 모드일 때만 textarea 생성 */
+function mkEdit(i){const o=rows[i];if(!o||o.ts)return o;
  const ts=document.createElement('textarea');ts.className='src';
- ts.value=e.src;ts.title='원문 (전사 오류 수정 가능)';
+ ts.value=o.sv;ts.title='원문 (전사 오류 수정 가능)';
  const hb=document.createElement('button');hb.textContent='§ 제목';
  hb.title='제목/소제목 지정 토글 — 켜면 EPUB 장 분할·목차 기준이 되고 '
   +'앞뒤 문단과 병합되지 않습니다 (원문 앞 ## 마커로 저장, '
@@ -1613,97 +1791,336 @@ D.paras.forEach((e,i)=>{
   hb.style.borderColor=on?'var(--acc)':'';}
  hb.onclick=function(){
   ts.value=ts.value.startsWith('## ')?ts.value.slice(3):'## '+ts.value;
-  mark(i,'src',ts.value);updHb();};
- ts.addEventListener('input',updHb);updHb();
- rh.appendChild(hb);
- const tk=document.createElement('textarea');tk.value=t||'';
+  o.sv=ts.value;mark(i,'src',ts.value);updHb();};
+ ts.addEventListener('input',()=>{o.sv=ts.value;updHb();mark(i,'src',ts.value);});
+ updHb();
+ if(SRV){const rb=document.createElement('button');rb.textContent='🌐 재번역';
+  rb.title='원문을 고쳤으면 이 버튼으로 해당 문단만 다시 번역합니다';
+  rb.onclick=()=>retx(i,rb);o.rh.appendChild(rb);}
+ o.rh.appendChild(hb);
+ const bm=document.createElement('button');bm.className='edbmk';
+ bm.textContent='🔖 북마크';
+ bm.title='이 문단을 북마크에 추가 — 상단 🔖 목록에서 골라 다시 옵니다 '
+  +'(닫기는 화면의 ✓ 버튼)';
+ bm.onclick=(ev)=>{ev.stopPropagation();
+  if(window._bmAdd)window._bmAdd(i);
+  bm.classList.add('on');bm.textContent='🔖 추가됨';
+  setTimeout(()=>{bm.classList.remove('on');bm.textContent='🔖 북마크';},1100);};
+ o.rh.appendChild(bm);
+ const tk=document.createElement('textarea');tk.value=o.tv;
  tk.placeholder='(비우면 원문이 그대로 출력됩니다)';
+ tk.addEventListener('input',()=>{o.tv=tk.value;mark(i,'text',tk.value);});
  [ts,tk].forEach(x=>{x.rows=Math.min(14,Math.max(2,
   Math.ceil((x.value.length||60)/60)));});
- ts.addEventListener('input',()=>mark(i,'src',ts.value));
- tk.addEventListener('input',()=>mark(i,'text',tk.value));
- const rd=document.createElement('div');rd.className='rd';
- rd.title='탭하면 이 문단을 편집합니다';
- rd.onclick=()=>{setMode(false);r.scrollIntoView();tk.focus();};
- r.append(rh,ts,tk,rd);list.appendChild(r);
- rows[i]={r,ts,tk,rd};
-});
+ const lo=document.createElement('div');lo.className='fldl fldl-o';
+ lo.textContent='원문';
+ const lt=document.createElement('div');lt.className='fldl fldl-t';
+ lt.textContent='번역';
+ o.r.insertBefore(lo,o.rd);o.r.insertBefore(ts,o.rd);
+ o.r.insertBefore(lt,o.rd);o.r.insertBefore(tk,o.rd);
+ o.ts=ts;o.tk=tk;return o;}
+function closeEd(i,scroll){const o=rows[i];if(!o)return;   // 카드 닫고 읽기로
+ o.r.classList.remove('ed');o.rf=false;rdFill(i);
+ if(!document.querySelector('.row.ed')){
+  document.body.classList.remove('hdhide');
+  document.body.classList.remove('hascard');edPost(false);}
+ try{if(document.activeElement)document.activeElement.blur();}catch(e){}
+ if(scroll)requestAnimationFrame(()=>{   // 수정하던 문단이 화면에 보이게
+  try{o.r.scrollIntoView({block:'center'});}catch(e){}
+  setTimeout(()=>{try{o.r.scrollIntoView({block:'center'});}catch(e){}},170);});}
+function showEd(i){
+ document.querySelectorAll('.row.ed').forEach(el=>{   // 한 번에 한 카드만
+  const j=+el.dataset.i;if(j!==i)closeEd(j);});
+ const o=mkEdit(i);o.r.classList.add('ed');
+ if(window._bmkSet)window._bmkSet(i);   // 마지막 편집 위치 기록(재열기 복원용)
+ if(NARROW)document.body.classList.add('hdhide');   // 편집 카드 열리면 헤더 숨김
+ document.body.classList.add('hascard');edPost(true);   // 완료 FAB·셸 홈 숨김
+ // 카드를 헤더 바로 아래로 고정 — 포커스 기본 스크롤(튕김)은 막고 직접 이동
+ requestAnimationFrame(()=>{
+  try{o.tk.focus({preventScroll:true});}catch(e){try{o.tk.focus();}catch(_){}}
+  o.r.scrollIntoView({block:'start'});
+  setTimeout(()=>o.r.scrollIntoView({block:'start'}),140);});}  // 키보드 열린 뒤 보정
+function gsv(i){const o=rows[i];return o.ts?o.ts.value:o.sv;}
+function gtv(i){const o=rows[i];return o.tk?o.tk.value:o.tv;}
+function stv(i,v){const o=rows[i];o.tv=v;if(o.tk)o.tk.value=v;}
+function ssv(i,v){const o=rows[i];o.sv=v;if(o.ts)o.ts.value=v;}
 function mark(i,k,v){const d=dirty.get(i)||{};d[k]=v;dirty.set(i,d);
  rows[i].r.classList.add('dirty');upd();if(CLOUD)cloudQueue();
- rdDirty.add(i);}
+ rows[i].rf=false;rdDirty.add(i);}
 function curIdx(){const hh=document.querySelector('header').offsetHeight+4;
  for(let i=0;i<rows.length;i++){
   const rc=rows[i].r.getBoundingClientRect();
   if(rc.bottom>hh&&(rc.bottom||rc.top))return i;}
  return 0;}
-const rdDirty=new Set();let rdFilled=false;
+const rdDirty=new Set();
 const NARROW=matchMedia('(max-width:640px)').matches;
 function rdFill(i){const o=rows[i];if(!o||!o.rd)return;
- const ko=(o.tk.value||'').trim();
- o.rd.innerHTML=fmtHtml(stripMark(ko||o.ts.value));
- o.rd.classList.toggle('untr',!ko);
- o.rd.classList.toggle('rdh',o.ts.value.indexOf('## ')===0);}
+ const s=gsv(i),ko=(gtv(i)||'').trim();
+ const srcOnly=document.body.classList.contains('rdsrc');  // 원문만 보기
+ o.rd.innerHTML=fmtHtml(stripMark(srcOnly?s:(ko||s)));
+ o.rd.classList.toggle('rdsronly',srcOnly);    // 원문 보기 시 색 구분
+ o.rd.classList.toggle('untr',!srcOnly&&!ko);
+ o.rd.classList.toggle('rdh',s.indexOf('## ')===0);
+ if(!srcOnly)hiPaint(o.rd,i);                  // 저장된 하이라이트 다시 칠하기
+ o.rf=true;}
+function updSrcBtn(){const b=window._srcBtn;if(!b)return;
+ const on=document.body.classList.contains('rdmode')
+  ?document.body.classList.contains('rdsrc')
+  :!document.body.classList.contains('nosrc');
+ b.style.opacity=on?'':'.5';}
+function refillRd(){rows.forEach(o=>{if(o)o.rf=false;});
+ if(!document.body.classList.contains('rdmode'))return;
+ const ci=curIdx();
+ for(let k=Math.max(0,ci-2);k<rows.length&&rows[k]
+   &&rows[k].r.getBoundingClientRect().top<innerHeight+500;k++)rdFill(k);}
+/* ---- 형광펜(하이라이트) — 읽기(번역) 화면에서 드래그해 지정 ---- */
+const HKEY='ebookHi:'+(D.title||'');
+let HI={};try{HI=JSON.parse(localStorage.getItem(HKEY)||'{}')||{}}catch(e){HI={}}
+function hiSave(){try{localStorage.setItem(HKEY,JSON.stringify(HI))}catch(e){}}
+let _hiPushT=null;
+function hiCloudPush(){if(!CLOUD)return;   // Drive에 공유 저장(디바운스)
+ clearTimeout(_hiPushT);
+ _hiPushT=setTimeout(()=>{gasCall({op:'hi',set:HI}).catch(()=>{});},700);}
+function hiCloudPull(){if(!CLOUD)return;   // 열 때 공유본 받아 반영(클라우드 우선)
+ gasCall({op:'hi'}).then(r=>{
+  const chi=r?r.hi:undefined;let changed=false;
+  if(chi===undefined||chi===null){        // 클라우드 기록 없음(최초) → 로컬 올림
+   if(Object.keys(HI).length)hiCloudPush();
+  }else{const before=JSON.stringify(HI);   // 기록 있으면(빈 것 포함) 클라우드 우선
+   HI=chi;hiSave();changed=(JSON.stringify(HI)!==before);}
+  // 실제로 하이라이트가 달라졌을 때만 다시 그린다 — 안 바뀌면 화면 리프레쉬 없음
+  if(changed&&document.body.classList.contains('rdmode'))refillRd();
+ }).catch(()=>{});}
+function _mergeHi(rs){rs=rs.slice().sort((a,b)=>a[0]-b[0]);const out=[];
+ for(const r of rs){const l=out[out.length-1];
+  if(l&&r[0]<=l[1])l[1]=Math.max(l[1],r[1]);else out.push(r.slice());}
+ return out;}
+function hiAdd(i,s,e){const k=String(i);
+ HI[k]=_mergeHi([...(HI[k]||[]),[s,e]]);hiSave();hiCloudPush();
+ if(rows[i]){rows[i].rf=false;rdFill(i);}}
+function hiDel(i,s,e){const k=String(i);
+ HI[k]=(HI[k]||[]).filter(r=>!(r[0]===s&&r[1]===e));
+ if(!HI[k].length)delete HI[k];hiSave();hiCloudPush();
+ if(rows[i]){rows[i].rf=false;rdFill(i);}}
+function _hiWrap(rd,i,s,e){
+ const w=document.createTreeWalker(rd,NodeFilter.SHOW_TEXT);
+ let n=0,node,jobs=[];
+ while((node=w.nextNode())){const len=node.textContent.length,ns=n;n+=len;
+  const a=Math.max(s,ns),b=Math.min(e,n);if(a<b)jobs.push([node,a-ns,b-ns]);}
+ jobs.reverse().forEach(([node,a,b])=>{const rg=document.createRange();
+  rg.setStart(node,a);rg.setEnd(node,b);
+  const m=document.createElement('mark');m.className='hl';
+  m.dataset.i=i;m.dataset.s=s;m.dataset.e=e;
+  try{rg.surroundContents(m);}catch(er){}});}
+function hiPaint(rd,i){const rs=HI[String(i)];if(!rs||!rs.length)return;
+ const L=rd.textContent.length;
+ rs.forEach(([s,e])=>{if(s<e&&e<=L)_hiWrap(rd,i,s,e);});}
+function _hoff(root,node,pos){let n=0,c,
+  w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);
+ while((c=w.nextNode())){if(c===node)return n+pos;n+=c.textContent.length;}
+ return -1;}
+const hlpop=document.createElement('div');hlpop.id='hlpop';
+document.body.appendChild(hlpop);
+let hlPend=null;
+function hlClose(){hlpop.classList.remove('on');}
+function hlShow(rect,label,onclk,fixed){
+ hlpop.innerHTML='<button>'+label+'</button>';
+ hlpop.querySelector('button').onclick=(ev)=>{
+  ev.stopPropagation();hlClose();onclk();};
+ hlpop.classList.add('on');
+ const pw=hlpop.offsetWidth,ph=hlpop.offsetHeight;
+ if(fixed){        // 선택 시: OS 기본 툴바(선택 위)와 안 겹치게 화면 하단 고정
+  hlpop.style.left='50%';hlpop.style.transform='translateX(-50%)';
+  hlpop.style.top='auto';
+  hlpop.style.bottom='calc(env(safe-area-inset-bottom) + 22px)';
+  // 선택이 화면 하단이면 기본 툴바가 아래로 올 수 있어 상단으로
+  if(rect&&rect.bottom>innerHeight*0.62){hlpop.style.bottom='auto';
+   hlpop.style.top='calc(env(safe-area-inset-top) + 12px)';}
+  return;}
+ hlpop.style.transform='';hlpop.style.bottom='auto';
+ let left=rect.left+rect.width/2-pw/2;
+ left=Math.max(6,Math.min(left,innerWidth-pw-6));
+ let top=rect.top-ph-8;if(top<6)top=rect.bottom+8;
+ hlpop.style.left=left+'px';hlpop.style.top=top+'px';}
+function onSelHl(){
+ if(!document.body.classList.contains('rdmode'))return;
+ if(document.body.classList.contains('rdsrc'))return;   // 번역 화면에서만
+ const sel=getSelection();
+ if(!sel||sel.isCollapsed||!sel.rangeCount)return;
+ const rg=sel.getRangeAt(0);
+ let el=rg.commonAncestorContainer;
+ el=el.nodeType===1?el:el.parentNode;
+ const rd=el&&el.closest?el.closest('.rd'):null;
+ if(!rd||(rd.closest&&rd.closest('.row.ed')))return;    // 편집 카드 제외
+ const i=+rd.parentNode.dataset.i;
+ const a=_hoff(rd,rg.startContainer,rg.startOffset);
+ const b=_hoff(rd,rg.endContainer,rg.endOffset);
+ if(a<0||b<0||a===b)return;
+ hlPend={i:i,s:Math.min(a,b),e:Math.max(a,b)};
+ hlShow(rg.getBoundingClientRect(),'🖍 하이라이트',()=>{
+  if(hlPend)hiAdd(hlPend.i,hlPend.s,hlPend.e);
+  try{getSelection().removeAllRanges()}catch(er){}},true);}
+document.addEventListener('selectionchange',()=>{
+ clearTimeout(window._hlT);window._hlT=setTimeout(onSelHl,350);});
+list.addEventListener('click',e=>{                       // 하이라이트 탭 → 지우기
+ const m=e.target.closest&&e.target.closest('mark.hl');
+ if(!m)return;e.stopPropagation();
+ hlShow(m.getBoundingClientRect(),'🗑 하이라이트 지우기',
+  ()=>hiDel(+m.dataset.i,+m.dataset.s,+m.dataset.e));},true);
+document.addEventListener('click',e=>{
+ if(hlpop.classList.contains('on')&&!hlpop.contains(e.target)
+    &&!(e.target.closest&&e.target.closest('mark.hl')))hlClose();},true);
+addEventListener('scroll',hlClose,true);
+/* ---- 상단 헤더 자동 숨김(모바일) — 아래로 스크롤 시 잠시 뒤 숨김,
+   위로 스크롤 시 즉시 표시, 편집 카드 열리면 숨김 ---- */
+if(NARROW){let _hy=scrollY,_hdT=null;
+ addEventListener('scroll',()=>{const y=scrollY;
+  if(document.querySelector('.row.ed')){
+   document.body.classList.add('hdhide');_hy=y;return;}
+  if(y<12){clearTimeout(_hdT);document.body.classList.remove('hdhide');_hy=y;return;}
+  if(y>_hy+6){clearTimeout(_hdT);_hdT=setTimeout(()=>{
+    if(!document.querySelector('.row.ed'))document.body.classList.add('hdhide');},380);}
+  else if(y<_hy-6){clearTimeout(_hdT);document.body.classList.remove('hdhide');}
+  _hy=y;},{passive:true});}
+/* 읽기모드 — 화면에 보이는 마지막 위치(맨 위 문단)를 자동 기억(재열기 복원) */
+window._psLast=-1;
+addEventListener('scroll',()=>{
+ if(!document.body.classList.contains('rdmode'))return;
+ if(document.querySelector('.row.ed'))return;      // 편집 중엔 편집 위치 우선
+ if(performance.now()<2500)return;                 // 초기 복원 스크롤 무시
+ clearTimeout(window._psT);
+ window._psT=setTimeout(()=>{const i=curIdx();
+  if(i!==window._psLast&&window._bmkSet){window._psLast=i;window._bmkSet(i);}},700);
+},{passive:true});
+/* 편집 카드 활성 시 반투명 완료 FAB (셸 홈 버튼은 숨기라고 부모에 통지) */
+const edfab=document.createElement('button');edfab.id='edfab';
+edfab.textContent='✓';edfab.title='편집 완료';
+edfab.onclick=()=>{const el=document.querySelector('.row.ed');
+ if(el)closeEd(+el.dataset.i,true);};
+document.body.appendChild(edfab);
+function edPost(on){try{if(window.top!==window)
+  window.top.postMessage({ebook:'ed',on:!!on},'*');}catch(e){}}
+/* 뷰포트 근처 문단의 rd만 렌더 — 긴 책 첫 로딩 부담 완화 */
+let rio=null;
+function ensureRio(){if(rio)return;
+ rio=new IntersectionObserver(es=>{es.forEach(en=>{
+   if(!en.isIntersecting)return;
+   const i=+en.target.dataset.i;const o=rows[i];
+   if(o&&!o.rf&&document.body.classList.contains('rdmode'))rdFill(i);});},
+  {rootMargin:'1200px 0px'});
+ rows.forEach(o=>rio.observe(o.r));}
 function setMode(on){
  const ci=curIdx();
  document.body.classList.toggle('rdmode',on);
  document.getElementById('mode').textContent=
   on?(NARROW?'✏':'✏ 편집'):(NARROW?'📖':'📖 읽기');
- if(on){if(!rdFilled){rows.forEach((o,i)=>rdFill(i));rdFilled=true;}
-  else{rdDirty.forEach(i=>rdFill(i));rdDirty.clear();}}
- try{localStorage.setItem('edMode',on?'1':'')}catch(e){}
+ if(on){document.querySelectorAll('.row.ed').forEach(el=>{
+   const j=+el.dataset.i;el.classList.remove('ed');rdDirty.add(j);});
+  ensureRio();
+  rdDirty.forEach(i=>{const o=rows[i];if(o){o.rf=false;rdFill(i);}});
+  rdDirty.clear();
+  requestAnimationFrame(()=>{const o=rows[curIdx()];
+   for(let k=Math.max(0,(o?+o.r.dataset.i:0)-2);
+       k<rows.length&&rows[k]&&!rows[k].rf
+       &&rows[k].r.getBoundingClientRect().top<innerHeight+400;k++)rdFill(k);});}
+ else if(CLOUD){rows.forEach((o,i)=>mkEdit(i));}  // 전체 편집 모드 — 모두 생성
+ try{localStorage.setItem('edMode',on?'1':'0')}catch(e){}
+ updSrcBtn();
  const o=rows[ci];if(o)o.r.scrollIntoView();}
 document.getElementById('mode').onclick=()=>
  setMode(!document.body.classList.contains('rdmode'));
 if(NARROW)document.getElementById('mode').textContent='📖';
-if(localStorage.getItem('edMode')==='1')setMode(true);
-const BKEY='ebookBmk:'+(D.title||'');
+{const _em=localStorage.getItem('edMode');
+ const _rd=CLOUD?(_em!=='0'):(_em==='1');   // 모바일 기본 읽기, 데스크톱 기본 편집
+ if(_rd)setMode(true);
+ else if(CLOUD)rows.forEach((o,i)=>mkEdit(i));}  // 편집 모드로 시작 → 전체 생성
+const BKEY='ebookBmk:'+(D.title||'');       // 자동 '마지막 위치'(이어읽기)
+const BMKS_KEY='ebookBmks:'+(D.title||'');  // 수동 다중 북마크 목록
+// 편집/스크롤 시 자동으로 마지막 위치 기록 — 재열기 복원용(북마크와 별개)
+window._bmkSet=(i)=>{if(i==null)return;
+ try{localStorage.setItem(BKEY,String(i))}catch(e){}
+ if(CLOUD){clearTimeout(window._bmkT);
+  window._bmkT=setTimeout(()=>{gasCall({op:'state',pos:i}).catch(()=>{});},1200);}};
+// 저장했던 문단을 '화면 맨 위'(헤더 바로 아래)로 안정적으로 복원.
+// 지연 렌더·웹폰트 로드 리플로우로 위치가 튀지 않게 여러 번 재보정하고,
+// 사용자가 직접 스크롤/터치하면 즉시 멈춰서 방해하지 않는다.
+let _restTarget=null,_restStop=false;
+['touchstart','wheel','keydown','pointerdown'].forEach(ev=>
+ addEventListener(ev,()=>{_restStop=true;},{passive:true}));
+function _restGo(){if(_restTarget==null||_restStop)return;
+ const o=rows[_restTarget];if(!o)return;
+ // 대상을 헤더 바로 아래(헤더 밑변)에 맞춤 — curIdx() 판정선(헤더+4)보다 위라
+ // 대상이 '맨 위 문단'으로 잡혀 자동 저장이 한 칸씩 밀리지 않는다.
+ const hh=(document.querySelector('header').offsetHeight||0);
+ const top=o.r.getBoundingClientRect().top;
+ if(Math.abs(top-hh)>2)scrollBy(0,top-hh);}   // 어긋날 때만 보정(맨 위 정렬)
+function _bmGo(j,flash){j=parseInt(j,10);
+ if(isNaN(j)||j<0)return false;j=Math.min(j,rows.length-1);
+ const o=rows[j];if(!o)return false;
+ _restTarget=j;_restStop=false;
+ for(let k=Math.max(0,j-8);k<Math.min(rows.length,j+10);k++){   // 대상 주변 먼저 렌더
+  const p=rows[k];if(p&&!p.rf&&document.body.classList.contains('rdmode'))rdFill(k);}
+ _restGo();
+ let n=0;(function settle(){if(_restStop)return;_restGo();      // 몇 프레임 재보정
+  if(++n<8)requestAnimationFrame(()=>setTimeout(settle,45));})();
+ if(document.fonts&&document.fonts.ready)document.fonts.ready.then(()=>{
+  if(_restStop||_restTarget!==j)return;                        // 폰트 로드 후 재보정
+  let m=0;(function fset(){if(_restStop||_restTarget!==j)return;_restGo();
+   if(++m<5)requestAnimationFrame(()=>setTimeout(fset,55));})();});
+ if(flash!==false){o.r.style.boxShadow='0 0 0 2px var(--acc)';
+  setTimeout(()=>{o.r.style.boxShadow=''},1600);}
+ st.textContent='🔖 #'+(j+1)+'에서 이어서';return true;}
+// 현재 문단을 수동 북마크 목록에 추가 (카드 🔖 버튼·상단 🔖 목록 공용)
+window._bmAdd=(i)=>{if(i==null||i<0)return;
+ let a;try{a=JSON.parse(localStorage.getItem(BMKS_KEY)||'[]')||[]}catch(e){a=[]}
+ if(!a.includes(i)){a.push(i);a.sort((x,y)=>x-y);
+  try{localStorage.setItem(BMKS_KEY,JSON.stringify(a))}catch(e){}}
+ st.textContent='🔖 #'+(i+1)+' 북마크에 추가됨';
+ if(window._bmRender)window._bmRender();};
 function initBmk(cloud){
  const bk=document.getElementById('bmk');bk.style.display='';
- let cur=null;
  const mnu=document.createElement('div');mnu.id='bmenu';
- const info=document.createElement('div');
- const b1=document.createElement('button');b1.textContent='📍 현재 위치 저장';
- const b2=document.createElement('button');b2.textContent='➡ 북마크로 이동';
- const b3=document.createElement('button');b3.textContent='🗑 북마크 삭제';
- mnu.append(info,b1,b2,b3);document.body.appendChild(mnu);
+ document.body.appendChild(mnu);
  const close=()=>mnu.classList.remove('on');
- bk.onclick=()=>{
-  if(mnu.classList.contains('on')){close();return}
-  info.textContent=cur!=null?'저장된 북마크: #'+(cur+1)
-   :'저장된 북마크 없음';
-  b2.disabled=b3.disabled=cur==null;
-  mnu.style.top=(bk.getBoundingClientRect().bottom+6)+'px';
-  mnu.style.right='8px';
-  mnu.classList.add('on');};
+ const loadB=()=>{try{return JSON.parse(localStorage.getItem(BMKS_KEY)||'[]')||[]}
+  catch(e){return[]}};
+ const saveB=a=>{try{localStorage.setItem(BMKS_KEY,JSON.stringify(a))}catch(e){}};
+ const snip=i=>{const t=(gtv(i)||gsv(i)||'');
+  return (stripMark(t).replace(/\\s+/g,' ').trim().slice(0,24))||'(빈 문단)';};
+ function render(){
+  mnu.innerHTML='';
+  const h=document.createElement('div');h.className='bmh';h.textContent='🔖 북마크';
+  const add=document.createElement('button');add.className='bmadd';
+  add.textContent='📍 현재 위치 북마크 추가';
+  add.onclick=()=>window._bmAdd(curIdx());
+  mnu.append(h,add);
+  const a=loadB();
+  if(!a.length){const e=document.createElement('div');e.className='bmempty';
+   e.textContent='저장된 북마크가 없습니다 — 위 버튼으로 추가하세요';
+   mnu.appendChild(e);return;}
+  a.forEach(i=>{const row=document.createElement('div');row.className='bmrow';
+   const g=document.createElement('button');g.className='bmgo';
+   const bb=document.createElement('b');bb.textContent='#'+(i+1);
+   const sp=document.createElement('span');sp.textContent=snip(i);
+   g.append(bb,sp);g.onclick=()=>{close();_bmGo(i);};
+   const d=document.createElement('button');d.className='bmdel';
+   d.textContent='🗑';d.title='이 북마크 삭제';
+   d.onclick=ev=>{ev.stopPropagation();saveB(loadB().filter(x=>x!==i));render();};
+   row.append(g,d);mnu.appendChild(row);});
+ }
+ window._bmRender=()=>{if(mnu.classList.contains('on'))render();};
+ bk.onclick=()=>{if(mnu.classList.contains('on')){close();return}
+  render();mnu.style.top=(bk.getBoundingClientRect().bottom+6)+'px';
+  mnu.style.right='8px';mnu.classList.add('on');};
  document.addEventListener('click',e=>{
   if(!mnu.contains(e.target)&&e.target!==bk)close();},true);
- const go=j=>{j=parseInt(j,10);
-  if(isNaN(j)||j<0)return false;
-  j=Math.min(j,rows.length-1);
-  const o=rows[j];if(!o)return false;
-  o.r.scrollIntoView();
-  o.r.style.boxShadow='0 0 0 2px var(--acc)';
-  setTimeout(()=>{o.r.style.boxShadow=''},1600);
-  st.textContent='🔖 #'+(j+1)+'에서 이어서';return true;};
- b1.onclick=async()=>{const i=curIdx();cur=i;close();
-  try{localStorage.setItem(BKEY,String(i))}catch(e){}
-  st.textContent='🔖 #'+(i+1)+' 위치 저장됨';
-  if(cloud){try{await gasCall({op:'state',pos:i});
-    st.textContent='🔖 #'+(i+1)+' 위치 저장됨 ☁';}catch(e){}}};
- b2.onclick=()=>{close();if(cur!=null)go(cur);};
- b3.onclick=async()=>{cur=null;close();
-  try{localStorage.removeItem(BKEY)}catch(e){}
-  st.textContent='🔖 북마크 삭제됨';
-  if(cloud){try{await gasCall({op:'state',pos:null});
-    st.textContent='🔖 북마크 삭제됨 ☁ (서재 진행률도 초기화)';}
-   catch(e){}}};
- const li=localStorage.getItem(BKEY);
- if(cloud)gasCall({op:'get'}).then(q=>{
-   const sp=q&&q.state&&q.state.pos;
-   if(sp!=null){if(go(sp))cur=parseInt(sp,10);}
-   else if(li!=null&&go(li))cur=parseInt(li,10);}).catch(()=>{
-   if(li!=null&&go(li))cur=parseInt(li,10);});
- else if(li!=null&&go(li))cur=parseInt(li,10);}
+ // 열 때 자동 '마지막 위치' 복원 (북마크와 별개)
+ // 로컬 기록으로 '즉시' 복원(대기 없음) → 클라우드 위치가 다를 때만 한 번 보정.
+ // 같은 기기에선 로컬==클라우드라 두 번 튀지 않는다.
+ const li=localStorage.getItem(BKEY);const liN=(li!=null&&li!=='')?parseInt(li,10):null;
+ if(liN!=null)_bmGo(liN,false);        // 자동 복원은 파란 강조 없이 조용히
+ if(cloud)gasCall({op:'get'}).then(q=>{const sp=q&&q.state&&q.state.pos;
+   if(sp!=null&&sp!==liN&&!_restStop)_bmGo(sp,false);}).catch(()=>{});}
 if(matchMedia('(pointer:coarse)').matches){
  const grow=t=>{t.style.height='auto';
   const cap=Math.max(160,innerHeight*0.5),h=t.scrollHeight+2;
@@ -1745,7 +2162,7 @@ async function retx(i,btn){btn.disabled=true;
  try{if(!await doSave())return;
   const r=await api('/api/xlat',{ids:[i]});
   const t=r[String(i)];
-  if(t){rows[i].tk.value=t;rows[i].r.classList.remove('fail');
+  if(t){stv(i,t);rows[i].r.classList.remove('fail');
    D.xlat[String(i)]=t;st.textContent='#'+(i+1)+' 재번역 완료';}
   else st.textContent='#'+(i+1)+' 재번역 실패 — 기존 번역 유지';
   upd();}
@@ -1804,8 +2221,8 @@ function showPv(pg){ipMode='pv';ipHead(pg,' — 출력 미리보기');
  D.paras.forEach(function(e,i){
   if(e.page!==pg||n>=200)return;   // 페이지 정보 없는 옛 데이터 폭주 방지
   n++;
-  const src=rows[i]?rows[i].ts.value:e.src;
-  const ko=rows[i]?rows[i].tk.value:(D.xlat[String(i)]||'');
+  const src=rows[i]?gsv(i):e.src;
+  const ko=rows[i]?gtv(i):(D.xlat[String(i)]||'');
   const isHead=src.startsWith('## ');
   const el=document.createElement(isHead?'h2':'p');
   el.innerHTML=fmtHtml(stripMark(ko.trim()||src));
@@ -1898,45 +2315,104 @@ function initCloud(){
   const b=new Blob([JSON.stringify(pl,null,1)],{type:'application/json'});
   const a=document.createElement('a');a.href=URL.createObjectURL(b);
   a.download=(D.title||'이북')+'_edits.json';a.click();};
- function setFs(px){window._fs=px;
-  try{localStorage.setItem('edFs',String(px))}catch(e){}
+ // 코믹스앱 본문 폰트 — GitHub Pages 셸에 호스팅한 woff2를 @font-face로 사용
+ // (셸 레포에 fonts.css·fonts/*.woff2 업로드 필요. 미업로드 시 뒤 폰트로 폴백)
+ const FONTHOST='https://kiuk104.github.io/ebook-shell';
+ (function(){const l=document.createElement('link');l.rel='stylesheet';
+   l.href=FONTHOST+'/fonts.css';document.head.appendChild(l);})();
+ const FONTS=[['바탕 (명조)',"Batang,'Noto Serif KR',Georgia,serif"],
+   ['리디바탕 (명조)',"'RIDIBatang',Batang,'Noto Serif KR',serif"],
+   ['에스코어드림 Light',"'SCDreamLight','Malgun Gothic',sans-serif"],
+   ['에스코어드림 Bold',"'SCDreamBold','Malgun Gothic',sans-serif"],
+   ['맑은 고딕',"'Malgun Gothic','Noto Sans KR','Apple SD Gothic Neo',sans-serif"],
+   ['나눔명조',"'Nanum Myeongjo',Batang,serif"],
+   ['나눔고딕',"'Nanum Gothic','Malgun Gothic',sans-serif"],
+   ['돋움 (고딕)',"Dotum,Gulim,sans-serif"]];
+ function applyView(){const px=window._fs||16,ff=window._ff||FONTS[0][1];
   let se=document.getElementById('fscss');
   if(!se){se=document.createElement('style');se.id='fscss';
    document.head.appendChild(se);}
   se.textContent='#list textarea{font-size:'+px+'px}'
-   +'#pv{font-size:'+(px+1)+'px}'
-   +'#list .rd{font-size:'+(px+1)+'px}'
+   +'#pv{font-size:'+(px+1)+'px;font-family:'+ff+'}'
+   +'#list .rd{font-size:'+(px+1)+'px;font-family:'+ff+'}'
    +'#list .rd.rdh{font-size:'+Math.round((px+1)*1.15)+'px}';}
+ function setFs(px){window._fs=Math.min(24,Math.max(12,px));
+  try{localStorage.setItem('edFs',String(window._fs))}catch(e){}applyView();}
+ function setFont(ff){window._ff=ff;
+  try{localStorage.setItem('edFont',ff)}catch(e){}applyView();}
  if(matchMedia('(max-width:640px)').matches)
   document.getElementById('save').textContent='💾';
- const fsm=document.getElementById('fsm'),fsp=document.getElementById('fsp');
- fsm.style.display=fsp.style.display='';
  const fs0=parseInt(localStorage.getItem('edFs')||'16',10);
- setFs(isNaN(fs0)?16:Math.min(24,Math.max(12,fs0)));
- fsm.onclick=()=>setFs(Math.max(12,(window._fs||16)-2));
- fsp.onclick=()=>setFs(Math.min(24,(window._fs||16)+2));
+ window._fs=isNaN(fs0)?16:Math.min(24,Math.max(12,fs0));
+ window._ff=localStorage.getItem('edFont')||FONTS[0][1];
+ applyView();
+ // ⚙ 보기 설정 — 글자 크기·글꼴 (헤더 절약: 팝오버 메뉴로)
+ const cfgb=document.getElementById('cfg');cfgb.style.display='';
+ const smenu=document.createElement('div');smenu.id='setmenu';
+ const fsl=document.createElement('div');fsl.className='lbl';
+ fsl.textContent='글자 크기';
+ const fsrow=document.createElement('div');fsrow.className='fsrow';
+ const bm=document.createElement('button');bm.textContent='A−';
+ const bp=document.createElement('button');bp.textContent='A+';
+ const fsv=document.createElement('span');
+ const showv=()=>fsv.textContent=(window._fs||16)+'px';showv();
+ bm.onclick=()=>{setFs((window._fs||16)-2);showv();};
+ bp.onclick=()=>{setFs((window._fs||16)+2);showv();};
+ fsrow.append(bm,fsv,bp);
+ const ffl=document.createElement('div');ffl.className='lbl';
+ ffl.textContent='글꼴';
+ const ffsel=document.createElement('select');
+ FONTS.forEach(([nm,stk])=>{const o=document.createElement('option');
+  o.value=stk;o.textContent=nm;ffsel.appendChild(o);});
+ ffsel.value=window._ff;if(ffsel.selectedIndex<0)ffsel.selectedIndex=0;
+ ffsel.onchange=()=>setFont(ffsel.value);
+ smenu.append(fsl,fsrow,ffl,ffsel);document.body.appendChild(smenu);
+ const closeS=()=>smenu.classList.remove('on');
+ cfgb.onclick=()=>{if(smenu.classList.contains('on')){closeS();return}
+  const r=cfgb.getBoundingClientRect();
+  smenu.style.top=(r.bottom+4)+'px';
+  smenu.style.right=Math.max(6,innerWidth-r.right)+'px';
+  smenu.classList.add('on');};
+ document.addEventListener('click',e=>{
+  if(!smenu.contains(e.target)&&e.target!==cfgb)closeS();},true);
  const hb2=document.getElementById('hpv');hb2.style.display='';
  hb2.onclick=()=>{const pg=D.paras[curIdx()]
    &&D.paras[curIdx()].page||D.pages[0];
   if(pg)showPv(pg);};
+ // 원문 버튼 — 편집 모드: 원문칸 접기 / 읽기 모드: 번역만 ↔ 원문만 전환
  const sb=document.createElement('button');
- sb.textContent='원문';sb.title='원문(전사) 칸 접기/펼치기 — 번역만 읽으며 검수';
- mx.after(sb);
- const setSrc=on=>{document.body.classList.toggle('nosrc',!on);
-  sb.style.opacity=on?'':'.5';
-  try{localStorage.setItem('edSrcShow',on?'1':'')}catch(e){}};
- sb.onclick=()=>setSrc(document.body.classList.contains('nosrc'));
- setSrc(localStorage.getItem('edSrcShow')!=='');
+ sb.textContent='원문';
+ sb.title='편집 모드: 원문(전사) 칸 접기 · 읽기 모드: 번역만 ↔ 원문만 보기 전환';
+ mx.after(sb);window._srcBtn=sb;
+ sb.onclick=()=>{
+  if(document.body.classList.contains('rdmode')){
+   const on=!document.body.classList.contains('rdsrc');
+   document.body.classList.toggle('rdsrc',on);
+   try{localStorage.setItem('edRdSrc',on?'1':'')}catch(e){}
+   refillRd();}
+  else{const on=document.body.classList.contains('nosrc');
+   document.body.classList.toggle('nosrc',!on);
+   try{localStorage.setItem('edSrcShow',on?'1':'')}catch(e){}}
+  updSrcBtn();};
+ document.body.classList.toggle('nosrc',
+   localStorage.getItem('edSrcShow')==='');
+ document.body.classList.toggle('rdsrc',
+   localStorage.getItem('edRdSrc')==='1');
+ if(document.body.classList.contains('rdmode'))refillRd();
+ updSrcBtn();
  try{const pd=JSON.parse(localStorage.getItem(PKEY)||'[]');
   pd.forEach(([i,d])=>{const o=rows[i];if(!o)return;   // 미전송분 복원
-   if(d.src!==undefined)o.ts.value=d.src;
-   if(d.text!==undefined)o.tk.value=d.text;
-   dirty.set(+i,d);o.r.classList.add('dirty');});}catch(e){}
+   if(d.src!==undefined)ssv(+i,d.src);
+   if(d.text!==undefined)stv(+i,d.text);
+   dirty.set(+i,d);o.r.classList.add('dirty');
+   o.rf=false;rdDirty.add(+i);});
+  if(dirty.size&&document.body.classList.contains('rdmode')){
+   rdDirty.forEach(j=>rdFill(j));rdDirty.clear();}}catch(e){}
  window.addEventListener('beforeunload',e=>{
   if(dirty.size){e.preventDefault();e.returnValue='';}});
  if(dirty.size){upd();cloudQueue(500);}
  st.textContent='☁ 클라우드 검수 — 수정은 자동 저장됩니다';
- initBmk(true);}
+ initBmk(true);hiCloudPull();}
 if(CLOUD)initCloud();
 else if(SRV)initBmk(false);
 else if(!SRV){st.textContent=
@@ -2387,7 +2863,7 @@ def _cli() -> int:
                          "gemini/deepseek은 저가 비전, winocr는 Windows "
                          "기본 OCR(무료)")
     ap.add_argument("--translate-backend", dest="backend", default="claude",
-                    choices=["claude", "gemini", "ollama"])
+                    choices=["claude", "gemini", "kimi", "ollama"])
     ap.add_argument("--model", dest="claude_model",
                     default=d.get("claude_model", "claude-sonnet-4-5"))
     ap.add_argument("--gemini-model",
@@ -2395,6 +2871,11 @@ def _cli() -> int:
     ap.add_argument("--gemini-key",
                     default=d.get("gemini_key", ""),
                     help="Gemini API 키 (기본: GEMINI_API_KEY 환경변수)")
+    ap.add_argument("--kimi-model",
+                    default=d.get("kimi_model", KIMI_MODEL))
+    ap.add_argument("--kimi-key",
+                    default=d.get("kimi_key", ""),
+                    help="Kimi API 키 (기본: MOONSHOT_API_KEY 환경변수)")
     ap.add_argument("--deepseek-model",
                     default=d.get("deepseek_model", DEEPSEEK_MODEL))
     ap.add_argument("--deepseek-key", default=d.get("deepseek_key", ""),
@@ -2450,7 +2931,8 @@ OCR_MODES = [("Claude 비전 (정확 — API 크레딧 사용)", "claude"),
               "winocr"),
              ("Tesseract (무료 — 깨끗한 인쇄 스캔용)", "tesseract")]
 BACKENDS = [("Claude API (권장 — 문학 번역 품질)", "claude"),
-            ("Gemini (저렴 — Google API 키 필요)", "gemini"),
+            ("Gemini (초저가 — Google API 키 필요)", "gemini"),
+            ("Kimi (저가·번역 품질 좋음 — Moonshot API 키 필요)", "kimi"),
             ("Ollama 로컬 (무료·오프라인)", "ollama")]
 LANGS = [("자동 감지 (독/영/일)", "auto"),
          ("독일어 → 한글", "de"), ("영어 → 한글", "en"),
@@ -2495,6 +2977,8 @@ def _gui() -> None:
             value=d.get("deepseek_model", DEEPSEEK_MODEL)),
         "deepseek_key": tk.StringVar(value=d.get("deepseek_key", "")),
         "deepseek_url": tk.StringVar(value=d.get("deepseek_url", "")),
+        "kimi_model": tk.StringVar(value=d.get("kimi_model", KIMI_MODEL)),
+        "kimi_key": tk.StringVar(value=d.get("kimi_key", "")),
         "ollama_model": tk.StringVar(
             value=d.get("ollama_model", retype.OLLAMA_MODEL)),
         "glossary": tk.StringVar(value=d.get("glossary", "")),
@@ -2565,6 +3049,12 @@ def _gui() -> None:
                  width=22).grid(row=r, column=1, sticky="w", padx=4)
     add_entry("Gemini API 키 (선택)", "gemini_key")
     add_entry("DeepSeek API 키 (선택)", "deepseek_key")
+    r = nrow()
+    ttk.Label(frm, text="Kimi 모델").grid(row=r, column=0, sticky="w")
+    ttk.Combobox(frm, textvariable=v["kimi_model"],
+                 values=["kimi-k2.5", "kimi-k2.6"],
+                 width=22).grid(row=r, column=1, sticky="w", padx=4)
+    add_entry("Kimi API 키 (선택)", "kimi_key")
     add_entry("Ollama 모델", "ollama_model")
     add_entry("용어집(선택)", "glossary", browse=lambda: v["glossary"].set(
         filedialog.askopenfilename(filetypes=[("텍스트", "*.txt"),
@@ -2658,7 +3148,8 @@ def _gui() -> None:
                          ("src", "title", "source_lang", "ocr", "backend",
                           "claude_model", "gemini_model", "gemini_key",
                           "deepseek_model", "deepseek_key",
-                          "deepseek_url", "ollama_model", "glossary",
+                          "deepseek_url", "kimi_model", "kimi_key",
+                          "ollama_model", "glossary",
                           "api_key")})
             CONFIG_PATH.write_text(
                 json.dumps(prev, ensure_ascii=False, indent=2),

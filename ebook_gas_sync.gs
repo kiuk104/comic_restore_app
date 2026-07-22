@@ -41,9 +41,16 @@ function _san(b) {
   return String(b || '').replace(/[\\\/:*?"<>|]/g, '_').trim();
 }
 
+var _FCACHE = null;                      // 실행 1회만 폴더 조회(왕복 절감)
 function _folder() {
+  if (_FCACHE) return _FCACHE;
   var it = DriveApp.getFoldersByName(FOLDER);
-  return it.hasNext() ? it.next() : DriveApp.createFolder(FOLDER);
+  _FCACHE = it.hasNext() ? it.next() : DriveApp.createFolder(FOLDER);
+  return _FCACHE;
+}
+
+function _bust() {                       // 목록 캐시 무효화(쓰기 시 호출)
+  try { CacheService.getScriptCache().remove('list'); } catch (e) {}
 }
 
 function _find(name) {
@@ -60,7 +67,7 @@ function _write(name, text) {
 function _readq(book) {
   var f = _find(book + '_edits.json');
   var d = {v: 1, fp: null, count: null, edits: {},
-           snap_fp: null, snap_count: null, state: null};
+           snap_fp: null, snap_count: null, state: null, hi: null};
   if (!f) return d;
   try {
     var q = JSON.parse(f.getBlob().getDataAsString('UTF-8'));
@@ -119,6 +126,12 @@ function _json(o) {
 function handleOp(q) {
   if (!q || q.key !== SECRET) return {err: '인증 실패 — 동기화 키 불일치'};
   if (q.op === 'list') {                 // book 불필요 — 서재 목록
+    var cache = null;
+    try { cache = CacheService.getScriptCache(); } catch (e) {}
+    if (cache) {                         // 45초 캐시 — 콜드스타트 외 재조회 즉시
+      var hit = cache.get('list');
+      if (hit) { try { return JSON.parse(hit); } catch (e) {} }
+    }
     var names = [], lfs = _folder().getFiles();
     while (lfs.hasNext()) {
       var lnm = lfs.next().getName();
@@ -133,7 +146,9 @@ function handleOp(q) {
                       ? e2.state.pos : null,
                  pending: Object.keys(e2.edits || {}).length});
     }
-    return {ok: true, books: names, info: info};
+    var res = {ok: true, books: names, info: info};
+    if (cache) { try { cache.put('list', JSON.stringify(res), 45); } catch (e) {} }
+    return res;
   }
   var book = _san(q.book);
   if (!book) return {err: 'book(책 제목) 누락'};
@@ -144,7 +159,7 @@ function handleOp(q) {
     e.snap_fp = (q.snap_fp === undefined) ? null : q.snap_fp;
     e.snap_count = (q.snap_count === undefined) ? null : q.snap_count;
     if (q.clear_edits) { e.edits = {}; e.fp = null; e.count = null; }
-    _writeq(book, e);
+    _writeq(book, e); _bust();
     return {ok: true, icon: !!_find('icon.png')};
   }
   if (q.op === 'edits') {
@@ -154,7 +169,7 @@ function handleOp(q) {
     var ed = q.edits || {};
     for (var k in ed) e.edits[k] = ed[k];              // last-write-wins
     e.ts = Date.now();
-    _writeq(book, e);
+    _writeq(book, e); _bust();
     return {ok: true, n: Object.keys(e.edits).length, snap: e.snap_fp};
   }
   if (q.op === 'get') return _readq(book);
@@ -163,19 +178,24 @@ function handleOp(q) {
     if (e.fp !== null && q.fp !== e.fp)
       return {err: 'fp 불일치 — 큐가 다른 버전 기준입니다'};
     e.edits = {}; e.fp = null; e.count = null;
-    _writeq(book, e);
+    _writeq(book, e); _bust();
     return {ok: true};
   }
   if (q.op === 'state') {
     var e = _readq(book);
     e.state = {pos: q.pos, ts: Date.now()};
-    _writeq(book, e);
+    _writeq(book, e); _bust();
     return {ok: true};
   }
   if (q.op === 'icon') {
     if (!q.png) return {err: 'png(base64) 누락'};
     _writeIcon(q.png);
     return {ok: true};
+  }
+  if (q.op === 'hi') {                    // 하이라이트 공유 저장/조회
+    var e = _readq(book);
+    if (q.set !== undefined) { e.hi = q.set; _writeq(book, e); }
+    return {ok: true, hi: e.hi};          // null=기록없음(최초), {}=비운 것
   }
   return {err: '알 수 없는 op: ' + q.op};
 }

@@ -353,6 +353,13 @@ GEMINI_TIMEOUT = 180
 DEEPSEEK_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 
+# Kimi (Moonshot AI) — OpenAI 호환, 저가 번역 백엔드 (번역 전용).
+# 비전 OCR은 주력이 아니라 전사엔 미제공 — 전사는 Claude/Gemini/DeepSeek 권장.
+# 키 발급: https://platform.moonshot.ai (MOONSHOT_API_KEY 환경변수 지원)
+KIMI_URL = "https://api.moonshot.ai/v1"
+KIMI_MODEL = "kimi-k2.5"
+KIMI_TIMEOUT = 180
+
 
 # ---------------------------------------------------------------------------
 # API 사용량·요금 집계 — 파트(전사/검증/번역)별 토큰과 예상 요금
@@ -373,6 +380,9 @@ API_PRICES = [
     ("gemini-3.5-flash", 1.50, 9.00),    # 주의: lite보다 6배 비쌈
     ("deepseek-v4-flash", 0.14, 0.28),   # 캐시 미스 기준 (히트 시 더 쌈)
     ("deepseek-v4-pro", 0.435, 0.87),
+    ("kimi-k2.5", 0.60, 3.00),           # 캐시 미스 기준 (히트 시 6배 쌈)
+    ("kimi-k2.6", 0.95, 4.00),
+    ("kimi", 0.60, 3.00),                # 기타 kimi-* 폴백
     ("ollama:", 0.0, 0.0),               # 로컬 — 무료
 ]
 
@@ -442,6 +452,11 @@ def _deepseek_key(args=None) -> str:
             or os.environ.get("DEEPSEEK_API_KEY") or "").strip()
 
 
+def _kimi_key(args=None) -> str:
+    return ((getattr(args, "kimi_key", None) if args is not None else None)
+            or os.environ.get("MOONSHOT_API_KEY") or "").strip()
+
+
 def _load_glossary(args, out_dir=None) -> str:
     """용어집 텍스트 로드 — --glossary 경로 우선, 없으면 출력폴더/_glossary.txt.
 
@@ -481,7 +496,9 @@ def xlat_cfg(args, out_dir=None) -> Optional[dict]:
                             or OLLAMA_URL).rstrip("/")),
             "gemini_model": (getattr(args, "gemini_model", None)
                              or GEMINI_MODEL),
-            "gemini_key": _gemini_key(args)}
+            "gemini_key": _gemini_key(args),
+            "kimi_model": (getattr(args, "kimi_model", None) or KIMI_MODEL),
+            "kimi_key": _kimi_key(args)}
 
 
 def needs_api_key(args) -> bool:
@@ -516,6 +533,15 @@ def needs_gemini_key(args) -> bool:
 def needs_deepseek_key(args) -> bool:
     """이 설정으로 실행 시 DEEPSEEK_API_KEY(또는 --deepseek-key)가 필요한지."""
     return getattr(args, "ocr_engine", "claude") == "deepseek"
+
+
+def needs_kimi_key(args) -> bool:
+    """이 설정으로 실행 시 MOONSHOT_API_KEY(또는 --kimi-key)가 필요한지.
+
+    Kimi는 번역 백엔드 전용 — 원서 언어가 ko가 아닐 때만 쓰인다."""
+    sl = (getattr(args, "source_lang", "ko") or "ko").lower()
+    return sl != "ko" and (getattr(args, "translate_backend", "claude")
+                           or "claude").lower() == "kimi"
 
 
 def parse_page_range(spec) -> Optional[tuple]:
@@ -874,6 +900,52 @@ def _call_deepseek(messages: list, model: str, key: str, url: str,
         raise RuntimeError(f"DeepSeek API 오류 {e.code}{hint}: {detail}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"DeepSeek 연결 실패: {e}")
+    uu = data.get("usage") or {}
+    track_usage(part, model, uu.get("prompt_tokens"),
+                uu.get("completion_tokens"))
+    raw = ((data.get("choices") or [{}])[0].get("message", {})
+           .get("content") or "")
+    raw = re.sub(r"<think>.*?(</think>|$)", "", raw, flags=re.S).strip()
+    try:
+        return _parse_json_reply(raw)
+    except Exception:
+        s, e2 = raw.find("["), raw.rfind("]")
+        if s != -1 and e2 > s:
+            return _parse_json_reply(raw[s:e2 + 1])
+        raise
+
+
+def _call_kimi(messages: list, model: str, key: str,
+               temperature: float = 0.0,
+               max_tokens: int = 8000, part: str = "번역") -> list[dict]:
+    """Kimi(Moonshot) OpenAI 호환 API 호출 → JSON 배열 파싱 (번역 전용).
+
+    _call_gemini와 동일 구조. 401/403은 키 안내 RuntimeError,
+    <think> 블록·코드펜스는 배열 추출 폴백으로 흡수."""
+    import re
+    import urllib.request
+    import urllib.error
+    body = json.dumps({"model": model, "stream": False,
+                       "temperature": temperature,
+                       "max_tokens": max_tokens,
+                       "messages": messages}).encode("utf-8")
+    req = urllib.request.Request(
+        f"{KIMI_URL.rstrip('/')}/chat/completions", data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=KIMI_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            detail = ""
+        hint = (" — MOONSHOT_API_KEY 확인 (https://platform.moonshot.ai)"
+                if e.code in (401, 403) else "")
+        raise RuntimeError(f"Kimi API 오류 {e.code}{hint}: {detail}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Kimi 연결 실패: {e}")
     uu = data.get("usage") or {}
     track_usage(part, model, uu.get("prompt_tokens"),
                 uu.get("completion_tokens"))
@@ -1282,6 +1354,11 @@ def translate_texts(results: list[dict], xlat: dict, model: str) -> None:
                 [{"role": "user", "content": f"{listing}\n\n{prompt}"}],
                 xlat.get("gemini_model") or GEMINI_MODEL,
                 xlat.get("gemini_key") or "", max_tokens=8000, part="번역")
+        if xlat.get("backend") == "kimi":
+            return _call_kimi(
+                [{"role": "user", "content": f"{listing}\n\n{prompt}"}],
+                xlat.get("kimi_model") or KIMI_MODEL,
+                xlat.get("kimi_key") or "", max_tokens=8000, part="번역")
         import anthropic
         client = anthropic.Anthropic()
         content = [{"type": "text", "text": listing},
@@ -5191,11 +5268,12 @@ def main() -> int:
                     help="번역 용어집 파일 경로 (기본: 출력폴더/_glossary.txt "
                          "자동 인식 — 등장인물 이름 표기·말투 규칙 등)")
     ap.add_argument("--translate-backend", default="claude",
-                    choices=["claude", "gemini", "ollama"],
-                    help="텍스트 번역 엔진 — claude(기본), gemini(저렴), "
-                         "ollama(로컬 무료·API 키 불필요). local-ocr 번역 "
-                         "방식에서만 쓰임 (vision 방식은 전사+번역이 한 "
-                         "요청이라 전사 엔진을 따름)")
+                    choices=["claude", "gemini", "kimi", "ollama"],
+                    help="텍스트 번역 엔진 — claude(기본), gemini(초저가), "
+                         "kimi(저가·번역 품질 좋음), ollama(로컬 무료·API "
+                         "키 불필요). local-ocr 번역 방식에서만 쓰임 "
+                         "(vision 방식은 전사+번역이 한 요청이라 전사 "
+                         "엔진을 따름)")
     ap.add_argument("--ollama-model", default=OLLAMA_MODEL,
                     help=f"Ollama 모델 이름 (기본 {OLLAMA_MODEL} — "
                          "미리 ollama pull 로 받아둘 것)")
@@ -5212,6 +5290,10 @@ def main() -> int:
     ap.add_argument("--deepseek-url", default=DEEPSEEK_URL,
                     help="OpenAI 호환 서버 URL — 공식 API가 이미지를 "
                          "거부하면 비전 지원 호환 서버로 교체")
+    ap.add_argument("--kimi-model", default=KIMI_MODEL,
+                    help=f"Kimi(Moonshot) 모델 (기본 {KIMI_MODEL})")
+    ap.add_argument("--kimi-key", default=None,
+                    help="Kimi API 키 (기본: MOONSHOT_API_KEY 환경변수)")
     ap.add_argument("--rework", default=None,
                     help="검수 페이지에서 저장한 rework.json 경로 — "
                          "마킹된 말풍선만 재조판 (--src는 원래 재조판 "
@@ -5265,6 +5347,14 @@ def main() -> int:
         print("ERROR: Gemini API 키가 없습니다 — --gemini-key 또는 "
               "GEMINI_API_KEY 환경변수를 설정하세요 "
               "(https://aistudio.google.com/apikey 무료 발급).",
+              file=sys.stderr)
+        return 2
+    if not args.export_crops and not args.transcript \
+            and not args.skip_retype \
+            and needs_kimi_key(args) and not _kimi_key(args):
+        print("ERROR: Kimi API 키가 없습니다 — --kimi-key 또는 "
+              "MOONSHOT_API_KEY 환경변수를 설정하세요 "
+              "(https://platform.moonshot.ai).",
               file=sys.stderr)
         return 2
 

@@ -108,44 +108,59 @@ function saveSetup() {
   loadList();
 }
 
+let autoOpened = false;
+function renderBooks(d, fromCache) {
+  const bx = document.getElementById("books");
+  bx.innerHTML = "";
+  const items = d.info || (d.books || []).map(n => ({name: n}));
+  items.forEach(it => {
+    const el = document.createElement("button");
+    el.className = "bk";
+    const nm = String(it.name).replace(/[<>&]/g, "");
+    let sub = "";
+    if (it.count) {
+      if (it.pos != null) {
+        const pct = Math.min(100,
+          Math.round((it.pos + 1) / it.count * 100));
+        sub = "🔖 #" + (it.pos + 1) + "까지 검수 / " + it.count
+            + "문단 (" + pct + "%)";
+      } else sub = it.count + "문단 · 북마크 없음";
+    }
+    if (it.pending)
+      sub += (sub ? " · " : "") + "☁ PC 반영 대기 " + it.pending + "건";
+    el.innerHTML = "📖 " + nm + (sub ? "<small>" + sub + "</small>" : "");
+    el.onclick = () => openBook(it.name);
+    bx.appendChild(el);
+  });
+  if (!(d.books || []).length)
+    bx.innerHTML = '<div class="spin">아직 업로드된 책이 없습니다 — ' +
+                   "PC에서 [☁ 업로드]</div>";
+  const last = localStorage.getItem("ebookShellLast");
+  if (last && !autoOpened && (d.books || []).includes(last)) {
+    autoOpened = true; openBook(last);
+  }
+}
+
 async function loadList() {
   show("home");
+  autoOpened = false;
   const bx = document.getElementById("books");
-  bx.innerHTML = '<div class="spin">목록 불러오는 중…</div>';
   document.getElementById("hint").innerHTML = "";
+  let cached = null;
+  try { cached = JSON.parse(localStorage.getItem("ebookShellList") || "null"); }
+  catch (e) {}
+  if (cached && (cached.books || cached.info))   // 캐시 즉시 표시(콜드스타트 대기 X)
+    renderBooks(cached, true);
+  else bx.innerHTML = '<div class="spin">목록 불러오는 중…</div>';
   try {
     const r = await fetch(cfg.url, {method: "POST",
       body: JSON.stringify({op: "list", key: cfg.key})});
     const d = await r.json();
     if (d.err) throw new Error(d.err);
-    bx.innerHTML = "";
-    const items = d.info || (d.books || []).map(n => ({name: n}));
-    items.forEach(it => {
-      const el = document.createElement("button");
-      el.className = "bk";
-      const nm = String(it.name).replace(/[<>&]/g, "");
-      let sub = "";
-      if (it.count) {
-        if (it.pos != null) {
-          const pct = Math.min(100,
-            Math.round((it.pos + 1) / it.count * 100));
-          sub = "🔖 #" + (it.pos + 1) + "까지 검수 / " + it.count
-              + "문단 (" + pct + "%)";
-        } else sub = it.count + "문단 · 북마크 없음";
-      }
-      if (it.pending)
-        sub += (sub ? " · " : "") + "☁ PC 반영 대기 " + it.pending + "건";
-      el.innerHTML = "📖 " + nm
-        + (sub ? "<small>" + sub + "</small>" : "");
-      el.onclick = () => openBook(it.name);
-      bx.appendChild(el);
-    });
-    if (!(d.books || []).length)
-      bx.innerHTML = '<div class="spin">아직 업로드된 책이 없습니다 — ' +
-                     "PC에서 [☁ 업로드]</div>";
-    const last = localStorage.getItem("ebookShellLast");
-    if (last && (d.books || []).includes(last)) openBook(last);
-  } catch (e) {   // CORS 등 목록 API 실패 — GAS 목록 페이지로 폴백
+    localStorage.setItem("ebookShellList", JSON.stringify(d));   // 다음에 즉시
+    renderBooks(d, false);                          // 최신본으로 갱신
+  } catch (e) {   // 실패 — 캐시가 있으면 그대로 두고, 없으면 GAS 목록으로 폴백
+    if (cached && (cached.books || cached.info)) return;
     bx.innerHTML = '<div class="spin">목록 API 실패(' +
       (e.message || e) + ") — 내장 목록으로 엽니다</div>";
     document.getElementById("hint").innerHTML =
@@ -170,6 +185,14 @@ function goHome() {
   document.getElementById("fr").src = "about:blank";
   loadList();
 }
+
+// 검수 iframe이 편집 카드를 열면 홈(⌂) 버튼을 숨김 — iframe 안 반투명 ✓로 대체
+addEventListener("message", e => {
+  const d = e.data;
+  if (!d || d.ebook !== "ed") return;
+  const back = document.getElementById("back");
+  if (back) back.style.display = d.on ? "none" : "";
+});
 
 if ("serviceWorker" in navigator)
   navigator.serviceWorker.register("sw.js").catch(() => {});

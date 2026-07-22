@@ -79,7 +79,8 @@ XLAT_MODES = [
 # 텍스트 번역 엔진 — (표시명, 내부 키). local-ocr 방식에서만 쓰임
 XLAT_BACKENDS = [
     ("Claude API (권장 — 자연스러움·용어집 준수 좋음)", "claude"),
-    ("Gemini API (저렴 — Google API 키 필요)", "gemini"),
+    ("Gemini API (초저가 — Google API 키 필요)", "gemini"),
+    ("Kimi API (저가·번역 품질 좋음 — Moonshot API 키 필요)", "kimi"),
     ("Ollama 로컬 (무료·오프라인 — API 키 불필요, 품질은 검수 전제)",
      "ollama"),
 ]
@@ -384,6 +385,8 @@ def make_args(cfg: dict) -> Namespace:
         deepseek_model=cfg.get("deepseek_model") or None,
         deepseek_key=cfg.get("deepseek_api_key") or None,
         deepseek_url=cfg.get("deepseek_url") or None,
+        kimi_model=cfg.get("kimi_model") or None,
+        kimi_key=cfg.get("kimi_api_key") or None,
         async_psd=True,   # 앱은 상주하므로 PSD 저장 백그라운드 (응답 단축)
         render_cache=bool(cfg.get("render_cache", False)),
     )
@@ -481,6 +484,8 @@ def run_job(cfg: dict, log, is_cancelled) -> None:
         os.environ["GEMINI_API_KEY"] = cfg["gemini_api_key"].strip()
     if cfg.get("deepseek_api_key"):
         os.environ["DEEPSEEK_API_KEY"] = cfg["deepseek_api_key"].strip()
+    if cfg.get("kimi_api_key"):
+        os.environ["MOONSHOT_API_KEY"] = cfg["kimi_api_key"].strip()
     key_ns = Namespace(
         ocr_engine=cfg.get("ocr_engine", "claude"),
         source_lang=cfg.get("source_lang", "ko"),
@@ -507,6 +512,12 @@ def run_job(cfg: dict, log, is_cancelled) -> None:
         raise RuntimeError("DeepSeek API 키가 없습니다 — 앱의 'DeepSeek "
                            "API 키'에 입력하거나 DEEPSEEK_API_KEY 환경변수를 "
                            "설정하세요 (https://platform.deepseek.com 발급).")
+    if not cfg.get("transcript") and not cfg.get("skip_retype") \
+            and retype.needs_kimi_key(key_ns) \
+            and not retype._kimi_key():
+        raise RuntimeError("Kimi API 키가 없습니다 — 앱의 'Kimi API 키'에 "
+                           "입력하거나 MOONSHOT_API_KEY 환경변수를 "
+                           "설정하세요 (https://platform.moonshot.ai).")
 
     # 폰트 결정: ① 원본 유사 자동 매칭 → ② 지정 경로 → ③ 자동 감지
     font_path = (cfg.get("font") or "").strip()
@@ -561,6 +572,8 @@ def run_job(cfg: dict, log, is_cancelled) -> None:
         deepseek_model=cfg.get("deepseek_model") or None,
         deepseek_key=cfg.get("deepseek_api_key") or None,
         deepseek_url=cfg.get("deepseek_url") or None,
+        kimi_model=cfg.get("kimi_model") or None,
+        kimi_key=cfg.get("kimi_api_key") or None,
         async_psd=True,   # 앱은 상주하므로 PSD 저장 백그라운드 (응답 단축)
         render_cache=bool(cfg.get("render_cache", False)),
     )
@@ -820,6 +833,10 @@ def main() -> int:
             value=cfg0.get("deepseek_url", retype.DEEPSEEK_URL)),
         "deepseek_api_key": tk.StringVar(
             value=cfg0.get("deepseek_api_key", "")),
+        "kimi_model": tk.StringVar(
+            value=cfg0.get("kimi_model", retype.KIMI_MODEL)),
+        "kimi_api_key": tk.StringVar(
+            value=cfg0.get("kimi_api_key", "")),
         "glossary": tk.StringVar(value=cfg0.get("glossary", "")),
         "caption_preset": tk.StringVar(
             value=cfg0.get("caption_preset", "본문과 동일")),
@@ -1383,6 +1400,22 @@ def main() -> int:
     dsk_ent.grid(row=r, column=1, sticky="ew", padx=4)
     tip(dsk_ent, "https://platform.deepseek.com 에서 발급.\n"
                  "비워두면 DEEPSEEK_API_KEY 환경변수를 사용합니다.")
+
+    r = nrow(tab_env)
+    ttk.Label(tab_env, text="Kimi 모델").grid(row=r, column=0, sticky="w")
+    km_cb = ttk.Combobox(tab_env, textvariable=v["kimi_model"],
+                         values=["kimi-k2.5", "kimi-k2.6"], width=22)
+    km_cb.grid(row=r, column=1, sticky="w", padx=4)
+    tip(km_cb, "번역 엔진을 Kimi로 선택했을 때 쓰입니다 (번역 전용).\n"
+               "k2.5=가성비 멀티모달, k2.6=최신·약간 비쌈.")
+
+    r = nrow(tab_env)
+    ttk.Label(tab_env, text="MOONSHOT_API_KEY").grid(row=r, column=0,
+                                                     sticky="w")
+    kk_ent = ttk.Entry(tab_env, textvariable=v["kimi_api_key"], show="*")
+    kk_ent.grid(row=r, column=1, sticky="ew", padx=4)
+    tip(kk_ent, "Moonshot 플랫폼에서 발급: https://platform.moonshot.ai\n"
+                "비워두면 MOONSHOT_API_KEY 환경변수를 사용합니다.")
 
     r = nrow(tab_env)
     lf_xl = ttk.Labelframe(tab_env, text="번역 (원서 → 한글)", padding=6)

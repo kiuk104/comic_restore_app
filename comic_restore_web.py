@@ -57,6 +57,7 @@ def _default_cfg() -> dict:
         "gemini_model": retype.GEMINI_MODEL, "gemini_api_key": "",
         "deepseek_model": retype.DEEPSEEK_MODEL,
         "deepseek_url": retype.DEEPSEEK_URL, "deepseek_api_key": "",
+        "kimi_model": retype.KIMI_MODEL, "kimi_api_key": "",
         "glossary": "",
         "caption_preset": "본문과 동일", "caption_font": "",
         "caption_font_index": 0,
@@ -107,7 +108,7 @@ def normalize_cfg(cfg: dict) -> dict:
     c["glossary"] = str(c.get("glossary") or "").strip()
     c["ollama_model"] = str(c.get("ollama_model") or "").strip()
     for k in ("ollama_model", "gemini_model", "deepseek_model",
-              "deepseek_url"):   # '직접 입력…' 센티널 잔재 방어
+              "deepseek_url", "kimi_model"):   # '직접 입력…' 센티널 방어
         if c.get(k) == "__custom__":
             c[k] = ""
     c["font_auto_match"] = str(c.get("font_preset", "")).startswith("자동 매칭")
@@ -344,6 +345,8 @@ class Api:
         if c.get("deepseek_api_key"):
             os.environ["DEEPSEEK_API_KEY"] = \
                 str(c["deepseek_api_key"]).strip()
+        if c.get("kimi_api_key"):
+            os.environ["MOONSHOT_API_KEY"] = str(c["kimi_api_key"]).strip()
         self._state["server_cfg"] = c
         import functools
         from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -790,6 +793,16 @@ WEB_HTML = r"""<!doctype html>
    <div class="row"><label>DEEPSEEK 키</label>
     <input type="password" id="c_deepseek_api_key"></div>
   </div>
+  <div class="engblk" id="blk_kimi">
+   <div class="bhead"><span class="bname">Kimi (Moonshot)</span>
+    <span class="badge" id="bdg_kimi"></span></div>
+   <div class="row"><label>모델</label>
+    <select id="c_kimi_model" style="flex:0 0 220px"
+           title="번역 전용 — Claude보다 싸고 번역 품질 좋음.
+k2.5=가성비, k2.6=최신·약간 비쌈"></select>
+    <label style="flex:0 0 auto">MOONSHOT 키</label>
+    <input type="password" id="c_kimi_api_key"></div>
+  </div>
   <div class="engblk" id="blk_ollama">
    <div class="bhead"><span class="bname">Ollama (로컬)</span>
     <span class="badge" id="bdg_ollama"></span></div>
@@ -856,6 +869,7 @@ const FIELDS = ["src","out","page_range","limit","resume","use_batch",
  "claude_model","source_lang","translate_mode","translate_consensus",
  "translate_backend","ollama_model","gemini_model","gemini_api_key",
  "deepseek_model","deepseek_url","deepseek_api_key",
+ "kimi_model","kimi_api_key",
  "glossary","sample_index"];
 
 function collectCfg(){
@@ -939,6 +953,7 @@ function updateEngineUI(){
     gemini: [eng === "gemini" && "전사",
              xlat && be === "gemini" && "번역"],
     deepseek: [eng === "deepseek" && "전사"],
+    kimi: [xlat && be === "kimi" && "번역"],
     ollama: [xlat && be === "ollama" && "번역"],
   };
   for (const [k, rs] of Object.entries(roles)){
@@ -957,7 +972,7 @@ function updateEngineUI(){
     ? "로컬 엔진 — 모델·API 키 불필요 (kind 분류 없음, 검수 페이지 병용 권장)"
     : "→ 아래 " + engName + " 블록의 모델·키를 사용합니다";
   const beName = {claude: "Claude", gemini: "Gemini",
-                  ollama: "Ollama"}[be] || be;
+                  kimi: "Kimi", ollama: "Ollama"}[be] || be;
   let hx = "";
   if (xlat){
     if (eng === "gemini" && be === "gemini")
@@ -1176,6 +1191,8 @@ async function boot(){
   optCustom("c_deepseek_url", ["https://api.deepinfra.com/v1/openai",
                                "https://api.deepseek.com"],
             INIT.cfg.deepseek_url);
+  optCustom("c_kimi_model", ["kimi-k2.5", "kimi-k2.6"],
+            INIT.cfg.kimi_model);
   const fl = INIT.fonts.map(f => f.label);
   const hl = INIT.hands.map(f => f.label);
   opt("c_font_preset", ["자동 매칭 (원본과 유사한 폰트)", "자동 감지"]
