@@ -1181,7 +1181,7 @@ async function boot(){
       : [INIT.cfg.upscayl_model], INIT.cfg.upscayl_model);
   optCustom("c_ollama_model", ["qwen3:14b", "qwen3:8b", "gemma3:12b",
                                "exaone3.5:7.8b"], INIT.cfg.ollama_model);
-  optCustom("c_gemini_model", ["gemini-3.1-flash-lite",
+  optCustom("c_gemini_model", ["gemini-3.6-flash", "gemini-3.1-flash-lite",
                                "gemini-2.5-flash-lite", "gemini-3.5-flash"],
             INIT.cfg.gemini_model);
   optCustom("c_deepseek_model", ["deepseek-ai/DeepSeek-OCR",

@@ -1347,7 +1347,8 @@ def main() -> int:
     r = nrow(tab_env)
     ttk.Label(tab_env, text="Gemini 모델").grid(row=r, column=0, sticky="w")
     gm_cb = ttk.Combobox(tab_env, textvariable=v["gemini_model"],
-                         values=["gemini-3.1-flash-lite",
+                         values=["gemini-3.6-flash",
+                                 "gemini-3.1-flash-lite",
                                  "gemini-2.5-flash-lite",
                                  "gemini-3.5-flash"], width=22)
     gm_cb.grid(row=r, column=1, sticky="w", padx=4)

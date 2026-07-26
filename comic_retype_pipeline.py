@@ -377,6 +377,9 @@ API_PRICES = [
     ("claude-haiku", 0.8, 4.0),
     ("gemini-3.1-flash-lite", 0.25, 1.50),
     ("gemini-2.5-flash-lite", 0.10, 0.40),
+    # ※ gemini-3.6-flash-lite가 나오면 반드시 이 줄 '위'에 둘 것
+    #   (startswith 매칭이라 -lite가 non-lite 단가에 먼저 걸림)
+    ("gemini-3.6-flash", 1.50, 7.50),    # 3.6 GA 2026-07-21 (3.5보다 출력 저렴)
     ("gemini-3.5-flash", 1.50, 9.00),    # 주의: lite보다 6배 비쌈
     ("deepseek-v4-flash", 0.14, 0.28),   # 캐시 미스 기준 (히트 시 더 쌈)
     ("deepseek-v4-pro", 0.435, 0.87),

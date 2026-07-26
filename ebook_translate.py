@@ -28,9 +28,14 @@ Claude 번역. 실행이 끝나면(취소 포함) 전사/번역 파트별 API �
 """
 from __future__ import annotations
 
-__version__ = "0.16.2"  # 자동 복원 시 파란 강조 제거 + 하이라이트 변화 없으면 리프레쉬 안 함
+__version__ = "0.18.8"  # 다시 실행 옵션 — 엔진 바꿔 번역만·전사부터 재실행(기존 결과 백업)
+
+# 모바일 검수 데이터 스키마 버전 — 공유 UI가 옛 데이터를 만나도 견디게 분기·가드용.
+# 필드를 바꾸거나 추가하면 올리고, EDIT_HTML은 낮은 스키마도 기본값으로 처리한다.
+SCHEMA_VER = 1
 
 import argparse
+import hashlib as _hashlib
 import html
 import json
 import os
@@ -80,6 +85,7 @@ DEEPSEEK_MODEL = "deepseek-v4-flash"
 # 키 발급: https://platform.moonshot.ai (MOONSHOT_API_KEY 환경변수 가능)
 KIMI_URL = "https://api.moonshot.ai/v1"
 KIMI_MODEL = "kimi-k2.5"
+KIMI_TIMEOUT = 600      # 추론 모델은 긴 청크 번역이 3~수 분 — 180초로는 부족
 
 
 # ---------------------------------------------------------------------------
@@ -287,13 +293,16 @@ def transcribe_page_claude(img, model: str) -> str:
 def _call_oai(base_url: str, messages: list, model: str, key: str,
               max_tokens: int = 8000, part: str = "기타",
               extra: Optional[dict] = None, name: str = "API",
-              key_hint: str = "") -> str:
+              key_hint: str = "", timeout: Optional[int] = None) -> str:
     """OpenAI 호환 chat/completions 호출 (표준lib urllib만 사용) → 텍스트.
 
     Gemini·DeepSeek 등 공용. part(전사/번역)별 토큰 사용량을
-    retype.track_usage 로 집계."""
+    retype.track_usage 로 집계. timeout(초)을 안 주면 GEMINI_TIMEOUT —
+    추론(thinking) 모델은 응답이 느려 호출부에서 넉넉히 지정한다."""
+    import socket
     import urllib.request
     import urllib.error
+    to = timeout or GEMINI_TIMEOUT
     payload = {"model": model, "stream": False, "temperature": 0.0,
                "max_tokens": max_tokens, "messages": messages}
     if extra:
@@ -305,35 +314,56 @@ def _call_oai(base_url: str, messages: list, model: str, key: str,
             url, data=json.dumps(pl).encode("utf-8"),
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {key}"})
-        with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=to) as resp:
             return json.loads(resp.read().decode("utf-8"))
+
+    # 읽기 단계 타임아웃은 socket.timeout(=TimeoutError)으로 튀며 URLError에
+    # 안 걸린다 — 별도로 잡아 명확한 안내로 변환 (Kimi 등 느린 추론 모델).
+    _timeout_msg = (
+        f"{name} 응답 시간 초과({to}초) — 추론(thinking) 모델은 느릴 수 "
+        "있습니다. 같은 출력 폴더로 다시 실행하면 실패한 문단만 이어서 "
+        "번역합니다(전사 재사용). 반복되면 번역 엔진을 Claude로 바꾸세요.")
+
+    def _post_safe(pl):                       # 재시도용 — 에러를 메시지로 변환
+        try:
+            return _post(pl)
+        except urllib.error.HTTPError as e2:
+            try:
+                d2 = e2.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                d2 = ""
+            raise RuntimeError(f"{name} 오류 {e2.code}: {d2}")
+        except (socket.timeout, TimeoutError):
+            raise RuntimeError(_timeout_msg)
+        except urllib.error.URLError as e2:
+            raise RuntimeError(f"{name} 연결 실패: {e2}")
 
     try:
         data = _post(payload)
+    except (socket.timeout, TimeoutError):
+        raise RuntimeError(_timeout_msg)
     except urllib.error.HTTPError as e:
         try:
             detail = e.read().decode("utf-8", "replace")[:300]
         except Exception:
             detail = ""
+        low = detail.lower()
         # 일부 Kimi 모델은 모드별로 특정 temperature만 허용 — 에러에서 값을
         # 읽어 1회 자동 재시도 ("only 0.6 is allowed" / "only 1 is allowed").
         m = re.search(r"only\s*([0-9]*\.?[0-9]+)\s*is allowed", detail, re.I)
-        if e.code == 400 and "temperature" in detail.lower() and m:
-            try:
-                data = _post(dict(payload, temperature=float(m.group(1))))
-            except urllib.error.HTTPError as e2:
-                try:
-                    d2 = e2.read().decode("utf-8", "replace")[:300]
-                except Exception:
-                    d2 = ""
-                raise RuntimeError(f"{name} 오류 {e2.code}: {d2}")
-            except urllib.error.URLError as e2:
-                raise RuntimeError(f"{name} 연결 실패: {e2}")
+        if e.code == 400 and "temperature" in low and m:
+            data = _post_safe(dict(payload, temperature=float(m.group(1))))
+        elif e.code == 400 and any(k in low for k in ("reasoning", "thinking")):
+            # 이 모델이 reasoning/thinking 파라미터를 거부 → 빼고 재시도
+            data = _post_safe({k: v for k, v in payload.items()
+                               if k not in ("reasoning_effort", "thinking")})
         else:
             hint = (f" — API 키 확인{key_hint}"
                     if e.code in (401, 403) else "")
             raise RuntimeError(f"{name} 오류 {e.code}{hint}: {detail}")
     except urllib.error.URLError as e:
+        if isinstance(getattr(e, "reason", None), (socket.timeout, TimeoutError)):
+            raise RuntimeError(_timeout_msg)
         raise RuntimeError(f"{name} 연결 실패: {e}")
     if isinstance(data, dict) and data.get("error"):   # 200인데 error 객체
         raise RuntimeError(f"{name} 오류(200+error): "
@@ -353,9 +383,10 @@ def _call_oai(base_url: str, messages: list, model: str, key: str,
 
 
 def _call_gemini(messages: list, model: str, key: str,
-                 max_tokens: int = 8000, part: str = "기타") -> str:
+                 max_tokens: int = 8000, part: str = "기타",
+                 extra: Optional[dict] = None) -> str:
     return _call_oai(GEMINI_URL, messages, model, key, max_tokens, part,
-                     name="Gemini API",
+                     extra=extra, name="Gemini API",
                      key_hint=" (https://aistudio.google.com/apikey)")
 
 
@@ -368,7 +399,8 @@ def _call_kimi(messages: list, model: str, key: str,
                      extra={"temperature": 0.6,
                             "thinking": {"type": "disabled"}},
                      name="Kimi API",
-                     key_hint=" (https://platform.moonshot.ai)")
+                     key_hint=" (https://platform.moonshot.ai)",
+                     timeout=KIMI_TIMEOUT)
 
 
 def _repair_json(raw: str) -> str:
@@ -443,8 +475,12 @@ def transcribe_page_gemini(img, model: str, key: str) -> str:
         content.append({"type": "image_url",
                         "image_url": {"url": f"data:image/png;base64,{b64}"}})
     content.append({"type": "text", "text": prompt})
+    # 전사는 추론 불필요 — Gemini 2.5+/3.x는 thinking이 기본 켜져 있어 응답
+    # 토큰을 다 먹고 빈 응답(finish_reason=length)이 나기 쉽다. reasoning_effort
+    # 를 꺼서 방지하고(거부 모델은 _call_oai가 빼고 재시도), 여유 토큰도 확보.
     raw = _call_gemini([{"role": "user", "content": content}],
-                       model, key, max_tokens=6000, part="전사")
+                       model, key, max_tokens=16000, part="전사",
+                       extra={"reasoning_effort": "none"})
     return retype._clean_ws(raw.strip())
 
 
@@ -765,6 +801,28 @@ def _load_glossary(path: Optional[str], out_dir: Path) -> str:
     return ""
 
 
+_HANGUL_RE = re.compile(r"[가-힣]")
+
+
+def _looks_untranslated(src: str, tr: str, src_lang: str) -> bool:
+    """번역 결과가 사실상 원문 그대로(에코)인지 판정.
+
+    대상은 항상 한국어이므로 한글이 하나도 없으면 미번역으로 본다 —
+    일부 모델(관측: Kimi k2.6)이 번역 대신 원문을 그대로 되돌려 xlat
+    캐시를 '완료'로 오염시키는 사고를 걸러낸다. 한글이 있으면 인정."""
+    tr = (tr or "").strip()
+    if not tr:
+        return True
+    if _HANGUL_RE.search(tr):
+        return False                     # 한글 포함 = 번역된 것으로 인정
+    src = (src or "").strip()
+    if tr == src:
+        return True                      # 원문 완전 일치 에코
+    if src_lang == "ja" and _CJK_RE.search(tr):
+        return True                      # 가나·한자가 남음 = 미번역
+    return False
+
+
 def translate_chunk(items: list[tuple[int, str]], cfg: dict, gloss: str,
                     ctx: str) -> dict[int, Optional[str]]:
     """문단 묶음 하나 번역 — {전역 문단 인덱스: 한국어 or None(실패)}."""
@@ -810,9 +868,15 @@ def translate_chunk(items: list[tuple[int, str]], cfg: dict, gloss: str,
         by_id = {n: it for n, it in enumerate(parsed, 1)
                  if isinstance(it, dict)}
     out = {}
-    for n, (gi, _) in enumerate(items, 1):
+    sl = cfg.get("source_lang", "")
+    for n, (gi, src_txt) in enumerate(items, 1):
         tv = ((by_id.get(n) or {}).get("text") or "").strip()
-        out[gi] = retype._clean_ws(tv) if tv else None
+        cleaned = retype._clean_ws(tv) if tv else ""
+        # 에코(원문 그대로)는 정상 번역으로 저장하지 않는다 — None(실패)으로
+        # 남겨 다음 실행에서 재시도. 캐시 오염 방지.
+        out[gi] = (cleaned if cleaned
+                   and not _looks_untranslated(src_txt, cleaned, sl)
+                   else None)
     return out
 
 
@@ -1133,6 +1197,38 @@ def resolve_out(cfg: dict) -> tuple[Path, str]:
     return out, title
 
 
+def redo_reset(out: Path, mode: str, log) -> None:
+    """엔진을 바꿔 '다시 실행' 준비 — 기존 결과를 지우지 않고 백업으로 옮긴다.
+
+    mode 'xlat': 번역만 다시 — xlat.json만 백업·제거.
+        원문(book.json: 전사 결과+수동 수정)·전사 캐시·모바일 fp는 모두
+        유지되므로, 지금 선택된 번역 엔진으로 전체가 재번역된다.
+    mode 'all' : 전사부터 다시 — 전사 캐시(_work/pages)·book.json·xlat.json
+        모두 백업·제거. 지금 선택된 전사 방식으로 처음부터. 원문 수동 수정도
+        초기화되고 fp가 바뀌므로 모바일 수정 큐와의 연결도 새로 시작된다.
+    백업 위치: _work/redo_YYYYmmdd_HHMMSS/ — 필요하면 수동 복원 가능."""
+    import datetime
+    import shutil
+    work = out / "_work"
+    bak = work / ("redo_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    moved = []
+
+    def mv(p: Path) -> None:
+        if p.exists():
+            bak.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(p), str(bak / p.name))
+            moved.append(p.name)
+
+    mv(work / "xlat.json")
+    if mode == "all":
+        mv(work / "book.json")
+        mv(work / "pages")
+    if moved:
+        log(f"⟲ 다시 실행 준비 — {', '.join(moved)} → _work/{bak.name}/ 백업")
+    else:
+        log("⟲ 초기화할 기존 결과가 없습니다 — 그대로 새로 실행합니다")
+
+
 def _apply_keys(cfg: dict) -> None:
     if cfg.get("api_key"):
         os.environ["ANTHROPIC_API_KEY"] = cfg["api_key"].strip()
@@ -1211,7 +1307,7 @@ def _resolve_auto_lang(cfg: dict, src: Path, kind: str, pages: list,
                     if _fatal_api_error(e):
                         raise
                     continue            # 표지·그림 페이지 등 — 다음 페이지로
-                if ocr != "tesseract":
+                if ocr != "tesseract" and t.strip():   # 빈 결과는 캐시하지 않음
                     lbl = page_label(kind, p)
                     (work / "pages" / f"{Path(lbl).stem}.txt").write_text(
                         t, encoding="utf-8")
@@ -1250,7 +1346,10 @@ def _fatal_api_error(e: Exception) -> bool:
     s = str(e).lower()
     return any(k in s for k in ("credit balance", "api key", "api 키",
                                 "unauthorized", "401", "403",
-                                "비전 미지원"))
+                                "비전 미지원",
+                                # 잘못된 모델명 등 — 전 페이지가 똑같이 404
+                                "404", "not found", "does not exist",
+                                "is not supported", "지원되지"))
 
 
 def _note_error(work: Path, cfg: dict, msg: str) -> None:
@@ -1348,8 +1447,11 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
             lbl = page_label(kind, p)
             cache = work / "pages" / f"{Path(lbl).stem}.txt"
             if cache.exists():
-                page_texts.append(cache.read_text(encoding="utf-8"))
-                continue
+                cached = cache.read_text(encoding="utf-8")
+                if cached.strip():                 # 내용 있는 캐시만 '완료'로 재사용
+                    page_texts.append(cached)
+                    continue
+                # 빈 캐시 = 이전 실패분 → 완료로 보지 않고 다시 전사
             try:
                 img = load_page_image(src, kind, p)
                 if ocr == "claude":
@@ -1373,7 +1475,13 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
                     raise
                 log(f"  !! {lbl} 전사 실패({e}) — 빈 페이지로 계속")
                 t = ""
-            cache.write_text(t, encoding="utf-8")
+            if t.strip():          # 성공분만 캐시 — 빈 결과는 저장 안 함(다음 실행에 재시도)
+                cache.write_text(t, encoding="utf-8")
+            elif cache.exists():   # 이전에 남은 빈 캐시 제거
+                try:
+                    cache.unlink()
+                except OSError:
+                    pass
             page_texts.append(t)
             if i % 10 == 0 or i == len(pages):
                 log(f"  전사 {i}/{len(pages)}")
@@ -1414,10 +1522,22 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
     xp = work / "xlat.json"
     done = load_xlat(out)
     if done:
+        # 원문 그대로 저장된(에코) 문단은 완료로 재사용하지 말고 초기화 —
+        # 이전 실행의 캐시 오염(예: Kimi가 번역 대신 원문 반환)을 자동 복구.
+        sl = cfg.get("source_lang", "")
+        echoed = [gi for gi, tv in done.items()
+                  if tv is not None and 0 <= gi < len(paras)
+                  and _looks_untranslated(paras[gi], tv, sl)]
+        for gi in echoed:
+            done[gi] = None
+        if echoed:
+            _atomic_json(xp, done)
+            log(f"  원문 그대로 저장된 {len(echoed)}문단을 재번역 대상으로 "
+                "초기화 (캐시 오염 복구)")
         n_ok = sum(1 for v in done.values() if v is not None)
         msg = f"이어하기: 기존 번역 {n_ok}문단 재사용"
         if len(done) > n_ok:
-            msg += f" (실패 {len(done) - n_ok}문단은 다시 시도)"
+            msg += f" (미번역·실패 {len(done) - n_ok}문단은 다시 시도)"
         log(msg)
     be = {"ollama": "Ollama " + str(cfg.get("ollama_model")),
           "gemini": "Gemini " + str(cfg.get("gemini_model")
@@ -1494,956 +1614,107 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
 # ---------------------------------------------------------------------------
 # 편집 모드 — 브라우저에서 원문·번역 검토/수정 (코믹스 검수 페이지 패턴)
 # ---------------------------------------------------------------------------
-EDIT_HTML = """<!doctype html>
-<html lang="ko"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>__TITLE__ — 이북 편집</title>
-<style>
-:root{--bd:#ddd;--src:#b45309;--fail:#dc2626;--acc:#2563eb}
-body{font-family:'Malgun Gothic',sans-serif;margin:0;background:#f5f5f4;
- color:#222}
-header{position:sticky;top:0;z-index:9;background:#fff;
- border-bottom:1px solid var(--bd);padding:8px 12px;display:flex;gap:10px;
- align-items:center;flex-wrap:wrap;transition:transform .25s ease}
-body.hdhide header{transform:translateY(-108%)}   /* 스크롤·편집 시 자동 숨김 */
-/* 편집 카드 활성 시 홈(셸) 대신 뜨는 반투명 완료 버튼 */
-#edfab{display:none;position:fixed;right:14px;
- bottom:calc(env(safe-area-inset-bottom) + 16px);z-index:45;
- width:50px;height:50px;border-radius:50%;border:0;color:#fff;font-size:23px;
- background:rgba(16,129,90,.5);box-shadow:0 2px 10px rgba(0,0,0,.28);
- cursor:pointer;align-items:center;justify-content:center}
-body.hascard #edfab{display:flex}
-#edfab:active{background:rgba(16,129,90,.82)}
-header b{font-size:15px}
-button{cursor:pointer;padding:4px 10px;border:1px solid #999;
- border-radius:6px;background:#fff;font-size:12px}
-button:disabled{opacity:.45;cursor:default}
-#save{background:var(--acc);color:#fff;border-color:var(--acc)}
-select{padding:3px 6px;border-radius:6px}
-#wrap{display:flex;align-items:flex-start}
-main{flex:1;min-width:0;padding:10px 12px 60vh}
-aside{display:none;width:42%;max-width:640px;border-left:1px solid var(--bd);
- background:#fff;position:sticky;top:46px;height:calc(100vh - 46px);
- overflow:auto}
-aside.on{display:block}
-aside img{width:100%;display:block}
-#pv{display:none;padding:20px 26px;font-family:Batang,'Noto Serif KR',
- Georgia,serif;font-size:15px;color:#1c1c1c;background:#fff}
-#pv p{margin:0 0 .1em;text-indent:1em;line-height:1.75}
-#pv h2{margin:1.2em 0 .8em;font-size:19px}
-#pv .empty{color:#999;font-size:13px;text-indent:0}
-#pv .untr{color:#8a6d3b}
-aside .cap{padding:6px 10px;color:#666;font-size:12px;display:flex;
- justify-content:space-between;align-items:center}
-.pgh{margin:18px 4px 6px;font-size:13px;color:#555;font-weight:bold;
- display:flex;gap:8px;align-items:center}
-.row{background:#fff;border:1px solid var(--bd);border-radius:8px;
- padding:8px 10px;margin:6px 0;content-visibility:auto;
- contain-intrinsic-size:auto 130px}   /* auto: 한 번 렌더한 높이를 기억 → 위치 튐 방지 */
-.row.dirty{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc)}
-.row.fail{border-left:4px solid var(--fail)}
-.rh{display:flex;gap:8px;align-items:center;font-size:12px;color:#888;
- margin-bottom:4px}
-.badge{color:var(--fail);font-size:11px}
-textarea{width:100%;box-sizing:border-box;border:1px solid var(--bd);
- border-radius:6px;padding:6px;font:13px/1.55 'Malgun Gothic',sans-serif;
- resize:vertical;margin-bottom:4px}
-textarea.src{color:var(--src);background:#fffbf3}
-#st{color:#666;font-size:12px}
-@media (pointer:coarse){textarea{font-size:16px}
- button{min-height:36px}header{gap:8px}}
-body.nosrc textarea.src{display:none}
-body.nosrc .row{padding-top:6px}
-#help{display:none;position:fixed;top:0;left:0;right:0;bottom:0;
- z-index:50;background:#fff;overflow:auto;padding:16px 16px 40px}
-#help.on{display:block}
-#help h3{margin:4px 0 12px}
-#help table{border-collapse:collapse;width:100%;font-size:14px}
-#help td{border:1px solid var(--bd);padding:7px 9px;vertical-align:top;
- line-height:1.55}
-#help td:first-child{white-space:nowrap;color:var(--src);
- font-family:Consolas,monospace}
-#help .hnote{color:#666;font-size:12px;margin:12px 0 0;line-height:1.8}
-#help .hclose{margin:14px 0 0;padding:9px 22px}
-#bmenu,#setmenu{display:none;position:fixed;z-index:40;background:#fff;
- border:1px solid var(--bd);border-radius:10px;padding:8px;
- box-shadow:0 4px 16px rgba(0,0,0,.18)}
-#bmenu{min-width:238px;max-width:82vw;max-height:64vh;overflow:auto}
-#bmenu.on,#setmenu.on{display:block}
-#bmenu div,#setmenu .lbl{color:#888;font-size:12px;margin:0 2px 6px}
-#bmenu button{display:block;width:100%;text-align:left;margin:4px 0;
- min-height:36px}
-#bmenu .bmh{color:#888;font-size:12px;font-weight:700;margin:0 2px 6px}
-#bmenu .bmadd{color:var(--acc);font-weight:700;margin-bottom:8px}
-#bmenu .bmempty{color:#aaa;font-size:12px;padding:8px 2px;margin:0}
-#bmenu .bmrow{display:flex;gap:5px;margin:5px 0}
-#bmenu .bmrow button{margin:0;width:auto}
-#bmenu .bmgo{flex:1;min-height:40px;overflow:hidden;white-space:nowrap;
- text-overflow:ellipsis}
-#bmenu .bmgo b{color:var(--acc);margin-right:6px}
-#bmenu .bmgo span{color:#555;font-size:12px}
-#bmenu .bmdel{flex:0 0 44px;min-height:40px;text-align:center}
-#setmenu{min-width:196px}
-#setmenu .fsrow{display:flex;align-items:center;gap:8px;margin:0 0 12px}
-#setmenu .fsrow button{min-width:44px;min-height:38px;font-weight:700}
-#setmenu .fsrow span{flex:1;text-align:center;font-size:14px;color:#333}
-#setmenu select{width:100%;min-height:38px;font-size:14px;padding:5px 6px;
- border:1px solid var(--bd);border-radius:6px;background:#fff}
-.rd{display:none;font-family:Batang,'Noto Serif KR',Georgia,serif;
- font-size:16px;line-height:1.8;color:#1c1c1c;padding:1px 4px;
- cursor:pointer;text-indent:1em}
-.rd .rdo{color:#8a6d3b;font-size:.9em;line-height:1.6;text-indent:0;
- margin:0 0 3px;padding:0 0 3px;border-bottom:1px dashed #e5dcc8}
-.rd .rdt{text-indent:1em}
-.rd.rdsronly{color:#6b4f2a}      /* 원문만 보기 — 원문임을 색으로 구분 */
-mark.hl{background:#fff2a8;color:inherit;border-radius:2px;padding:0 1px;
- cursor:pointer;-webkit-box-decoration-break:clone;box-decoration-break:clone}
-#hlpop{display:none;position:fixed;z-index:50;background:#222;color:#fff;
- border-radius:9px;padding:2px;box-shadow:0 3px 14px rgba(0,0,0,.35)}
-#hlpop.on{display:block}
-#hlpop button{background:none;border:0;color:#fff;font-size:14px;
- padding:8px 13px;min-height:40px;cursor:pointer;white-space:nowrap}
-.rd.untr{color:#8a6d3b}
-.rd.rdh{font-weight:700;font-size:1.15em;text-indent:0;margin:8px 0 4px}
-body.rdmode .row{border:0;background:none;padding:1px 6px;margin:0;
- box-shadow:none;contain-intrinsic-size:auto 60px}
-body.rdmode .row .rh,body.rdmode .row textarea{display:none}
-body.rdmode .rd{display:block}
-/* 읽기모드에서 탭한 문단만 인라인 '편집 카드'로 펼침 (지연 생성) */
-body.rdmode .row.ed{border:1px solid var(--acc);background:#fff;
- border-radius:10px;padding:9px 10px;margin:10px 2px;
- box-shadow:0 2px 10px rgba(0,0,0,.13);content-visibility:visible;
- scroll-margin-top:calc(env(safe-area-inset-top) + 54px)}
-body.hdhide .row.ed{scroll-margin-top:calc(env(safe-area-inset-top) + 8px)}
-body.rdmode .row.ed .rd{display:none}
-body.rdmode .row.ed .rh{display:flex;margin-bottom:4px;align-items:center}
-/* 카드에선 원문·번역 둘 다 표시 (대조하며 수정) */
-body.rdmode .row.ed textarea{display:block}
-body.rdmode .row.ed textarea.src{display:block!important}
-.edbmk{display:none}
-body.rdmode .row.ed .rh .edbmk{display:inline-block;margin-left:auto;
- background:#fff;color:var(--acc);border-color:var(--acc);font-weight:700}
-body.rdmode .row.ed .rh .edbmk.on{background:var(--acc);color:#fff}
-/* 카드 안 원문/번역 라벨 (편집 모드 전체에선 숨김) */
-.fldl{display:none}
-body.rdmode .row.ed .fldl{display:block;font-size:11px;font-weight:700;
- margin:2px 2px 1px}
-body.rdmode .row.ed .fldl-o{color:#8a6d3b}
-body.rdmode .row.ed .fldl-t{color:#127a53;margin-top:6px}
-body.rdmode .pgh{opacity:.45;font-size:11px;margin:10px 4px 2px}
-body.rdmode .pgh button{display:none}
-@media (max-width:640px){
- main{padding:6px 6px 60vh}
- .row{padding:7px 8px;margin:5px 0;border-radius:10px;
-  contain-intrinsic-size:auto 110px}
- .rh{margin-bottom:2px;flex-wrap:wrap}
- header{padding:6px 6px;gap:4px}
- header::before{content:"";flex-basis:100%;order:1;height:0}
- header select,header button{order:2;padding:4px 6px;font-size:12px;
-  min-height:34px}
- #hpv{display:none!important}
- header b{font-size:14px;max-width:44vw;overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap}
- #cnt{font-size:11px;flex-grow:1}
- #st{flex-basis:100%;order:9}
- .pgh{margin:14px 2px 4px}
- textarea{margin-bottom:3px}
- aside{position:fixed;top:0;left:0;right:0;bottom:0;width:auto;
-  max-width:none;height:100%;z-index:30;border-left:0}
- aside .cap{position:sticky;top:0;background:#fff;
-  border-bottom:1px solid var(--bd);z-index:1}}
-</style></head><body>
-<header>
- <b>__TITLE__</b><span id="cnt"></span>
- <select id="flt"><option value="all">전체</option>
- <option value="fail">번역 실패만</option>
- <option value="dirty">수정됨만</option>
- <option value="help">❓ 기호 도움말</option></select>
- <select id="ocrsel" title="🔄 재전사에 사용할 전사 방식"></select>
- <button id="save" disabled>💾 저장</button>
- <button id="mexp" style="display:none"
-  title="수정분 JSON 내보내기 — 오프라인 폴백, PC 웹앱 [📥 파일 반영]으로 적용">📤</button>
- <button id="hpv" style="display:none"
-  title="지금 보이는 페이지의 출력(TXT/EPUB) 미리보기">👁</button>
- <button id="bmk" style="display:none"
-  title="현재 위치를 북마크로 저장 — 다음에 열 때 이 문단에서 이어서">🔖</button>
- <button id="mode"
-  title="읽기 모드 ↔ 편집 모드 — 읽기 모드에서 문단을 탭하면 편집">📖 읽기</button>
- <button id="cfg" style="display:none"
-  title="보기 설정 — 글자 크기·글꼴">⚙</button>
- <button id="exp">📖 TXT/EPUB 재생성</button>
- <span id="st"></span>
-</header>
-<div id="wrap"><main id="list"></main>
-<aside id="ip"><div class="cap">
-<span><button onclick="ipNav(-1)" id="ipprev">◀</button>
-<button onclick="ipNav(1)" id="ipnext">▶</button></span>
-<span id="ipl"></span>
-<button onclick="ipOff()">닫기</button></div><img id="pimg" alt="">
-<div id="pv"></div></aside>
-</div>
-<div id="help">
- <h3>❓ 본문 편집 기호 <small style="color:#999">v__VER__</small></h3>
- <table>
-  <tr><td>## </td><td>문단 맨 앞 — 제목/소제목 (EPUB 장 분할·목차,
-   [§ 제목] 버튼과 동일)</td></tr>
-  <tr><td>&gt;&gt; </td><td>줄 맨 앞 — 그 줄만 오른쪽 정렬 (헌사·서명·날짜.
-   전각 ＞＞·앞 공백 인식, 뒤 공백 필수)</td></tr>
-  <tr><td>**굵게**</td><td><strong>굵게</strong></td></tr>
-  <tr><td>*기울임*</td><td><em>기울임</em></td></tr>
-  <tr><td>~~취소선~~</td><td><s>취소선</s></td></tr>
-  <tr><td>++밑줄++</td><td><u>밑줄</u></td></tr>
-  <tr><td>엔터</td><td>문단 안 줄바꿈 유지</td></tr>
-  <tr><td>빈 줄</td><td>번역 칸만 세로 여백으로 유지 (원문 칸은 자동
-   정리 — 문단 구분과 충돌 방지)</td></tr>
-  <tr><td>(비우기)</td><td>번역 칸을 비우면 그 문단은 원문 그대로 출력
-   — 페이지 단위는 [↩ 원문] 버튼</td></tr>
- </table>
- <div class="hnote">· 기호는 쌍이어야 변환 — 홀수 개는 문자 그대로<br>
-  · TXT 출력·목차에는 기호 제거(플레인)<br>
-  · 👁 미리보기·📖 읽기 모드에서 실제 서식 확인<br>
-  · 출력 반영은 [📖 TXT/EPUB 재생성] 시 · 상세: docs/편집기호_참조.md</div>
- <button class="hclose" onclick="document.getElementById('help')
-  .classList.remove('on')">닫기</button>
-</div>
-<script>
-const D=__DATA__;
-const GURL='__GASURL__',GKEY='__GASKEY__';   // GAS 서빙 시 주입됨
-const CLOUD=GURL.indexOf('__')!==0;
-const SRV=!CLOUD&&(location.protocol==='http:'||location.protocol==='https:');
-const dirty=new Map();          // i -> {src?, text?}
-const rows=[];
-const list=document.getElementById('list');
-const st=document.getElementById('st');
-let lastPg=null;
-D.paras.forEach((e,i)=>{
- if(e.page!==lastPg){lastPg=e.page;
-  const h=document.createElement('div');h.className='pgh';
-  h.textContent=e.page||'(페이지 정보 없음)';
-  const pvb=document.createElement('button');pvb.textContent='👁 미리보기';
-  pvb.title='이 페이지 문단들이 최종 TXT/EPUB에 어떻게 나오는지 표시 '
-   +'(지금 편집 중인 내용 기준 — 다시 누르면 갱신)';
-  const pvpg=e.page;
-  pvb.onclick=()=>showPv(pvpg);h.appendChild(pvb);
-  if(e.page&&SRV){const b=document.createElement('button');
-   b.textContent='📄 원본 보기';b.onclick=()=>showImg(e.page);
-   h.appendChild(b);
-   const rs=document.createElement('button');rs.textContent='🔄 재전사';
-   rs.title='이 페이지만 다시 전사 — 해당 문단들의 원문·번역이 새로 '
-    +'만들어지고 다른 페이지 번역은 유지됩니다';
-   rs.onclick=()=>rescan(e.page,rs);h.appendChild(rs);
-   const cvb=document.createElement('button');cvb.textContent='🖼 표지';
-   cvb.title='이 페이지 스캔을 EPUB 표지 이미지로 (재생성 시 반영)';
-   if(D.cover===pvpg){cvb.style.background='var(--acc)';
-    cvb.style.color='#fff';cvb.style.borderColor='var(--acc)';}
-   cvb.onclick=async()=>{try{await api('/api/cover',{page:pvpg});
-    sessionStorage.setItem('edScroll',String(scrollY));location.reload();}
-    catch(er){st.textContent='표지 설정 실패: '+er.message;}};
-   h.appendChild(cvb);}
-  if(e.page){const rvb=document.createElement('button');
-   rvb.textContent='↩ 원문';
-   rvb.title='이 페이지 문단들의 번역을 비워 원문 그대로 출력되게 합니다 '
-    +'(문단 하나만은 번역칸을 직접 비우면 됨)';
-   rvb.onclick=()=>{if(!confirm('『'+pvpg+'』 페이지의 번역을 모두 비우고 '
-     +'원문 그대로 출력할까요?'))return;
-    D.paras.forEach((x,j)=>{if(x.page!==pvpg||!rows[j])return;
-     if(gtv(j)){stv(j,'');mark(j,'text','');}});
-    if(document.body.classList.contains('rdmode')){
-     rdDirty.forEach(j=>rdFill(j));rdDirty.clear();}};
-   h.appendChild(rvb);}
-  list.appendChild(h);}
- const t=D.xlat[String(i)];
- const r=document.createElement('div');r.className='row';r.dataset.i=i;
- if(t==null)r.classList.add('fail');
- const rh=document.createElement('div');rh.className='rh';
- const sp=document.createElement('span');sp.textContent='#'+(i+1);
- rh.appendChild(sp);
- if(t==null){const bd=document.createElement('span');bd.className='badge';
-  bd.textContent='번역 실패 — 원문 그대로 출력됨';rh.appendChild(bd);}
- if(e.page_end&&e.page_end!==e.page){
-  const sb=document.createElement('button');
-  sb.textContent='↪ '+e.page_end+' 에 걸침';
-  sb.title='페이지 경계에서 병합된 문단 — 뒷부분은 이 페이지에 있습니다';
-  if(SRV)sb.onclick=()=>showImg(e.page_end);
-  rh.appendChild(sb);}
- const rd=document.createElement('div');rd.className='rd';
- rd.title='탭하면 편집 · 드래그하면 하이라이트';
- rd.onclick=()=>{
-  const sel=getSelection();                 // 드래그로 선택 중이면 카드 안 엶
-  if(sel&&!sel.isCollapsed&&(sel.toString()||'').trim())return;
-  if(CLOUD){showEd(i);}
-  else{setMode(false);const o=mkEdit(i);r.scrollIntoView();o.tk.focus();}};
- r.append(rh,rd);list.appendChild(r);
- rows[i]={r,rh,rd,sv:e.src,tv:(t==null?'':t),ts:null,tk:null};
- if(!CLOUD)mkEdit(i);           // 데스크톱: 즉시 편집기 (기존 동작)
-});
-/* 지연 편집기 생성 — 해당 문단을 탭하거나 전체 편집 모드일 때만 textarea 생성 */
-function mkEdit(i){const o=rows[i];if(!o||o.ts)return o;
- const ts=document.createElement('textarea');ts.className='src';
- ts.value=o.sv;ts.title='원문 (전사 오류 수정 가능)';
- const hb=document.createElement('button');hb.textContent='§ 제목';
- hb.title='제목/소제목 지정 토글 — 켜면 EPUB 장 분할·목차 기준이 되고 '
-  +'앞뒤 문단과 병합되지 않습니다 (원문 앞 ## 마커로 저장, '
-  +'출력에선 마커 제거)';
- function updHb(){const on=ts.value.startsWith('## ');
-  hb.style.background=on?'var(--acc)':'';
-  hb.style.color=on?'#fff':'';
-  hb.style.borderColor=on?'var(--acc)':'';}
- hb.onclick=function(){
-  ts.value=ts.value.startsWith('## ')?ts.value.slice(3):'## '+ts.value;
-  o.sv=ts.value;mark(i,'src',ts.value);updHb();};
- ts.addEventListener('input',()=>{o.sv=ts.value;updHb();mark(i,'src',ts.value);});
- updHb();
- if(SRV){const rb=document.createElement('button');rb.textContent='🌐 재번역';
-  rb.title='원문을 고쳤으면 이 버튼으로 해당 문단만 다시 번역합니다';
-  rb.onclick=()=>retx(i,rb);o.rh.appendChild(rb);}
- o.rh.appendChild(hb);
- const bm=document.createElement('button');bm.className='edbmk';
- bm.textContent='🔖 북마크';
- bm.title='이 문단을 북마크에 추가 — 상단 🔖 목록에서 골라 다시 옵니다 '
-  +'(닫기는 화면의 ✓ 버튼)';
- bm.onclick=(ev)=>{ev.stopPropagation();
-  if(window._bmAdd)window._bmAdd(i);
-  bm.classList.add('on');bm.textContent='🔖 추가됨';
-  setTimeout(()=>{bm.classList.remove('on');bm.textContent='🔖 북마크';},1100);};
- o.rh.appendChild(bm);
- const tk=document.createElement('textarea');tk.value=o.tv;
- tk.placeholder='(비우면 원문이 그대로 출력됩니다)';
- tk.addEventListener('input',()=>{o.tv=tk.value;mark(i,'text',tk.value);});
- [ts,tk].forEach(x=>{x.rows=Math.min(14,Math.max(2,
-  Math.ceil((x.value.length||60)/60)));});
- const lo=document.createElement('div');lo.className='fldl fldl-o';
- lo.textContent='원문';
- const lt=document.createElement('div');lt.className='fldl fldl-t';
- lt.textContent='번역';
- o.r.insertBefore(lo,o.rd);o.r.insertBefore(ts,o.rd);
- o.r.insertBefore(lt,o.rd);o.r.insertBefore(tk,o.rd);
- o.ts=ts;o.tk=tk;return o;}
-function closeEd(i,scroll){const o=rows[i];if(!o)return;   // 카드 닫고 읽기로
- o.r.classList.remove('ed');o.rf=false;rdFill(i);
- if(!document.querySelector('.row.ed')){
-  document.body.classList.remove('hdhide');
-  document.body.classList.remove('hascard');edPost(false);}
- try{if(document.activeElement)document.activeElement.blur();}catch(e){}
- if(scroll)requestAnimationFrame(()=>{   // 수정하던 문단이 화면에 보이게
-  try{o.r.scrollIntoView({block:'center'});}catch(e){}
-  setTimeout(()=>{try{o.r.scrollIntoView({block:'center'});}catch(e){}},170);});}
-function showEd(i){
- document.querySelectorAll('.row.ed').forEach(el=>{   // 한 번에 한 카드만
-  const j=+el.dataset.i;if(j!==i)closeEd(j);});
- const o=mkEdit(i);o.r.classList.add('ed');
- if(window._bmkSet)window._bmkSet(i);   // 마지막 편집 위치 기록(재열기 복원용)
- if(NARROW)document.body.classList.add('hdhide');   // 편집 카드 열리면 헤더 숨김
- document.body.classList.add('hascard');edPost(true);   // 완료 FAB·셸 홈 숨김
- // 카드를 헤더 바로 아래로 고정 — 포커스 기본 스크롤(튕김)은 막고 직접 이동
- requestAnimationFrame(()=>{
-  try{o.tk.focus({preventScroll:true});}catch(e){try{o.tk.focus();}catch(_){}}
-  o.r.scrollIntoView({block:'start'});
-  setTimeout(()=>o.r.scrollIntoView({block:'start'}),140);});}  // 키보드 열린 뒤 보정
-function gsv(i){const o=rows[i];return o.ts?o.ts.value:o.sv;}
-function gtv(i){const o=rows[i];return o.tk?o.tk.value:o.tv;}
-function stv(i,v){const o=rows[i];o.tv=v;if(o.tk)o.tk.value=v;}
-function ssv(i,v){const o=rows[i];o.sv=v;if(o.ts)o.ts.value=v;}
-function mark(i,k,v){const d=dirty.get(i)||{};d[k]=v;dirty.set(i,d);
- rows[i].r.classList.add('dirty');upd();if(CLOUD)cloudQueue();
- rows[i].rf=false;rdDirty.add(i);}
-function curIdx(){const hh=document.querySelector('header').offsetHeight+4;
- for(let i=0;i<rows.length;i++){
-  const rc=rows[i].r.getBoundingClientRect();
-  if(rc.bottom>hh&&(rc.bottom||rc.top))return i;}
- return 0;}
-const rdDirty=new Set();
-const NARROW=matchMedia('(max-width:640px)').matches;
-function rdFill(i){const o=rows[i];if(!o||!o.rd)return;
- const s=gsv(i),ko=(gtv(i)||'').trim();
- const srcOnly=document.body.classList.contains('rdsrc');  // 원문만 보기
- o.rd.innerHTML=fmtHtml(stripMark(srcOnly?s:(ko||s)));
- o.rd.classList.toggle('rdsronly',srcOnly);    // 원문 보기 시 색 구분
- o.rd.classList.toggle('untr',!srcOnly&&!ko);
- o.rd.classList.toggle('rdh',s.indexOf('## ')===0);
- if(!srcOnly)hiPaint(o.rd,i);                  // 저장된 하이라이트 다시 칠하기
- o.rf=true;}
-function updSrcBtn(){const b=window._srcBtn;if(!b)return;
- const on=document.body.classList.contains('rdmode')
-  ?document.body.classList.contains('rdsrc')
-  :!document.body.classList.contains('nosrc');
- b.style.opacity=on?'':'.5';}
-function refillRd(){rows.forEach(o=>{if(o)o.rf=false;});
- if(!document.body.classList.contains('rdmode'))return;
- const ci=curIdx();
- for(let k=Math.max(0,ci-2);k<rows.length&&rows[k]
-   &&rows[k].r.getBoundingClientRect().top<innerHeight+500;k++)rdFill(k);}
-/* ---- 형광펜(하이라이트) — 읽기(번역) 화면에서 드래그해 지정 ---- */
-const HKEY='ebookHi:'+(D.title||'');
-let HI={};try{HI=JSON.parse(localStorage.getItem(HKEY)||'{}')||{}}catch(e){HI={}}
-function hiSave(){try{localStorage.setItem(HKEY,JSON.stringify(HI))}catch(e){}}
-let _hiPushT=null;
-function hiCloudPush(){if(!CLOUD)return;   // Drive에 공유 저장(디바운스)
- clearTimeout(_hiPushT);
- _hiPushT=setTimeout(()=>{gasCall({op:'hi',set:HI}).catch(()=>{});},700);}
-function hiCloudPull(){if(!CLOUD)return;   // 열 때 공유본 받아 반영(클라우드 우선)
- gasCall({op:'hi'}).then(r=>{
-  const chi=r?r.hi:undefined;let changed=false;
-  if(chi===undefined||chi===null){        // 클라우드 기록 없음(최초) → 로컬 올림
-   if(Object.keys(HI).length)hiCloudPush();
-  }else{const before=JSON.stringify(HI);   // 기록 있으면(빈 것 포함) 클라우드 우선
-   HI=chi;hiSave();changed=(JSON.stringify(HI)!==before);}
-  // 실제로 하이라이트가 달라졌을 때만 다시 그린다 — 안 바뀌면 화면 리프레쉬 없음
-  if(changed&&document.body.classList.contains('rdmode'))refillRd();
- }).catch(()=>{});}
-function _mergeHi(rs){rs=rs.slice().sort((a,b)=>a[0]-b[0]);const out=[];
- for(const r of rs){const l=out[out.length-1];
-  if(l&&r[0]<=l[1])l[1]=Math.max(l[1],r[1]);else out.push(r.slice());}
- return out;}
-function hiAdd(i,s,e){const k=String(i);
- HI[k]=_mergeHi([...(HI[k]||[]),[s,e]]);hiSave();hiCloudPush();
- if(rows[i]){rows[i].rf=false;rdFill(i);}}
-function hiDel(i,s,e){const k=String(i);
- HI[k]=(HI[k]||[]).filter(r=>!(r[0]===s&&r[1]===e));
- if(!HI[k].length)delete HI[k];hiSave();hiCloudPush();
- if(rows[i]){rows[i].rf=false;rdFill(i);}}
-function _hiWrap(rd,i,s,e){
- const w=document.createTreeWalker(rd,NodeFilter.SHOW_TEXT);
- let n=0,node,jobs=[];
- while((node=w.nextNode())){const len=node.textContent.length,ns=n;n+=len;
-  const a=Math.max(s,ns),b=Math.min(e,n);if(a<b)jobs.push([node,a-ns,b-ns]);}
- jobs.reverse().forEach(([node,a,b])=>{const rg=document.createRange();
-  rg.setStart(node,a);rg.setEnd(node,b);
-  const m=document.createElement('mark');m.className='hl';
-  m.dataset.i=i;m.dataset.s=s;m.dataset.e=e;
-  try{rg.surroundContents(m);}catch(er){}});}
-function hiPaint(rd,i){const rs=HI[String(i)];if(!rs||!rs.length)return;
- const L=rd.textContent.length;
- rs.forEach(([s,e])=>{if(s<e&&e<=L)_hiWrap(rd,i,s,e);});}
-function _hoff(root,node,pos){let n=0,c,
-  w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT);
- while((c=w.nextNode())){if(c===node)return n+pos;n+=c.textContent.length;}
- return -1;}
-const hlpop=document.createElement('div');hlpop.id='hlpop';
-document.body.appendChild(hlpop);
-let hlPend=null;
-function hlClose(){hlpop.classList.remove('on');}
-function hlShow(rect,label,onclk,fixed){
- hlpop.innerHTML='<button>'+label+'</button>';
- hlpop.querySelector('button').onclick=(ev)=>{
-  ev.stopPropagation();hlClose();onclk();};
- hlpop.classList.add('on');
- const pw=hlpop.offsetWidth,ph=hlpop.offsetHeight;
- if(fixed){        // 선택 시: OS 기본 툴바(선택 위)와 안 겹치게 화면 하단 고정
-  hlpop.style.left='50%';hlpop.style.transform='translateX(-50%)';
-  hlpop.style.top='auto';
-  hlpop.style.bottom='calc(env(safe-area-inset-bottom) + 22px)';
-  // 선택이 화면 하단이면 기본 툴바가 아래로 올 수 있어 상단으로
-  if(rect&&rect.bottom>innerHeight*0.62){hlpop.style.bottom='auto';
-   hlpop.style.top='calc(env(safe-area-inset-top) + 12px)';}
-  return;}
- hlpop.style.transform='';hlpop.style.bottom='auto';
- let left=rect.left+rect.width/2-pw/2;
- left=Math.max(6,Math.min(left,innerWidth-pw-6));
- let top=rect.top-ph-8;if(top<6)top=rect.bottom+8;
- hlpop.style.left=left+'px';hlpop.style.top=top+'px';}
-function onSelHl(){
- if(!document.body.classList.contains('rdmode'))return;
- if(document.body.classList.contains('rdsrc'))return;   // 번역 화면에서만
- const sel=getSelection();
- if(!sel||sel.isCollapsed||!sel.rangeCount)return;
- const rg=sel.getRangeAt(0);
- let el=rg.commonAncestorContainer;
- el=el.nodeType===1?el:el.parentNode;
- const rd=el&&el.closest?el.closest('.rd'):null;
- if(!rd||(rd.closest&&rd.closest('.row.ed')))return;    // 편집 카드 제외
- const i=+rd.parentNode.dataset.i;
- const a=_hoff(rd,rg.startContainer,rg.startOffset);
- const b=_hoff(rd,rg.endContainer,rg.endOffset);
- if(a<0||b<0||a===b)return;
- hlPend={i:i,s:Math.min(a,b),e:Math.max(a,b)};
- hlShow(rg.getBoundingClientRect(),'🖍 하이라이트',()=>{
-  if(hlPend)hiAdd(hlPend.i,hlPend.s,hlPend.e);
-  try{getSelection().removeAllRanges()}catch(er){}},true);}
-document.addEventListener('selectionchange',()=>{
- clearTimeout(window._hlT);window._hlT=setTimeout(onSelHl,350);});
-list.addEventListener('click',e=>{                       // 하이라이트 탭 → 지우기
- const m=e.target.closest&&e.target.closest('mark.hl');
- if(!m)return;e.stopPropagation();
- hlShow(m.getBoundingClientRect(),'🗑 하이라이트 지우기',
-  ()=>hiDel(+m.dataset.i,+m.dataset.s,+m.dataset.e));},true);
-document.addEventListener('click',e=>{
- if(hlpop.classList.contains('on')&&!hlpop.contains(e.target)
-    &&!(e.target.closest&&e.target.closest('mark.hl')))hlClose();},true);
-addEventListener('scroll',hlClose,true);
-/* ---- 상단 헤더 자동 숨김(모바일) — 아래로 스크롤 시 잠시 뒤 숨김,
-   위로 스크롤 시 즉시 표시, 편집 카드 열리면 숨김 ---- */
-if(NARROW){let _hy=scrollY,_hdT=null;
- addEventListener('scroll',()=>{const y=scrollY;
-  if(document.querySelector('.row.ed')){
-   document.body.classList.add('hdhide');_hy=y;return;}
-  if(y<12){clearTimeout(_hdT);document.body.classList.remove('hdhide');_hy=y;return;}
-  if(y>_hy+6){clearTimeout(_hdT);_hdT=setTimeout(()=>{
-    if(!document.querySelector('.row.ed'))document.body.classList.add('hdhide');},380);}
-  else if(y<_hy-6){clearTimeout(_hdT);document.body.classList.remove('hdhide');}
-  _hy=y;},{passive:true});}
-/* 읽기모드 — 화면에 보이는 마지막 위치(맨 위 문단)를 자동 기억(재열기 복원) */
-window._psLast=-1;
-addEventListener('scroll',()=>{
- if(!document.body.classList.contains('rdmode'))return;
- if(document.querySelector('.row.ed'))return;      // 편집 중엔 편집 위치 우선
- if(performance.now()<2500)return;                 // 초기 복원 스크롤 무시
- clearTimeout(window._psT);
- window._psT=setTimeout(()=>{const i=curIdx();
-  if(i!==window._psLast&&window._bmkSet){window._psLast=i;window._bmkSet(i);}},700);
-},{passive:true});
-/* 편집 카드 활성 시 반투명 완료 FAB (셸 홈 버튼은 숨기라고 부모에 통지) */
-const edfab=document.createElement('button');edfab.id='edfab';
-edfab.textContent='✓';edfab.title='편집 완료';
-edfab.onclick=()=>{const el=document.querySelector('.row.ed');
- if(el)closeEd(+el.dataset.i,true);};
-document.body.appendChild(edfab);
-function edPost(on){try{if(window.top!==window)
-  window.top.postMessage({ebook:'ed',on:!!on},'*');}catch(e){}}
-/* 뷰포트 근처 문단의 rd만 렌더 — 긴 책 첫 로딩 부담 완화 */
-let rio=null;
-function ensureRio(){if(rio)return;
- rio=new IntersectionObserver(es=>{es.forEach(en=>{
-   if(!en.isIntersecting)return;
-   const i=+en.target.dataset.i;const o=rows[i];
-   if(o&&!o.rf&&document.body.classList.contains('rdmode'))rdFill(i);});},
-  {rootMargin:'1200px 0px'});
- rows.forEach(o=>rio.observe(o.r));}
-function setMode(on){
- const ci=curIdx();
- document.body.classList.toggle('rdmode',on);
- document.getElementById('mode').textContent=
-  on?(NARROW?'✏':'✏ 편집'):(NARROW?'📖':'📖 읽기');
- if(on){document.querySelectorAll('.row.ed').forEach(el=>{
-   const j=+el.dataset.i;el.classList.remove('ed');rdDirty.add(j);});
-  ensureRio();
-  rdDirty.forEach(i=>{const o=rows[i];if(o){o.rf=false;rdFill(i);}});
-  rdDirty.clear();
-  requestAnimationFrame(()=>{const o=rows[curIdx()];
-   for(let k=Math.max(0,(o?+o.r.dataset.i:0)-2);
-       k<rows.length&&rows[k]&&!rows[k].rf
-       &&rows[k].r.getBoundingClientRect().top<innerHeight+400;k++)rdFill(k);});}
- else if(CLOUD){rows.forEach((o,i)=>mkEdit(i));}  // 전체 편집 모드 — 모두 생성
- try{localStorage.setItem('edMode',on?'1':'0')}catch(e){}
- updSrcBtn();
- const o=rows[ci];if(o)o.r.scrollIntoView();}
-document.getElementById('mode').onclick=()=>
- setMode(!document.body.classList.contains('rdmode'));
-if(NARROW)document.getElementById('mode').textContent='📖';
-{const _em=localStorage.getItem('edMode');
- const _rd=CLOUD?(_em!=='0'):(_em==='1');   // 모바일 기본 읽기, 데스크톱 기본 편집
- if(_rd)setMode(true);
- else if(CLOUD)rows.forEach((o,i)=>mkEdit(i));}  // 편집 모드로 시작 → 전체 생성
-const BKEY='ebookBmk:'+(D.title||'');       // 자동 '마지막 위치'(이어읽기)
-const BMKS_KEY='ebookBmks:'+(D.title||'');  // 수동 다중 북마크 목록
-// 편집/스크롤 시 자동으로 마지막 위치 기록 — 재열기 복원용(북마크와 별개)
-window._bmkSet=(i)=>{if(i==null)return;
- try{localStorage.setItem(BKEY,String(i))}catch(e){}
- if(CLOUD){clearTimeout(window._bmkT);
-  window._bmkT=setTimeout(()=>{gasCall({op:'state',pos:i}).catch(()=>{});},1200);}};
-// 저장했던 문단을 '화면 맨 위'(헤더 바로 아래)로 안정적으로 복원.
-// 지연 렌더·웹폰트 로드 리플로우로 위치가 튀지 않게 여러 번 재보정하고,
-// 사용자가 직접 스크롤/터치하면 즉시 멈춰서 방해하지 않는다.
-let _restTarget=null,_restStop=false;
-['touchstart','wheel','keydown','pointerdown'].forEach(ev=>
- addEventListener(ev,()=>{_restStop=true;},{passive:true}));
-function _restGo(){if(_restTarget==null||_restStop)return;
- const o=rows[_restTarget];if(!o)return;
- // 대상을 헤더 바로 아래(헤더 밑변)에 맞춤 — curIdx() 판정선(헤더+4)보다 위라
- // 대상이 '맨 위 문단'으로 잡혀 자동 저장이 한 칸씩 밀리지 않는다.
- const hh=(document.querySelector('header').offsetHeight||0);
- const top=o.r.getBoundingClientRect().top;
- if(Math.abs(top-hh)>2)scrollBy(0,top-hh);}   // 어긋날 때만 보정(맨 위 정렬)
-function _bmGo(j,flash){j=parseInt(j,10);
- if(isNaN(j)||j<0)return false;j=Math.min(j,rows.length-1);
- const o=rows[j];if(!o)return false;
- _restTarget=j;_restStop=false;
- for(let k=Math.max(0,j-8);k<Math.min(rows.length,j+10);k++){   // 대상 주변 먼저 렌더
-  const p=rows[k];if(p&&!p.rf&&document.body.classList.contains('rdmode'))rdFill(k);}
- _restGo();
- let n=0;(function settle(){if(_restStop)return;_restGo();      // 몇 프레임 재보정
-  if(++n<8)requestAnimationFrame(()=>setTimeout(settle,45));})();
- if(document.fonts&&document.fonts.ready)document.fonts.ready.then(()=>{
-  if(_restStop||_restTarget!==j)return;                        // 폰트 로드 후 재보정
-  let m=0;(function fset(){if(_restStop||_restTarget!==j)return;_restGo();
-   if(++m<5)requestAnimationFrame(()=>setTimeout(fset,55));})();});
- if(flash!==false){o.r.style.boxShadow='0 0 0 2px var(--acc)';
-  setTimeout(()=>{o.r.style.boxShadow=''},1600);}
- st.textContent='🔖 #'+(j+1)+'에서 이어서';return true;}
-// 현재 문단을 수동 북마크 목록에 추가 (카드 🔖 버튼·상단 🔖 목록 공용)
-window._bmAdd=(i)=>{if(i==null||i<0)return;
- let a;try{a=JSON.parse(localStorage.getItem(BMKS_KEY)||'[]')||[]}catch(e){a=[]}
- if(!a.includes(i)){a.push(i);a.sort((x,y)=>x-y);
-  try{localStorage.setItem(BMKS_KEY,JSON.stringify(a))}catch(e){}}
- st.textContent='🔖 #'+(i+1)+' 북마크에 추가됨';
- if(window._bmRender)window._bmRender();};
-function initBmk(cloud){
- const bk=document.getElementById('bmk');bk.style.display='';
- const mnu=document.createElement('div');mnu.id='bmenu';
- document.body.appendChild(mnu);
- const close=()=>mnu.classList.remove('on');
- const loadB=()=>{try{return JSON.parse(localStorage.getItem(BMKS_KEY)||'[]')||[]}
-  catch(e){return[]}};
- const saveB=a=>{try{localStorage.setItem(BMKS_KEY,JSON.stringify(a))}catch(e){}};
- const snip=i=>{const t=(gtv(i)||gsv(i)||'');
-  return (stripMark(t).replace(/\\s+/g,' ').trim().slice(0,24))||'(빈 문단)';};
- function render(){
-  mnu.innerHTML='';
-  const h=document.createElement('div');h.className='bmh';h.textContent='🔖 북마크';
-  const add=document.createElement('button');add.className='bmadd';
-  add.textContent='📍 현재 위치 북마크 추가';
-  add.onclick=()=>window._bmAdd(curIdx());
-  mnu.append(h,add);
-  const a=loadB();
-  if(!a.length){const e=document.createElement('div');e.className='bmempty';
-   e.textContent='저장된 북마크가 없습니다 — 위 버튼으로 추가하세요';
-   mnu.appendChild(e);return;}
-  a.forEach(i=>{const row=document.createElement('div');row.className='bmrow';
-   const g=document.createElement('button');g.className='bmgo';
-   const bb=document.createElement('b');bb.textContent='#'+(i+1);
-   const sp=document.createElement('span');sp.textContent=snip(i);
-   g.append(bb,sp);g.onclick=()=>{close();_bmGo(i);};
-   const d=document.createElement('button');d.className='bmdel';
-   d.textContent='🗑';d.title='이 북마크 삭제';
-   d.onclick=ev=>{ev.stopPropagation();saveB(loadB().filter(x=>x!==i));render();};
-   row.append(g,d);mnu.appendChild(row);});
- }
- window._bmRender=()=>{if(mnu.classList.contains('on'))render();};
- bk.onclick=()=>{if(mnu.classList.contains('on')){close();return}
-  render();mnu.style.top=(bk.getBoundingClientRect().bottom+6)+'px';
-  mnu.style.right='8px';mnu.classList.add('on');};
- document.addEventListener('click',e=>{
-  if(!mnu.contains(e.target)&&e.target!==bk)close();},true);
- // 열 때 자동 '마지막 위치' 복원 (북마크와 별개)
- // 로컬 기록으로 '즉시' 복원(대기 없음) → 클라우드 위치가 다를 때만 한 번 보정.
- // 같은 기기에선 로컬==클라우드라 두 번 튀지 않는다.
- const li=localStorage.getItem(BKEY);const liN=(li!=null&&li!=='')?parseInt(li,10):null;
- if(liN!=null)_bmGo(liN,false);        // 자동 복원은 파란 강조 없이 조용히
- if(cloud)gasCall({op:'get'}).then(q=>{const sp=q&&q.state&&q.state.pos;
-   if(sp!=null&&sp!==liN&&!_restStop)_bmGo(sp,false);}).catch(()=>{});}
-if(matchMedia('(pointer:coarse)').matches){
- const grow=t=>{t.style.height='auto';
-  const cap=Math.max(160,innerHeight*0.5),h=t.scrollHeight+2;
-  if(h>cap){t.style.height=cap+'px';t.style.overflowY='auto';}
-  else{t.style.height=h+'px';t.style.overflowY='hidden';}};
- list.addEventListener('focusin',e=>{
-  if(e.target.tagName==='TEXTAREA')grow(e.target);});
- list.addEventListener('input',e=>{
-  if(e.target.tagName==='TEXTAREA')grow(e.target);});
- addEventListener('resize',()=>{   // 키보드 개폐 → 포커스 칸 재계산
-  const a=document.activeElement;
-  if(a&&a.tagName==='TEXTAREA'&&list.contains(a))grow(a);});}
-function upd(){
- document.getElementById('save').disabled=!dirty.size||(!SRV&&!CLOUD);
- const nf=rows.filter(o=>o.r.classList.contains('fail')).length;
- document.getElementById('cnt').textContent=
-  ' '+D.paras.length+'문단 · 실패 '+nf+' · 수정 '+dirty.size
-  +(window._stale?' · ⚠ PC 새 버전 — 새로 여세요':'');}
-async function api(p,body){
- const r=await fetch(p,{method:'POST',
-  headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
- if(!r.ok){let m='HTTP '+r.status;
-  if(r.status===409)m='작업 실행 중 — 완료 후 다시 시도하세요';
-  else try{m=(await r.json()).error||m}catch(_){}
-  throw new Error(m);}
- return r.json();}
-async function doSave(){if(!dirty.size)return true;
- if(CLOUD){clearTimeout(cq);await cloudSend();return !dirty.size;}
- const edits=[...dirty.entries()].map(([i,d])=>({i:+i,...d}));
- st.textContent='저장 중…';
- try{await api('/api/save',{edits});
-  edits.forEach(e=>{const o=rows[e.i];o.r.classList.remove('dirty');
-   if('text'in e)o.r.classList.toggle('fail',!e.text.trim());});
-  dirty.clear();upd();st.textContent='저장 완료 — 재생성해야 TXT/EPUB에 반영';
-  return true;}
- catch(e){st.textContent='저장 실패: '+e.message;return false;}}
-async function retx(i,btn){btn.disabled=true;
- st.textContent='#'+(i+1)+' 재번역 중…';
- try{if(!await doSave())return;
-  const r=await api('/api/xlat',{ids:[i]});
-  const t=r[String(i)];
-  if(t){stv(i,t);rows[i].r.classList.remove('fail');
-   D.xlat[String(i)]=t;st.textContent='#'+(i+1)+' 재번역 완료';}
-  else st.textContent='#'+(i+1)+' 재번역 실패 — 기존 번역 유지';
-  upd();}
- catch(e){st.textContent='재번역 오류: '+e.message;}
- finally{btn.disabled=false;}}
-document.getElementById('save').onclick=doSave;
-document.getElementById('exp').onclick=async()=>{
- if(!SRV)return;
- try{if(!await doSave())return;st.textContent='재생성 중…';
-  const r=await api('/api/export',{});
-  st.textContent='재생성 완료: '+r.files.join(' / ');}
- catch(e){st.textContent='재생성 실패: '+e.message;}};
-document.getElementById('flt').onchange=function(){
- const m=this.value;
- if(m==='help'){this.value=window._pflt||'all';
-  document.getElementById('help').classList.add('on');return}
- window._pflt=m;
- rows.forEach(o=>{o.r.style.display=
-  m==='all'||(m==='fail'&&o.r.classList.contains('fail'))
-  ||(m==='dirty'&&o.r.classList.contains('dirty'))?'':'none';});};
-const ip=document.getElementById('ip');
-const pimg=document.getElementById('pimg');
-const pv=document.getElementById('pv');
-let ipCur=-1,ipMode='img';
-function stripMark(s){return (s||'').replace(/^##\s*/,'');}
-function fmtHtml(s){s=(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
- .replace(/>/g,'&gt;');
- s=s.replace(/\*\*([\s\S]+?)\*\*/g,'<strong>$1</strong>')
-  .replace(/~~([\s\S]+?)~~/g,'<s>$1</s>')
-  .replace(/\+\+([\s\S]+?)\+\+/g,'<u>$1</u>')
-  .replace(/\*([^*\\n]+?)\*/g,'<em>$1</em>')
-  .replace(/ {2,}/g,m=>' '.repeat(m.length-1)+' ');
- const out=[];let buf=[];
- const fl=()=>{if(buf.length){out.push(buf.join('<br>'));buf=[];}};
- s.split('\\n').forEach(ln=>{
-  const m=ln.match(/^[ \t　]*(?:&gt;&gt;|＞＞)\s+/);
-  if(m){fl();
-   out.push('<span style="display:block;text-align:right;text-indent:0">'
-    +ln.slice(m[0].length)+'</span>');}
-  else if(!ln.trim()){fl();out.push('<br><br>');}
-  else buf.push(ln);});
- fl();return out.join('');}
-function ipHead(pg,suffix){ip.classList.add('on');
- ipCur=D.pages.indexOf(pg);
- document.getElementById('ipl').textContent=pg+(suffix||'');
- document.getElementById('ipprev').disabled=ipCur<=0;
- document.getElementById('ipnext').disabled=
-  ipCur<0||ipCur>=D.pages.length-1;}
-function showImg(pg){ipMode='img';ipHead(pg,'');
- pv.style.display='none';pimg.style.display='block';
- pimg.src='/_pageimg/'+encodeURIComponent(pg);}
-function showPv(pg){ipMode='pv';ipHead(pg,' — 출력 미리보기');
- pimg.style.display='none';pv.style.display='block';
- pv.innerHTML='';
- let n=0;
- D.paras.forEach(function(e,i){
-  if(e.page!==pg||n>=200)return;   // 페이지 정보 없는 옛 데이터 폭주 방지
-  n++;
-  const src=rows[i]?gsv(i):e.src;
-  const ko=rows[i]?gtv(i):(D.xlat[String(i)]||'');
-  const isHead=src.startsWith('## ');
-  const el=document.createElement(isHead?'h2':'p');
-  el.innerHTML=fmtHtml(stripMark(ko.trim()||src));
-  if(!ko.trim())el.classList.add('untr');   // 미번역 — 원문 그대로
-  pv.appendChild(el);});
- if(!n){const d2=document.createElement('div');d2.className='empty';
-  d2.textContent='이 페이지에서 시작하는 문단이 없습니다 '
-   +'(앞 페이지에서 걸쳐 온 문장은 앞 페이지 미리보기에 포함)';
-  pv.appendChild(d2);}}
-function ipNav(d){const i=ipCur+d;
- if(i<0||i>=D.pages.length)return;
- if(ipMode==='pv')showPv(D.pages[i]);else showImg(D.pages[i]);}
-function ipOff(){ip.classList.remove('on');}
-const ocrSel=document.getElementById('ocrsel');
-(D.ocr_modes||[]).forEach(function(m,i){
- const o=document.createElement('option');
- o.value=i===0?'':m[1];
- o.textContent=(i===0?'재전사: 실행 설정':'재전사: '+m[0].split(' (')[0]);
- ocrSel.appendChild(o);});
-ocrSel.value=localStorage.getItem('edOcr')||'';
-if(ocrSel.selectedIndex<0)ocrSel.selectedIndex=0;
-ocrSel.onchange=()=>localStorage.setItem('edOcr',ocrSel.value);
-async function rescan(pg,btn){
- if(dirty.size&&!await doSave())return;   // 수정분 먼저 저장
- const eng=ocrSel.value;
- const engLb=eng?ocrSel.selectedOptions[0].textContent
-  .replace('재전사: ',''):'실행 설정의 전사 방식';
- if(!confirm('『'+pg+'』 페이지를 '+engLb+'(으)로 다시 전사합니다.\\n'
-  +'바뀐 문단의 원문·번역이 새로 만들어지고(경계 걸침 포함),\\n'
-  +'내용이 같은 문단과 다른 페이지의 번역은 유지됩니다. 계속할까요?'))
-  return;
- btn.disabled=true;st.textContent=pg+' 재전사 중… ('+engLb+')';
- try{await api('/api/rescan',eng?{page:pg,ocr:eng}:{page:pg});
-  sessionStorage.setItem('edScroll',String(scrollY));
-  location.reload();}
- catch(e){st.textContent='재전사 실패: '+e.message;btn.disabled=false;}}
-const _sc=sessionStorage.getItem('edScroll');
-if(_sc!==null){sessionStorage.removeItem('edScroll');
- requestAnimationFrame(()=>scrollTo(0,+_sc));}
-/* ---- CLOUD(모바일 동기화) — GAS 서빙 시 URL·키 주입 ---- */
-const PKEY='ebookEdits:'+(D.title||'')+':'+(D.fp||'');
-let cq=null,sending=false;
-function KEY(){if(GKEY.indexOf('__')!==0)return GKEY;
- let k=localStorage.getItem('gasKey')||'';
- if(!k){k=prompt('동기화 키를 입력하세요')||'';
-  if(k)localStorage.setItem('gasKey',k);}
- return k;}
-function gasCall(body){body=Object.assign(
-  {key:KEY(),book:D.title||'이북'},body);
- return new Promise((res,rej)=>{
-  const done=t=>{let r;
-   try{r=typeof t==='string'?JSON.parse(t):t}
-   catch(e){rej(new Error('응답 파싱 실패'));return}
-   r&&r.err?rej(new Error(r.err)):res(r||{});};
-  if(window.google&&google.script&&google.script.run)
-   google.script.run.withSuccessHandler(done)
-    .withFailureHandler(e=>rej(new Error((e&&e.message)||'통신 실패')))
-    .apiCall(JSON.stringify(body));
-  else fetch(GURL,{method:'POST',body:JSON.stringify(body)})
-   .then(r=>r.text()).then(done).catch(rej);});}
-function savePend(){try{localStorage.setItem(PKEY,
- JSON.stringify([...dirty.entries()]))}catch(e){}}
-function cloudQueue(ms){savePend();clearTimeout(cq);
- cq=setTimeout(cloudSend,ms||2000);}
-async function cloudSend(){
- if(sending)return;
- if(!dirty.size){savePend();return}
- sending=true;st.textContent='☁ 저장 중…';
- const snap=[...dirty.entries()].map(([i,d])=>[i,JSON.stringify(d)]);
- try{const r=await gasCall({op:'edits',fp:D.fp,count:D.count,
-   edits:Object.fromEntries(snap.map(([i,s])=>[i,JSON.parse(s)]))});
-  snap.forEach(([i,s])=>{const d=dirty.get(i);   // 전송 중 재수정분은 유지
-   if(d&&JSON.stringify(d)===s){dirty.delete(i);
-    const o=rows[i];if(o){o.r.classList.remove('dirty');
-     if(d.text!==undefined)o.r.classList.toggle('fail',!d.text.trim());}}});
-  savePend();
-  if(r.snap!=null&&D.fp&&r.snap!==D.fp)window._stale=true;
-  upd();
-  st.textContent=dirty.size?'⏳ 대기 '+dirty.size+'건'
-   :'☁ 저장됨 '+new Date().toLocaleTimeString();}
- catch(e){st.textContent='⚠ 전송 실패('+e.message+') — 10초 후 재시도';
-  cloudQueue(10000);}
- finally{sending=false;}}
-function initCloud(){
- document.getElementById('exp').style.display='none';
- document.getElementById('ocrsel').style.display='none';
- const mx=document.getElementById('mexp');mx.style.display='';
- mx.onclick=()=>{const pl={v:1,fp:D.fp,count:D.count,
-   edits:Object.fromEntries(dirty)};
-  const b=new Blob([JSON.stringify(pl,null,1)],{type:'application/json'});
-  const a=document.createElement('a');a.href=URL.createObjectURL(b);
-  a.download=(D.title||'이북')+'_edits.json';a.click();};
- // 코믹스앱 본문 폰트 — GitHub Pages 셸에 호스팅한 woff2를 @font-face로 사용
- // (셸 레포에 fonts.css·fonts/*.woff2 업로드 필요. 미업로드 시 뒤 폰트로 폴백)
- const FONTHOST='https://kiuk104.github.io/ebook-shell';
- (function(){const l=document.createElement('link');l.rel='stylesheet';
-   l.href=FONTHOST+'/fonts.css';document.head.appendChild(l);})();
- const FONTS=[['바탕 (명조)',"Batang,'Noto Serif KR',Georgia,serif"],
-   ['리디바탕 (명조)',"'RIDIBatang',Batang,'Noto Serif KR',serif"],
-   ['에스코어드림 Light',"'SCDreamLight','Malgun Gothic',sans-serif"],
-   ['에스코어드림 Bold',"'SCDreamBold','Malgun Gothic',sans-serif"],
-   ['맑은 고딕',"'Malgun Gothic','Noto Sans KR','Apple SD Gothic Neo',sans-serif"],
-   ['나눔명조',"'Nanum Myeongjo',Batang,serif"],
-   ['나눔고딕',"'Nanum Gothic','Malgun Gothic',sans-serif"],
-   ['돋움 (고딕)',"Dotum,Gulim,sans-serif"]];
- function applyView(){const px=window._fs||16,ff=window._ff||FONTS[0][1];
-  let se=document.getElementById('fscss');
-  if(!se){se=document.createElement('style');se.id='fscss';
-   document.head.appendChild(se);}
-  se.textContent='#list textarea{font-size:'+px+'px}'
-   +'#pv{font-size:'+(px+1)+'px;font-family:'+ff+'}'
-   +'#list .rd{font-size:'+(px+1)+'px;font-family:'+ff+'}'
-   +'#list .rd.rdh{font-size:'+Math.round((px+1)*1.15)+'px}';}
- function setFs(px){window._fs=Math.min(24,Math.max(12,px));
-  try{localStorage.setItem('edFs',String(window._fs))}catch(e){}applyView();}
- function setFont(ff){window._ff=ff;
-  try{localStorage.setItem('edFont',ff)}catch(e){}applyView();}
- if(matchMedia('(max-width:640px)').matches)
-  document.getElementById('save').textContent='💾';
- const fs0=parseInt(localStorage.getItem('edFs')||'16',10);
- window._fs=isNaN(fs0)?16:Math.min(24,Math.max(12,fs0));
- window._ff=localStorage.getItem('edFont')||FONTS[0][1];
- applyView();
- // ⚙ 보기 설정 — 글자 크기·글꼴 (헤더 절약: 팝오버 메뉴로)
- const cfgb=document.getElementById('cfg');cfgb.style.display='';
- const smenu=document.createElement('div');smenu.id='setmenu';
- const fsl=document.createElement('div');fsl.className='lbl';
- fsl.textContent='글자 크기';
- const fsrow=document.createElement('div');fsrow.className='fsrow';
- const bm=document.createElement('button');bm.textContent='A−';
- const bp=document.createElement('button');bp.textContent='A+';
- const fsv=document.createElement('span');
- const showv=()=>fsv.textContent=(window._fs||16)+'px';showv();
- bm.onclick=()=>{setFs((window._fs||16)-2);showv();};
- bp.onclick=()=>{setFs((window._fs||16)+2);showv();};
- fsrow.append(bm,fsv,bp);
- const ffl=document.createElement('div');ffl.className='lbl';
- ffl.textContent='글꼴';
- const ffsel=document.createElement('select');
- FONTS.forEach(([nm,stk])=>{const o=document.createElement('option');
-  o.value=stk;o.textContent=nm;ffsel.appendChild(o);});
- ffsel.value=window._ff;if(ffsel.selectedIndex<0)ffsel.selectedIndex=0;
- ffsel.onchange=()=>setFont(ffsel.value);
- smenu.append(fsl,fsrow,ffl,ffsel);document.body.appendChild(smenu);
- const closeS=()=>smenu.classList.remove('on');
- cfgb.onclick=()=>{if(smenu.classList.contains('on')){closeS();return}
-  const r=cfgb.getBoundingClientRect();
-  smenu.style.top=(r.bottom+4)+'px';
-  smenu.style.right=Math.max(6,innerWidth-r.right)+'px';
-  smenu.classList.add('on');};
- document.addEventListener('click',e=>{
-  if(!smenu.contains(e.target)&&e.target!==cfgb)closeS();},true);
- const hb2=document.getElementById('hpv');hb2.style.display='';
- hb2.onclick=()=>{const pg=D.paras[curIdx()]
-   &&D.paras[curIdx()].page||D.pages[0];
-  if(pg)showPv(pg);};
- // 원문 버튼 — 편집 모드: 원문칸 접기 / 읽기 모드: 번역만 ↔ 원문만 전환
- const sb=document.createElement('button');
- sb.textContent='원문';
- sb.title='편집 모드: 원문(전사) 칸 접기 · 읽기 모드: 번역만 ↔ 원문만 보기 전환';
- mx.after(sb);window._srcBtn=sb;
- sb.onclick=()=>{
-  if(document.body.classList.contains('rdmode')){
-   const on=!document.body.classList.contains('rdsrc');
-   document.body.classList.toggle('rdsrc',on);
-   try{localStorage.setItem('edRdSrc',on?'1':'')}catch(e){}
-   refillRd();}
-  else{const on=document.body.classList.contains('nosrc');
-   document.body.classList.toggle('nosrc',!on);
-   try{localStorage.setItem('edSrcShow',on?'1':'')}catch(e){}}
-  updSrcBtn();};
- document.body.classList.toggle('nosrc',
-   localStorage.getItem('edSrcShow')==='');
- document.body.classList.toggle('rdsrc',
-   localStorage.getItem('edRdSrc')==='1');
- if(document.body.classList.contains('rdmode'))refillRd();
- updSrcBtn();
- try{const pd=JSON.parse(localStorage.getItem(PKEY)||'[]');
-  pd.forEach(([i,d])=>{const o=rows[i];if(!o)return;   // 미전송분 복원
-   if(d.src!==undefined)ssv(+i,d.src);
-   if(d.text!==undefined)stv(+i,d.text);
-   dirty.set(+i,d);o.r.classList.add('dirty');
-   o.rf=false;rdDirty.add(+i);});
-  if(dirty.size&&document.body.classList.contains('rdmode')){
-   rdDirty.forEach(j=>rdFill(j));rdDirty.clear();}}catch(e){}
- window.addEventListener('beforeunload',e=>{
-  if(dirty.size){e.preventDefault();e.returnValue='';}});
- if(dirty.size){upd();cloudQueue(500);}
- st.textContent='☁ 클라우드 검수 — 수정은 자동 저장됩니다';
- initBmk(true);hiCloudPull();}
-if(CLOUD)initCloud();
-else if(SRV)initBmk(false);
-else if(!SRV){st.textContent=
- '파일로 열림 — 저장·재번역은 GUI [편집 페이지] 또는 --edit 로 여세요';
- document.getElementById('exp').disabled=true;}
-upd();
-</script></body></html>
-"""
+# 모바일 검수 UI — edit_ui.html 별도 파일에서 로드.
+# (JS/CSS를 진짜 HTML 파일로 관리 — 편집기 하이라이트·린트·작은 diff.
+#  파이썬 문자열 이스케이프(\\n 등)가 없으므로 JS를 그대로 쓰면 된다.
+#  서빙·업로드 구조는 종전과 동일: 이 문자열이 한 장의 HTML로 나간다.)
+def _load_edit_ui() -> str:
+    p = Path(__file__).parent / "edit_ui.html"
+    try:
+        return p.read_text(encoding="utf-8")
+    except OSError:
+        raise SystemExit(
+            "edit_ui.html이 없습니다 — ebook_translate.py와 같은 폴더에 "
+            "edit_ui.html(모바일 검수 UI 템플릿)을 두세요")
 
 
-def write_edit_html(out: Path) -> Optional[Path]:
-    """_work/book.json + xlat.json → out/edit.html (열 때마다 재생성)."""
+EDIT_HTML = _load_edit_ui()
+
+# 공유 UI 템플릿 — __TITLE__/__DATA__/__GASURL__/__GASKEY__ 자리표시자는 보존.
+# 모바일은 이 템플릿을 GAS에 '한 벌'만 올리고(op:ui), 책은 데이터(JSON)만 올린다.
+# UI_VER가 바뀌면(=코어 UI 수정) PC가 자동으로 새 템플릿을 1회 재업로드한다.
+UI_TEMPLATE = EDIT_HTML.replace("__VER__", __version__)
+UI_VER = _hashlib.md5(UI_TEMPLATE.encode("utf-8")).hexdigest()[:12]
+
+
+def edit_data(out: Path) -> Optional[dict]:
+    """_work/book.json + xlat.json → 검수 UI가 먹는 데이터(dict).
+
+    베이크드 edit.html·모바일 데이터-분리 업로드 공용 단일 소스.
+    schema 필드로 버전을 박아, 나중에 공유 UI가 옛 데이터를 만나도
+    분기·기본값 처리할 수 있게 한다."""
     book = load_book(out)
     if not book:
         return None
     done = load_xlat(out)
-    data = {"title": book.get("title") or "", "paras": book["paras"],
+    return {"title": book.get("title") or "", "paras": book["paras"],
             "pages": book.get("page_labels") or [],
             "fp": book_fingerprint(book), "count": len(book["paras"]),
             "cover": book.get("cover") or "",
+            # 북마크·읽던 위치는 book.json에 보관 — PC·폰 공용
+            "bmks": book.get("bmks") or [],
+            "pos": book.get("pos"),
             "ocr_modes": [["실행 설정", ""]] + [[lb, k]
                                                for lb, k in OCR_MODES],
-            "xlat": {str(k): v for k, v in done.items()}}
-    page = (EDIT_HTML
-            .replace("__VER__", __version__)
-            .replace("__TITLE__", html.escape(data["title"] or "이북"))
-            .replace("__DATA__", json.dumps(data, ensure_ascii=False)
-                     .replace("</", "<\\/")))
+            "xlat": {str(k): v for k, v in done.items()},
+            "schema": SCHEMA_VER}
+
+
+def _fill_ui(title: str, data_json: str) -> str:
+    """공유 UI 템플릿에 제목·데이터 주입 (베이크드/서버 조립 공통 규칙)."""
+    return (UI_TEMPLATE
+            .replace("__TITLE__", html.escape(title or "이북"))
+            .replace("__DATA__", data_json.replace("</", "<\\/")))
+
+
+def write_edit_html(out: Path) -> Optional[Path]:
+    """_work/book.json + xlat.json → out/edit.html (열 때마다 재생성).
+
+    로컬(파일) 열람용 자기완결 스냅샷 — UI가 통째로 구워진다."""
+    data = edit_data(out)
+    if not data:
+        return None
+    page = _fill_ui(data["title"], json.dumps(data, ensure_ascii=False))
     fp = out / "edit.html"
     fp.write_text(page, encoding="utf-8")
     return fp
+
+
+def save_marks(out: Path, bmks=None, pos=None) -> dict:
+    """북마크 목록·읽던 위치를 book.json에 저장 (PC 편집 서버·폰 회수 공용).
+
+    기기 localStorage가 아니라 책 데이터에 두어야 PC·폰 양쪽에서 같이
+    보이고 이어읽기가 된다. 인덱스는 정수·범위 검증(북마크는 정렬·중복 제거).
+    None인 항목은 건드리지 않는다(부분 저장)."""
+    book = load_book(out)
+    if not book:
+        raise RuntimeError("편집 데이터(book.json)가 없습니다")
+    n = len(book["paras"])
+
+    def _idx(v):
+        try:
+            i = int(v)
+        except (TypeError, ValueError):
+            return None
+        return i if 0 <= i < n else None
+
+    if bmks is not None:
+        book["bmks"] = sorted({i for i in (_idx(x) for x in bmks)
+                               if i is not None})
+    if pos is not None:
+        p = _idx(pos)
+        if p is not None:
+            book["pos"] = p
+    work = out / "_work"
+    work.mkdir(parents=True, exist_ok=True)
+    _atomic_json(work / "book.json", book)
+    return {"ok": True, "bmks": book.get("bmks") or [],
+            "pos": book.get("pos")}
+
+
+def save_bookmarks(out: Path, bmks: list) -> dict:
+    """(구 이름 호환) 북마크만 저장."""
+    return save_marks(out, bmks=bmks)
 
 
 def _edit_save(out: Path, edits: list, log) -> dict:
@@ -2786,7 +2057,7 @@ def run_edit_server(cfg: dict, log, is_busy=None) -> Optional[str]:
         def do_POST(self):
             p = self.path.split("?")[0]
             if p not in ("/api/save", "/api/xlat", "/api/export",
-                         "/api/rescan", "/api/cover"):
+                         "/api/rescan", "/api/cover", "/api/marks"):
                 self.send_error(404)
                 return
             if busy["on"] or ext_busy():
@@ -2812,6 +2083,9 @@ def run_edit_server(cfg: dict, log, is_busy=None) -> Optional[str]:
                 elif p == "/api/cover":
                     self._json(_edit_cover(out, req.get("page") or "",
                                            log))
+                elif p == "/api/marks":
+                    self._json(save_marks(out, req.get("bmks"),
+                                          req.get("pos")))
                 else:
                     self._json(_edit_export(out, cfg, log))
             except Exception as e:
@@ -3044,8 +2318,8 @@ def _gui() -> None:
     r = nrow()
     ttk.Label(frm, text="Gemini 모델").grid(row=r, column=0, sticky="w")
     ttk.Combobox(frm, textvariable=v["gemini_model"],
-                 values=["gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
-                         "gemini-3.5-flash"],
+                 values=["gemini-3.6-flash", "gemini-3.1-flash-lite",
+                         "gemini-2.5-flash-lite", "gemini-3.5-flash"],
                  width=22).grid(row=r, column=1, sticky="w", padx=4)
     add_entry("Gemini API 키 (선택)", "gemini_key")
     add_entry("DeepSeek API 키 (선택)", "deepseek_key")

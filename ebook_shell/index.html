@@ -35,7 +35,17 @@ body{font-family:'Malgun Gothic',sans-serif;background:var(--bg);
 #back{position:fixed;right:12px;bottom:calc(14px + env(safe-area-inset-bottom));
  z-index:9;width:44px;height:44px;border-radius:50%;border:0;
  background:rgba(6,78,59,.78);color:#fff;font-size:20px;cursor:pointer;
- box-shadow:0 2px 8px rgba(0,0,0,.25)}
+ box-shadow:0 2px 8px rgba(0,0,0,.25);
+ touch-action:none;-webkit-user-select:none;user-select:none;
+ transition:transform .12s, background .2s}
+#back.flash{transform:scale(1.25);background:var(--acc)}
+/* 길게 누르면 뜨는 모드 안내 말풍선 */
+#fabtip{position:fixed;right:12px;
+ bottom:calc(64px + env(safe-area-inset-bottom));z-index:10;
+ background:rgba(33,36,43,.92);color:#fff;font-size:12px;padding:6px 10px;
+ border-radius:8px;opacity:0;transform:translateY(6px);pointer-events:none;
+ transition:opacity .2s, transform .2s;max-width:70vw}
+#fabtip.on{opacity:1;transform:translateY(0)}
 /* ---- 설정 ---- */
 #setup{padding:calc(26px + env(safe-area-inset-top)) 22px;gap:6px}
 #setup h2{margin:0 0 4px;font-size:19px}
@@ -72,7 +82,8 @@ body{font-family:'Malgun Gothic',sans-serif;background:var(--bg);
 
 <div class="pg" id="view">
  <iframe id="fr" src="about:blank" allow="clipboard-write"></iframe>
- <button id="back" onclick="goHome()" title="서재로">⌂</button>
+ <button id="back" title="탭: 현재 기능 · 길게: 서재 ↔ 원문 보기 전환">⌂</button>
+ <div id="fabtip"></div>
 </div>
 
 <script>
@@ -174,6 +185,7 @@ async function loadList() {
 }
 
 function openBook(b) {
+  edWin = null;                              // 새 책 로드 — 프레임 핸들 재확보 대기
   localStorage.setItem("ebookShellLast", b);
   document.getElementById("fr").src = cfg.url +
     "?book=" + encodeURIComponent(b) + "&key=" + encodeURIComponent(cfg.key);
@@ -181,17 +193,87 @@ function openBook(b) {
 }
 
 function goHome() {
+  edWin = null;
   localStorage.removeItem("ebookShellLast");   // 자동 재진입 해제
   document.getElementById("fr").src = "about:blank";
   loadList();
 }
 
-// 검수 iframe이 편집 카드를 열면 홈(⌂) 버튼을 숨김 — iframe 안 반투명 ✓로 대체
+// ── 떠 있는 홈 버튼(⌂): 길게 누르면 '서재'↔'원문 보기' 기능 전환 ──
+//   탭  = 현재 모드 실행 (서재로 가기 / iframe 검수페이지의 원문 토글)
+//   길게 = 모드 전환 (아이콘 ⌂↔📄, 이 기기에 저장)
+let fabMode = localStorage.getItem("ebookFabMode") === "src" ? "src" : "home";
+let edWin = null;                 // 검수(iframe) 프레임 핸들 — 메시지 되쏠 대상
+const backBtn = document.getElementById("back");
+const fabTip = document.getElementById("fabtip");
+function updFab() {
+  backBtn.textContent = fabMode === "src" ? "文" : "⌂";
+  backBtn.title = fabMode === "src"
+    ? "탭: 원문 보기 전환 · 길게: 서재 버튼으로"
+    : "탭: 서재로 · 길게: 원문 보기 버튼으로";
+}
+function flashTip(msg) {
+  fabTip.textContent = msg;
+  fabTip.classList.add("on");
+  clearTimeout(flashTip._t);
+  flashTip._t = setTimeout(() => fabTip.classList.remove("on"), 1400);
+}
+function toggleFabMode() {
+  fabMode = fabMode === "src" ? "home" : "src";
+  localStorage.setItem("ebookFabMode", fabMode);
+  updFab();
+  backBtn.classList.add("flash");
+  setTimeout(() => backBtn.classList.remove("flash"), 300);
+  if (navigator.vibrate) { try { navigator.vibrate(30); } catch (e) {} }
+  flashTip(fabMode === "src"
+    ? "文 원문 보기 버튼 — 탭하면 원문을 켜고 끕니다"
+    : "⌂ 서재 버튼 — 탭하면 책장으로 돌아갑니다");
+}
+function fabTap() {
+  if (fabMode === "src") {
+    // 검수 프레임이 인사로 알려준 핸들(edWin)로 되쏜다 — GAS 중첩 iframe이라
+    // fr.contentWindow(래퍼)로는 안 닿는다. 폴백으로 래퍼에도 한 번 보냄.
+    const wrap = document.getElementById("fr").contentWindow;
+    if (edWin || wrap)
+      (edWin || wrap).postMessage({ebook: "shell", cmd: "srcToggle"}, "*");
+    if (!edWin)
+      flashTip("원문 준비 중 — 책이 다 열린 뒤 다시 눌러 주세요");
+  } else {
+    goHome();
+  }
+}
+let holdTimer = null, didLong = false;
+backBtn.addEventListener("pointerdown", () => {
+  didLong = false;
+  holdTimer = setTimeout(() => { didLong = true; toggleFabMode(); }, 500);
+});
+["pointerup", "pointerleave", "pointercancel"].forEach(ev =>
+  backBtn.addEventListener(ev, () => clearTimeout(holdTimer)));
+backBtn.addEventListener("click", () => {
+  if (didLong) { didLong = false; return; }   // 길게 누른 직후의 클릭은 무시
+  fabTap();
+});
+backBtn.addEventListener("contextmenu", e => e.preventDefault());
+updFab();
+
+// 검수 iframe에서 오는 메시지 처리:
+//  - edhello/ed: 그 프레임 핸들(e.source)을 저장 → 원문 토글을 되쏠 대상
+//  - ed(편집 카드 열림): 홈 버튼 숨김 (iframe 안 반투명 ✓로 대체)
 addEventListener("message", e => {
   const d = e.data;
-  if (!d || d.ebook !== "ed") return;
-  const back = document.getElementById("back");
-  if (back) back.style.display = d.on ? "none" : "";
+  if (!d || !d.ebook) return;
+  if (d.ebook === "home") {                       // 검수 헤더의 ⌂ 책장 버튼
+    // 처리했음을 알림 — ack가 없으면 검수 페이지가 자체 폴백으로 이동한다
+    try { if (e.source) e.source.postMessage({ebook: "homeack"}, "*"); }
+    catch (err) {}
+    goHome(); return;
+  }
+  if (d.ebook !== "ed" && d.ebook !== "edhello") return;
+  edWin = e.source;
+  if (d.ebook === "ed") {
+    const back = document.getElementById("back");
+    if (back) back.style.display = d.on ? "none" : "";
+  }
 });
 
 if ("serviceWorker" in navigator)

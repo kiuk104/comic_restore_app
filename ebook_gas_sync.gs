@@ -29,6 +29,8 @@
  *   get    : 수정 큐 반환 (PC [☁ 모바일 수정 반영])
  *   clear  : 반영 완료 후 큐 비움 (fp 일치할 때만)
  *   state  : 읽던 위치 저장 (뷰어 확장 예약)
+ *   hi     : 하이라이트 공유 저장/조회
+ *   bmk    : 북마크 공유 저장/조회 (PC book.json과 연동)
  *   icon   : 홈 화면 아이콘 업로드 (PC가 1회 전송 → 공개 링크로 파비콘)
  *   list   : 책 목록+진행 정보 {name,count,pos,pending} (PWA 셸 서재용)
  */
@@ -39,6 +41,11 @@ var FOLDER = 'ebook_review_sync';
 // ---------------------------------------------------------------- 유틸
 function _san(b) {
   return String(b || '').replace(/[\\\/:*?"<>|]/g, '_').trim();
+}
+
+function _htmlesc(s) {                    // 제목 주입용 최소 이스케이프
+  return String(s || '').replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 var _FCACHE = null;                      // 실행 1회만 폴더 조회(왕복 절감)
@@ -67,7 +74,8 @@ function _write(name, text) {
 function _readq(book) {
   var f = _find(book + '_edits.json');
   var d = {v: 1, fp: null, count: null, edits: {},
-           snap_fp: null, snap_count: null, state: null, hi: null};
+           snap_fp: null, snap_count: null, state: null, hi: null,
+           bmk: null};
   if (!f) return d;
   try {
     var q = JSON.parse(f.getBlob().getDataAsString('UTF-8'));
@@ -132,10 +140,13 @@ function handleOp(q) {
       var hit = cache.get('list');
       if (hit) { try { return JSON.parse(hit); } catch (e) {} }
     }
-    var names = [], lfs = _folder().getFiles();
+    var names = [], seen = {}, lfs = _folder().getFiles();
     while (lfs.hasNext()) {
-      var lnm = lfs.next().getName();
-      if (lnm.slice(-5) === '.html') names.push(lnm.slice(0, -5));
+      var lnm = lfs.next().getName(), bn = null;
+      if (lnm.charAt(0) === '_') continue;              // _ui.html 등 시스템 파일 제외
+      if (lnm.slice(-5) === '.html') bn = lnm.slice(0, -5);
+      else if (lnm.slice(-10) === '.data.json') bn = lnm.slice(0, -10);  // 데이터-분리 책
+      if (bn && !seen[bn]) { seen[bn] = 1; names.push(bn); }
     }
     names.sort();
     var info = [];                       // 책별 진행 정보 (서재 표시용)
@@ -150,10 +161,21 @@ function handleOp(q) {
     if (cache) { try { cache.put('list', JSON.stringify(res), 45); } catch (e) {} }
     return res;
   }
+  if (q.op === 'ui') {                    // 공유 편집 UI 템플릿 저장/버전 조회
+    if (q.html !== undefined) {           // 업로드(코어 UI가 바뀔 때 1회)
+      _write('_ui.html', q.html);
+      _write('_ui.ver', String(q.ver || ''));
+      _bust();
+      return {ok: true, ver: String(q.ver || '')};
+    }
+    var vf = _find('_ui.ver');            // 버전 조회 — 같으면 재업로드 불필요
+    var cur = vf ? vf.getBlob().getDataAsString('UTF-8') : '';
+    return {ok: true, have: (cur === String(q.ver || '') && !!_find('_ui.html'))};
+  }
   var book = _san(q.book);
   if (!book) return {err: 'book(책 제목) 누락'};
 
-  if (q.op === 'upload') {
+  if (q.op === 'upload') {               // (구) 베이크드 업로드 — 하위호환 유지
     _write(book + '.html', q.html || '');
     var e = _readq(book);
     e.snap_fp = (q.snap_fp === undefined) ? null : q.snap_fp;
@@ -161,6 +183,18 @@ function handleOp(q) {
     if (q.clear_edits) { e.edits = {}; e.fp = null; e.count = null; }
     _writeq(book, e); _bust();
     return {ok: true, icon: !!_find('icon.png')};
+  }
+  if (q.op === 'putdata') {              // (신) 데이터-분리 업로드 — 책 데이터만
+    _write(book + '.data.json', q.data || '');
+    var ed = _readq(book);
+    ed.snap_fp = (q.snap_fp === undefined) ? null : q.snap_fp;
+    ed.snap_count = (q.snap_count === undefined) ? null : q.snap_count;
+    if (q.clear_edits) { ed.edits = {}; ed.fp = null; ed.count = null; }
+    _writeq(book, ed);
+    var oldh = _find(book + '.html');    // 옛 베이크드 있으면 제거 → 데이터 경로로 전환
+    if (oldh) oldh.setTrashed(true);
+    _bust();
+    return {ok: true, ui: !!_find('_ui.html'), icon: !!_find('icon.png')};
   }
   if (q.op === 'edits') {
     var e = _readq(book);
@@ -197,6 +231,11 @@ function handleOp(q) {
     if (q.set !== undefined) { e.hi = q.set; _writeq(book, e); }
     return {ok: true, hi: e.hi};          // null=기록없음(최초), {}=비운 것
   }
+  if (q.op === 'bmk') {                   // 북마크 공유 저장/조회 (PC와 연동)
+    var e = _readq(book);
+    if (q.set !== undefined) { e.bmk = q.set; _writeq(book, e); _bust(); }
+    return {ok: true, bmk: (e.bmk === undefined ? null : e.bmk)};
+  }
   return {err: '알 수 없는 op: ' + q.op};
 }
 
@@ -223,15 +262,28 @@ function doGet(e) {
   if (p.api === 'edits') return _json(_readq(_san(p.book)));
 
   if (p.book) {                          // 검수 페이지 서빙
-    var f = _find(_san(p.book) + '.html');
-    if (!f)
-      return ContentService.createTextOutput(
-        '스냅샷이 없습니다 — PC 이북 앱에서 [☁ 업로드]를 먼저 하세요');
-    var html = f.getBlob().getDataAsString('UTF-8')
-      .split('__GASURL__').join(ScriptApp.getService().getUrl())
-      .split('__GASKEY__').join(p.key);
+    var bkn = _san(p.book), html = null;
+    var dataF = _find(bkn + '.data.json');
+    if (dataF) {                         // (신) 데이터-분리: 공유 UI + 데이터 조립
+      var uiF = _find('_ui.html');
+      if (!uiF)
+        return ContentService.createTextOutput(
+          '공유 편집 UI가 아직 업로드되지 않았습니다 — PC 이북 앱에서 다시 [☁ 업로드]하세요');
+      var dataStr = dataF.getBlob().getDataAsString('UTF-8').split('</').join('<\\/');
+      html = uiF.getBlob().getDataAsString('UTF-8')
+        .split('__TITLE__').join(_htmlesc(bkn))
+        .split('__DATA__').join(dataStr);
+    } else {                             // (구) 베이크드 스냅샷 — 하위호환
+      var f = _find(bkn + '.html');
+      if (!f)
+        return ContentService.createTextOutput(
+          '스냅샷이 없습니다 — PC 이북 앱에서 [☁ 업로드]를 먼저 하세요');
+      html = f.getBlob().getDataAsString('UTF-8');
+    }
+    html = html.split('__GASURL__').join(ScriptApp.getService().getUrl())
+               .split('__GASKEY__').join(p.key);
     return _app(HtmlService.createHtmlOutput(html)
-      .setTitle(_san(p.book) + ' — 검수')
+      .setTitle(bkn + ' — 검수')
       .addMetaTag('viewport', 'width=device-width, initial-scale=1'));
   }
 
@@ -242,15 +294,17 @@ function doGet(e) {
              'initial-scale=1"><title>이북 검수 목록</title></head>',
              '<body style="font-family:sans-serif;padding:24px 20px;',
              'font-size:17px;line-height:2.2"><h3>📚 검수 목록</h3>'];
-  var fs = _folder().getFiles(), n = 0;
+  var fs = _folder().getFiles(), n = 0, seen2 = {};
   while (fs.hasNext()) {
-    var f2 = fs.next(), nm = f2.getName();
-    if (nm.slice(-5) !== '.html') continue;
-    n++;
-    var t = nm.slice(0, -5);
+    var f2 = fs.next(), nm = f2.getName(), t = null;
+    if (nm.charAt(0) === '_') continue;
+    if (nm.slice(-5) === '.html') t = nm.slice(0, -5);
+    else if (nm.slice(-10) === '.data.json') t = nm.slice(0, -10);
+    if (!t || seen2[t]) continue;
+    seen2[t] = 1; n++;
     out.push('<p><a target="_top" href="' + url + '?book='
              + encodeURIComponent(t) + '&key=' + encodeURIComponent(p.key)
-             + '">' + t + '</a></p>');
+             + '">' + _htmlesc(t) + '</a></p>');
   }
   if (!n) out.push('<p>아직 업로드된 책이 없습니다 — PC에서 [☁ 업로드]</p>');
   out.push('</body></html>');

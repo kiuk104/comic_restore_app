@@ -31,38 +31,57 @@ import comic_retype_pipeline as retype    # noqa: E402
 
 CONFIG_PATH = core.CONFIG_PATH
 RECENTS_PATH = CONFIG_PATH.parent / "ebook_recents.json"   # 최근 작업·즐겨찾기
-WINSIZE_PATH = CONFIG_PATH.parent / "ebook_winsize.json"   # 창 크기 기억
+WINSIZE_PATH = CONFIG_PATH.parent / "ebook_winsize.json"   # 창 크기·위치 기억
 _winsize_timer = None
+_GEOM = {}                                      # 최신 창 기하(w,h,x,y)
 
 
-def _load_winsize() -> tuple:
+def _load_geom() -> tuple:
+    """저장된 창 크기·위치 복원. 위치가 없거나 화면 밖이면 None(중앙 배치)."""
     try:
         d = json.loads(WINSIZE_PATH.read_text(encoding="utf-8"))
-        w = max(560, min(int(d.get("w", 760)), 3200))
-        h = max(560, min(int(d.get("h", 780)), 2400))
-        return w, h
     except Exception:
-        return 760, 780
+        d = {}
+    w = max(560, min(int(d.get("w") or 760), 3200))
+    h = max(560, min(int(d.get("h") or 780), 2400))
+
+    def _coord(v):
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return None
+        return v if -3000 <= v <= 8000 else None    # 모니터 분리 등 대비(대략)
+    return w, h, _coord(d.get("x")), _coord(d.get("y"))
 
 
-def _write_winsize(w, h) -> None:
+def _write_geom() -> None:
     try:
-        WINSIZE_PATH.write_text(
-            json.dumps({"w": int(w), "h": int(h)}), encoding="utf-8")
+        if _GEOM.get("w"):
+            WINSIZE_PATH.write_text(json.dumps(_GEOM), encoding="utf-8")
     except Exception:
         pass
 
 
-def _save_winsize(w, h) -> None:                # 리사이즈 폭주 → 디바운스 저장
+def _debounce_geom() -> None:                   # 리사이즈·이동 폭주 → 디바운스 저장
     global _winsize_timer
     try:
         if _winsize_timer:
             _winsize_timer.cancel()
-        _winsize_timer = threading.Timer(0.4, _write_winsize, args=(w, h))
+        _winsize_timer = threading.Timer(0.4, _write_geom)
         _winsize_timer.daemon = True
         _winsize_timer.start()
     except Exception:
         pass
+
+
+def _on_resized(w, h):
+    _GEOM["w"], _GEOM["h"] = int(w), int(h)
+    _debounce_geom()
+
+
+def _on_moved(x, y):
+    _GEOM["x"], _GEOM["y"] = int(x), int(y)
+    _debounce_geom()
 # 최근 항목에 담을 필드 (키·비밀 제외 — 폴더/제목/엔진만 복원)
 _RECENT_KEYS = ("src", "title", "source_lang", "ocr", "backend", "glossary",
                 "page_range", "claude_model", "gemini_model",
@@ -181,7 +200,7 @@ class Api:
             "backends": [{"label": lb, "key": k}
                          for lb, k in core.BACKENDS],
             "claude_models": ["claude-sonnet-4-5", "claude-haiku-4-5"],
-            "gemini_models": ["gemini-3.1-flash-lite",
+            "gemini_models": ["gemini-3.6-flash", "gemini-3.1-flash-lite",
                               "gemini-2.5-flash-lite", "gemini-3.5-flash"],
             "kimi_models": ["kimi-k2.5", "kimi-k2.6"],
             "recents": self.list_recents(),
@@ -340,6 +359,25 @@ class Api:
         threading.Thread(target=worker, daemon=True).start()
         return {"ok": True}
 
+    def redo(self, cfg: dict, mode: str):
+        """엔진을 바꿔 다시 실행 — mode 'xlat'(번역만) / 'all'(전사부터).
+
+        기존 결과는 삭제하지 않고 _work/redo_타임스탬프/ 로 백업한 뒤,
+        지금 화면에 선택된 전사/번역 엔진 설정으로 일반 실행을 시작한다."""
+        if self._state["running"]:
+            return {"err": "이미 실행 중입니다."}
+        if mode not in ("xlat", "all"):
+            return {"err": f"알 수 없는 다시 실행 모드: {mode}"}
+        c = normalize_cfg(cfg)
+        if not c.get("src"):
+            return {"err": "소스 폴더 또는 PDF를 지정하세요."}
+        try:
+            out, _t = core.resolve_out(c)
+            core.redo_reset(out, mode, self._log)
+        except Exception as e:
+            return {"err": f"다시 실행 준비 실패: {e}"}
+        return self.start(cfg)
+
     def stop(self):
         self._state["cancel"] = True
         return True
@@ -412,19 +450,36 @@ class Api:
         return out
 
     def _push_c(self, c: dict) -> str:
-        """스냅샷(edit.html) 업로드 — cloud_push·완료 자동 업로드 공용."""
+        """책 데이터 업로드 — cloud_push·완료 자동 업로드 공용.
+
+        (신) 공유 UI 1벌 + 책 데이터(JSON)만 분리 업로드 → UI 갱신에 책 재업로드
+        불필요. 동기화 서버(GAS)가 구버전이라 신 op를 모르면 (구) 베이크드
+        업로드로 자동 폴백해 그대로 동작한다."""
         out, title = core.resolve_out(c)
-        fp = core.write_edit_html(out)
-        if not fp:
+        data = core.edit_data(out)
+        if not data:
             raise RuntimeError("업로드할 편집 데이터가 없습니다 — "
                                "[▶ 번역 시작]으로 전사·병합 후 다시 시도")
-        book = core.load_book(out)
-        bk = book.get("title") or title
-        r = self._gas_call(c, {
-            "op": "upload", "book": bk,
-            "html": fp.read_text(encoding="utf-8"),
-            "snap_fp": core.book_fingerprint(book),
-            "snap_count": len(book["paras"])})
+        bk = data["title"] or title
+        snap = {"snap_fp": data["fp"], "snap_count": data["count"]}
+        try:                             # (신) 데이터-분리
+            u = self._gas_call(c, {"op": "ui", "ver": core.UI_VER})
+            if not (u or {}).get("have"):
+                self._gas_call(c, {"op": "ui", "ver": core.UI_VER,
+                                   "html": core.UI_TEMPLATE})
+                self._log("☁ 공유 편집 UI 업데이트 — 이후 UI 변경은 책 "
+                          "재업로드 없이 모든 책에 적용됩니다")
+            r = self._gas_call(c, dict(
+                snap, op="putdata", book=bk, schema=core.SCHEMA_VER,
+                data=json.dumps(data, ensure_ascii=False)))
+        except RuntimeError as e:        # 구 GAS(op 미지원) → 베이크드 폴백
+            if "알 수 없는 op" not in str(e):
+                raise
+            self._log("(동기화 서버가 구버전이라 베이크드 방식으로 업로드합니다 "
+                      "— 최신 이점(공유 UI)을 쓰려면 GAS를 재배포하세요)")
+            fp = core.write_edit_html(out)
+            r = self._gas_call(c, dict(snap, op="upload", book=bk,
+                                       html=fp.read_text(encoding="utf-8")))
         if not (r or {}).get("icon"):    # 홈 화면 아이콘 1회 전송
             try:
                 ic = Path(__file__).parent / "ebook_mobile_icon.png"
@@ -454,6 +509,46 @@ class Api:
         except Exception as e:
             return {"err": str(e)}
 
+    def _pull_marks(self, c: dict, out, bk: str, book: dict, q: dict,
+                    quiet: bool = False) -> None:
+        """폰의 북마크·읽던 위치를 book.json으로 회수 (PC 뷰어와 공유).
+
+        수정분(edits)과 별개 저장소라 수정이 없어도 매번 확인한다.
+        q = 이미 받아둔 op:'get' 응답(state.pos 재사용 — 왕복 절감).
+        구버전 GAS(bmk op 없음)면 조용히 넘어간다."""
+        bmks = pos = None
+        try:
+            r = self._gas_call(c, {"op": "bmk", "book": bk})
+            cloud = (r or {}).get("bmk")
+            if isinstance(cloud, list):
+                cur = book.get("bmks") or []
+                if sorted({int(x) for x in cloud}) != sorted(
+                        {int(x) for x in cur}):
+                    bmks = cloud
+        except Exception:
+            pass
+        try:
+            sp = ((q or {}).get("state") or {}).get("pos")
+            if sp is not None and int(sp) != (book.get("pos")
+                                             if book.get("pos") is not None
+                                             else -1):
+                pos = int(sp)
+        except Exception:
+            pass
+        if bmks is None and pos is None:
+            return
+        try:
+            r2 = core.save_marks(out, bmks, pos)
+            if not quiet:
+                bits = []
+                if bmks is not None:
+                    bits.append(f"북마크 {len(r2['bmks'])}개")
+                if pos is not None:
+                    bits.append(f"읽던 위치 #{pos + 1}")
+                self._log("☁ 폰 " + " · ".join(bits) + " 반영")
+        except Exception:
+            pass                       # 실패가 수정분 반영을 막지 않게
+
     def _pull_c(self, c: dict, quiet: bool = False) -> dict:
         """폰 수정 큐 → fp 검증 → 반영 → 큐 비움 → 새 스냅샷 재업로드.
         수동(cloud_pull)·자동(_autopull_loop) 공용. 수정 없으면 재업로드 안 함."""
@@ -463,6 +558,8 @@ class Api:
             raise RuntimeError("편집 데이터(book.json)가 없습니다.")
         bk = book.get("title") or title
         q = self._gas_call(c, {"op": "get", "book": bk})
+        # 북마크·읽던 위치는 수정분과 별개 저장소 — 수정이 없어도 매번 회수
+        self._pull_marks(c, out, bk, book, q, quiet)
         if not (q or {}).get("edits"):
             if not quiet:
                 self._log("☁ 폰 수정분이 없습니다")
@@ -718,6 +815,12 @@ WEB_HTML = r"""<!doctype html>
   title="검수 페이지를 동기화 서버(Drive)에 업로드 — 폰에서 열람·수정">☁ 업로드</button>
  <button id="b_pull" onclick="doPull()"
   title="폰 수정분을 내려받아 반영하고 새 스냅샷을 재업로드">☁ 수정 반영</button>
+ <button id="b_redo_x" onclick="doRedo('xlat')"
+  title="지금 선택된 번역 엔진으로 전체를 다시 번역합니다 — 원문(전사·수동 수정)은
+그대로 유지, 기존 번역은 _work/redo_…/에 백업됩니다">⟲ 번역만 다시</button>
+ <button id="b_redo_a" onclick="doRedo('all')"
+  title="지금 선택된 전사 방식으로 처음부터 다시 전사·번역합니다 — 원문 수동 수정과
+번역이 모두 백업 후 초기화되고, 모바일 검수 기준(fp)도 새로 시작됩니다">⟲ 전사부터 다시</button>
  <span class="hint">같은 출력 폴더로 다시 실행하면 이어서 합니다</span>
 </div>
 
@@ -822,12 +925,23 @@ function updSummary(){
     const c = collectCfg();
     const lb = id => ($(id).selectedOptions[0] || {textContent:""})
       .textContent.split(" (")[0];
+    const om = modelOf($("c_ocr").value), bm = modelOf($("c_backend").value);
     const parts = [lb("c_source_lang"),
-                   "전사 " + lb("c_ocr"), "번역 " + lb("c_backend")];
+                   "전사 " + lb("c_ocr") + (om ? " (" + om + ")" : ""),
+                   "번역 " + lb("c_backend") + (bm ? " (" + bm + ")" : "")];
     if (c.page_range) parts.push("범위 " + c.page_range);
     $("summary").textContent = "이번 실행 설정:  " + parts.join(" · ");
   }catch(e){}
   updateEngineUI();
+}
+
+// 엔진 키 → 그 엔진이 실제로 쓸 모델명 (해당 모델 셀렉트 값). 로컬 OCR은 "".
+function modelOf(key){
+  const id = {claude:"c_claude_model", gemini:"c_gemini_model",
+              deepseek:"c_deepseek_model", kimi:"c_kimi_model",
+              ollama:"c_ollama_model"}[key];
+  const el = id && $(id);
+  return el ? (el.value || "").trim() : "";
 }
 
 // ── 전사/번역 엔진 선택에 따라 쓰이는 모델·키 블록만 표시 ──
@@ -854,7 +968,8 @@ function updateEngineUI(){
   const local = !["claude", "gemini", "deepseek"].includes(eng);
   $("hint_ocr").textContent = local
     ? "로컬 엔진 — 모델·API 키 불필요 (무료, 인쇄 스캔에 적합)"
-    : "→ 아래 " + engName + " 블록의 모델·키를 사용합니다";
+    : "→ " + engName + " · 모델 " + (modelOf(eng) || "?")
+      + " (아래 '엔진별 모델·API 키' 탭에서 변경)";
   const beName = {claude:"Claude", gemini:"Gemini",
                   kimi:"Kimi", ollama:"Ollama"}[be] || be;
   let hx;
@@ -867,8 +982,26 @@ function updateEngineUI(){
     hx = "Claude가 이미지에서 전사+번역을 처리합니다";
   else
     hx = "전사된 원문을 " + beName + "가 텍스트로 번역합니다";
+  hx += " · 번역 모델 " + (modelOf(be) || "?");
   hx += " · 끝나면 파트별 예상 요금 표시";
   $("hint_xlat").textContent = hx;
+  decorateEngineSelect();
+}
+
+// 전사/번역 엔진 드롭다운의 각 옵션 텍스트에 그 엔진이 쓸 모델명을 덧붙여
+// 선택칸에서 바로 보이게 한다 (INIT 원본 라벨 기준이라 반복 호출해도 누적 X).
+function decorateEngineSelect(){
+  const deco = (id, list) => {
+    const sel = $(id);
+    if (!sel || !list) return;
+    for (const o of sel.options){
+      const base = (list.find(x => x.key === o.value) || {}).label || o.value;
+      const m = modelOf(o.value);
+      o.text = base + (m ? "  ·  " + m : "");
+    }
+  };
+  deco("c_ocr", INIT.ocr_modes);
+  deco("c_backend", INIT.backends);
 }
 
 async function pickSrcDir(){
@@ -962,6 +1095,26 @@ async function doStart(){
   if (r && r.err) alert(r.err);
   else refreshRecents();
 }
+// 엔진 바꿔 다시 실행 — 실수 방지로 '한 번 더 누르면 실행' 2단계 확인
+// (웹뷰 confirm() 의존 없이 동작. 3.5초 안에 다시 누르면 진행)
+const _redoArm = {};
+async function doRedo(mode){
+  const b = $(mode === "xlat" ? "b_redo_x" : "b_redo_a");
+  if (!_redoArm[mode]){
+    _redoArm[mode] = b.textContent;
+    b.textContent = "⚠ 한 번 더 누르면 실행";
+    b.style.borderColor = "#c04545"; b.style.color = "#c04545";
+    setTimeout(() => { if (_redoArm[mode]){
+      b.textContent = _redoArm[mode]; b.style.borderColor = ""; b.style.color = "";
+      _redoArm[mode] = null; } }, 3500);
+    return;
+  }
+  b.textContent = _redoArm[mode]; b.style.borderColor = ""; b.style.color = "";
+  _redoArm[mode] = null;
+  const r = await api().redo(collectCfg(), mode);
+  if (r && r.err) alert(r.err);
+  else refreshRecents();
+}
 async function doEdit(){
   const r = await api().open_edit(collectCfg());
   if (r && r.err) alert(r.err);
@@ -1049,44 +1202,74 @@ window.addEventListener("pywebviewready", boot);
 
 
 def _set_win_icon(title: str, ico: Path) -> None:
-    """Windows 한정 — 아이콘 + 제목줄 색을 앱 테마(라이트)와 통일.
+    """Windows 한정 — 창 아이콘(제목줄+작업표시줄)을 초록 책 아이콘으로 통일.
 
     pywebview는 Windows(EdgeChromium)에서 icon 인자를 지원하지 않아
-    WM_SETICON으로 직접 지정한다. 제목줄은 Windows 11의
-    DWMWA_CAPTION_COLOR로 본문 배경(#f4f5f7)과 같은 밝은 색으로 —
-    Windows 10 이하는 미지원이라 호출이 조용히 무시된다.
+    WM_SETICON으로 직접 지정한다. 64비트 파이썬에서 ctypes 기본 반환형은
+    c_int(32비트)라 아이콘 핸들(포인터)이 잘려 잘못된 아이콘/기본 아이콘으로
+    보이는 문제가 있어 restype/argtypes를 반드시 c_void_p로 지정한다.
+    작업표시줄 아이콘은 창 아이콘과 별개(클래스 아이콘)라 SetClassLongPtr로
+    같이 지정하고, 웹뷰 호스트가 나중에 덮어쓰는 경우가 있어 잠깐 반복 적용한다.
+    제목줄 색은 사용자 선택대로 '밝은 바'를 유지(Windows 11에서만 적용, 10은 무시).
     """
     if sys.platform != "win32":
         return
     import ctypes
     import time
+    from ctypes import wintypes
     u32 = ctypes.windll.user32
-    WM_SETICON, LR_LOADFROMFILE, IMAGE_ICON = 0x80, 0x10, 1
-    for _ in range(40):                    # 창 생성까지 최대 ~4초 대기
+    WM_SETICON = 0x80
+    ICON_SMALL, ICON_BIG = 0, 1
+    LR_LOADFROMFILE, IMAGE_ICON = 0x10, 1
+    GCLP_HICON, GCLP_HICONSM = -14, -34
+    # ★ 64비트 핸들이 잘리지 않게 반환형/인자형을 포인터로 지정 (핵심 수정)
+    u32.FindWindowW.restype = wintypes.HWND
+    u32.LoadImageW.restype = wintypes.HANDLE
+    u32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR,
+                               wintypes.UINT, ctypes.c_int, ctypes.c_int,
+                               wintypes.UINT]
+    u32.SendMessageW.restype = ctypes.c_void_p
+    u32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                 ctypes.c_void_p, ctypes.c_void_p]
+    setcls = getattr(u32, "SetClassLongPtrW", None) or u32.SetClassLongW
+    setcls.restype = ctypes.c_void_p
+    setcls.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+
+    hwnd = None
+    for _ in range(60):                    # 창 생성까지 최대 ~6초 대기
         hwnd = u32.FindWindowW(None, title)
         if hwnd:
-            if ico.exists():
-                for big, size in ((0, 16), (1, 32)):
-                    h = u32.LoadImageW(None, str(ico), IMAGE_ICON,
-                                       size, size, LR_LOADFROMFILE)
-                    if h:
-                        u32.SendMessageW(hwnd, WM_SETICON, big, h)
-            try:   # 제목줄을 라이트 테마 색으로 (Windows 11 22000+)
-                dwm = ctypes.windll.dwmapi
-                DWMWA_CAPTION_COLOR = 35
-                DWMWA_TEXT_COLOR = 36
-                cap = ctypes.c_uint(0x00F7F5F4)    # #f4f5f7 (COLORREF BGR)
-                txt = ctypes.c_uint(0x002B2421)    # #21242b
-                dwm.DwmSetWindowAttribute(hwnd, DWMWA_CAPTION_COLOR,
-                                          ctypes.byref(cap),
-                                          ctypes.sizeof(cap))
-                dwm.DwmSetWindowAttribute(hwnd, DWMWA_TEXT_COLOR,
-                                          ctypes.byref(txt),
-                                          ctypes.sizeof(txt))
-            except OSError:
-                pass
-            return
+            break
         time.sleep(0.1)
+    if not hwnd:
+        return
+
+    try:   # 제목줄을 밝은 테마 색으로 유지 (Windows 11 22000+; 10은 조용히 무시)
+        dwm = ctypes.windll.dwmapi
+        cap = ctypes.c_uint(0x00F7F5F4)    # #f4f5f7 (COLORREF BGR)
+        txt = ctypes.c_uint(0x002B2421)    # #21242b
+        dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(cap), 4)
+        dwm.DwmSetWindowAttribute(hwnd, 36, ctypes.byref(txt), 4)
+    except OSError:
+        pass
+
+    if not ico.exists():
+        return
+    hsm = u32.LoadImageW(None, str(ico), IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+    hbg = u32.LoadImageW(None, str(ico), IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
+    if not (hsm or hbg):
+        return
+    for _ in range(6):                     # 웹뷰가 늦게 덮어써도 우리 아이콘이 이기게
+        if hsm:
+            u32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hsm)
+        if hbg:
+            u32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hbg)
+        try:                               # 작업표시줄(클래스) 아이콘도 동일하게
+            setcls(hwnd, GCLP_HICONSM, hsm or hbg)
+            setcls(hwnd, GCLP_HICON, hbg or hsm)
+        except OSError:
+            pass
+        time.sleep(0.3)
 
 
 def main() -> int:
@@ -1097,13 +1280,35 @@ def main() -> int:
         return 1
     api = Api()
     title = f"스캔 이북 한글 번역 v{core.__version__} — 웹앱"
-    w0, h0 = _load_winsize()                     # 지난 창 크기 복원
-    win = webview.create_window(
-        title, html=WEB_HTML, js_api=api,
-        width=w0, height=h0, background_color="#f4f5f7")
+    w0, h0, x0, y0 = _load_geom()                # 지난 창 크기·위치 복원
+    _GEOM.update(w=w0, h=h0)
+    kw = dict(width=w0, height=h0, background_color="#f4f5f7")
+    if x0 is not None and y0 is not None:        # 저장된 위치가 있으면 그 자리에
+        kw["x"], kw["y"] = x0, y0
+        _GEOM["x"], _GEOM["y"] = x0, y0
+    win = webview.create_window(title, html=WEB_HTML, js_api=api, **kw)
     api._window = win
-    try:                                          # 리사이즈 시 크기 기억
-        win.events.resized += _save_winsize
+    try:                                          # 리사이즈·이동 시 기억(디바운스)
+        win.events.resized += _on_resized
+    except Exception:
+        pass
+    try:
+        win.events.moved += _on_moved
+    except Exception:
+        pass
+
+    def _persist_on_close():                      # 닫힐 때 최종 기하 확정 저장
+        try:                                      # (이벤트 미지원·디바운스 유실 대비)
+            for attr, key in (("width", "w"), ("height", "h"),
+                              ("x", "x"), ("y", "y")):
+                v = getattr(win, attr, None)
+                if isinstance(v, (int, float)):
+                    _GEOM[key] = int(v)
+        except Exception:
+            pass
+        _write_geom()
+    try:
+        win.events.closing += _persist_on_close
     except Exception:
         pass
     ico = Path(__file__).parent / "ebook_web_icon.ico"
