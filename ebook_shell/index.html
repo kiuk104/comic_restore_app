@@ -81,7 +81,10 @@ body{font-family:'Malgun Gothic',sans-serif;background:var(--bg);
 </div>
 
 <div class="pg" id="view">
- <iframe id="fr" src="about:blank" allow="clipboard-write"></iframe>
+ <!-- screen-wake-lock·autoplay는 기본 허용 범위가 'self'라 크로스오리진
+      iframe(GAS 검수 페이지)에 명시적으로 넘겨줘야 '화면 꺼짐 방지'가 산다 -->
+ <iframe id="fr" src="about:blank"
+   allow="clipboard-write; screen-wake-lock; autoplay"></iframe>
  <button id="back" title="탭: 현재 기능 · 길게: 서재 ↔ 원문 보기 전환">⌂</button>
  <div id="fabtip"></div>
 </div>
@@ -131,9 +134,10 @@ function renderBooks(d, fromCache) {
     let sub = "";
     if (it.count) {
       if (it.pos != null) {
+        const pn = Math.floor(it.pos);  // pos는 소수(문단+비율)일 수 있음
         const pct = Math.min(100,
-          Math.round((it.pos + 1) / it.count * 100));
-        sub = "🔖 #" + (it.pos + 1) + "까지 검수 / " + it.count
+          Math.round((pn + 1) / it.count * 100));
+        sub = "🔖 #" + (pn + 1) + "까지 검수 / " + it.count
             + "문단 (" + pct + "%)";
       } else sub = it.count + "문단 · 북마크 없음";
     }
@@ -186,6 +190,7 @@ async function loadList() {
 
 function openBook(b) {
   edWin = null;                              // 새 책 로드 — 프레임 핸들 재확보 대기
+  wkSet(false);                              // 새 책이 다시 요청할 때까지 해제
   localStorage.setItem("ebookShellLast", b);
   document.getElementById("fr").src = cfg.url +
     "?book=" + encodeURIComponent(b) + "&key=" + encodeURIComponent(cfg.key);
@@ -194,10 +199,35 @@ function openBook(b) {
 
 function goHome() {
   edWin = null;
+  wkSet(false);                                // 화면 꺼짐 방지도 해제
   localStorage.removeItem("ebookShellLast");   // 자동 재진입 해제
   document.getElementById("fr").src = "about:blank";
   loadList();
 }
+
+// ── 화면 꺼짐 방지 '대리' ──────────────────────────────────────────────
+//   검수 페이지는 GAS가 크로스오리진 중첩 iframe으로 서빙해서
+//   screen-wake-lock(기본 허용 범위 'self')이 막힌다. 셸은 최상위 문서라
+//   자기 출처로 잡을 수 있으니, 검수 페이지의 요청을 받아 대신 걸어 준다.
+let wkLock = null, wkWant = false;
+function wkSupported() { return !!(navigator.wakeLock && navigator.wakeLock.request); }
+async function wkApply() {
+  if (wkWant && document.visibilityState === "visible") {
+    if (wkLock) return true;
+    try {
+      wkLock = await navigator.wakeLock.request("screen");
+      wkLock.addEventListener("release", () => {   // OS가 놓으면 다시 잡는다
+        wkLock = null;
+        if (wkWant) setTimeout(wkApply, 400);
+      });
+      return true;
+    } catch (e) { wkLock = null; return false; }
+  }
+  if (wkLock) { try { wkLock.release(); } catch (e) {} wkLock = null; }
+  return true;
+}
+function wkSet(on) { wkWant = !!on; if (wkSupported()) wkApply(); }
+document.addEventListener("visibilitychange", () => { if (wkSupported()) wkApply(); });
 
 // ── 떠 있는 홈 버튼(⌂): 길게 누르면 '서재'↔'원문 보기' 기능 전환 ──
 //   탭  = 현재 모드 실행 (서재로 가기 / iframe 검수페이지의 원문 토글)
@@ -267,6 +297,17 @@ addEventListener("message", e => {
     try { if (e.source) e.source.postMessage({ebook: "homeack"}, "*"); }
     catch (err) {}
     goHome(); return;
+  }
+  if (d.ebook === "wake") {          // 검수 페이지의 '화면 꺼짐 방지' 대리 요청
+    const src = e.source;
+    // on을 함께 돌려준다 — 해제 응답이 '유지 중'으로 오해되지 않게
+    const reply = ok => { try { if (src) src.postMessage(
+      {ebook: "wakeack", ok: !!ok, on: !!d.on}, "*"); } catch (err) {} };
+    if (!wkSupported()) { reply(false); return; }   // 이 브라우저는 지원 안 함
+    wkWant = !!d.on;
+    // 켜기 요청은 실제로 잡혔는지를, 끄기 요청은 늘 성공으로 답한다
+    wkApply().then(ok => reply(wkWant ? ok : true));
+    return;
   }
   if (d.ebook !== "ed" && d.ebook !== "edhello") return;
   edWin = e.source;

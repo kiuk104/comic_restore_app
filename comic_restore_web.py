@@ -1191,7 +1191,7 @@ async function boot(){
   optCustom("c_deepseek_url", ["https://api.deepinfra.com/v1/openai",
                                "https://api.deepseek.com"],
             INIT.cfg.deepseek_url);
-  optCustom("c_kimi_model", ["kimi-k2.5", "kimi-k2.6"],
+  optCustom("c_kimi_model", ["kimi-k2.6", "kimi-k3"],
             INIT.cfg.kimi_model);
   const fl = INIT.fonts.map(f => f.label);
   const hl = INIT.hands.map(f => f.label);

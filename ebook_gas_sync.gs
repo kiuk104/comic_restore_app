@@ -28,7 +28,8 @@
  *            다른 fp 기준 큐가 남아 있으면 새 fp 기준으로 교체)
  *   get    : 수정 큐 반환 (PC [☁ 모바일 수정 반영])
  *   clear  : 반영 완료 후 큐 비움 (fp 일치할 때만)
- *   state  : 읽던 위치 저장 (뷰어 확장 예약)
+ *   state  : 읽던 위치 저장 {pos:문단+비율, off:문단 내 글자 오프셋, ts}
+ *            (off/ts는 v0.19 위치 정밀화 — 구 클라이언트는 pos만 보내도 동작)
  *   hi     : 하이라이트 공유 저장/조회
  *   bmk    : 북마크 공유 저장/조회 (PC book.json과 연동)
  *   icon   : 홈 화면 아이콘 업로드 (PC가 1회 전송 → 공개 링크로 파비콘)
@@ -217,7 +218,11 @@ function handleOp(q) {
   }
   if (q.op === 'state') {
     var e = _readq(book);
-    e.state = {pos: q.pos, ts: Date.now()};
+    // off = 문단 내 글자 오프셋(정밀 복원), ts = 클라이언트 저장 시각(충돌 판정).
+    // 구 클라이언트는 off/ts 없이 보냄 → null/서버 시각으로 채워 호환.
+    e.state = {pos: q.pos,
+               off: (q.off === undefined ? null : q.off),
+               ts: (q.ts || Date.now())};
     _writeq(book, e); _bust();
     return {ok: true};
   }

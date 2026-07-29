@@ -202,7 +202,7 @@ class Api:
             "claude_models": ["claude-sonnet-4-5", "claude-haiku-4-5"],
             "gemini_models": ["gemini-3.6-flash", "gemini-3.1-flash-lite",
                               "gemini-2.5-flash-lite", "gemini-3.5-flash"],
-            "kimi_models": ["kimi-k2.5", "kimi-k2.6"],
+            "kimi_models": ["kimi-k2.6", "kimi-k3"],
             "recents": self.list_recents(),
         }
 
@@ -514,9 +514,11 @@ class Api:
         """폰의 북마크·읽던 위치를 book.json으로 회수 (PC 뷰어와 공유).
 
         수정분(edits)과 별개 저장소라 수정이 없어도 매번 확인한다.
-        q = 이미 받아둔 op:'get' 응답(state.pos 재사용 — 왕복 절감).
+        q = 이미 받아둔 op:'get' 응답(state 재사용 — 왕복 절감).
+        읽던 위치는 ts를 비교해 '폰 기록이 더 최신일 때만' 채택 —
+        PC에서 읽던 최신 위치를 폰의 옛 기록으로 되감지 않는다(v0.19).
         구버전 GAS(bmk op 없음)면 조용히 넘어간다."""
-        bmks = pos = None
+        bmks = pos = off = ts = None
         try:
             r = self._gas_call(c, {"op": "bmk", "book": bk})
             cloud = (r or {}).get("bmk")
@@ -528,23 +530,28 @@ class Api:
         except Exception:
             pass
         try:
-            sp = ((q or {}).get("state") or {}).get("pos")
-            if sp is not None and int(sp) != (book.get("pos")
-                                             if book.get("pos") is not None
-                                             else -1):
-                pos = int(sp)
+            st = ((q or {}).get("state") or {})
+            sp = st.get("pos")
+            if sp is not None:
+                spf = float(sp)
+                sts, cur_ts = st.get("ts"), book.get("pos_ts")
+                fresh = not (sts and cur_ts and int(sts) <= int(cur_ts))
+                if fresh and spf != (book.get("pos")
+                                     if book.get("pos") is not None
+                                     else -1):
+                    pos, off, ts = spf, st.get("off"), sts
         except Exception:
             pass
         if bmks is None and pos is None:
             return
         try:
-            r2 = core.save_marks(out, bmks, pos)
+            r2 = core.save_marks(out, bmks, pos, off, ts)
             if not quiet:
                 bits = []
                 if bmks is not None:
                     bits.append(f"북마크 {len(r2['bmks'])}개")
                 if pos is not None:
-                    bits.append(f"읽던 위치 #{pos + 1}")
+                    bits.append(f"읽던 위치 #{int(pos) + 1}")
                 self._log("☁ 폰 " + " · ".join(bits) + " 반영")
         except Exception:
             pass                       # 실패가 수정분 반영을 막지 않게

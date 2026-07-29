@@ -28,7 +28,7 @@ Claude 번역. 실행이 끝나면(취소 포함) 전사/번역 파트별 API �
 """
 from __future__ import annotations
 
-__version__ = "0.18.8"  # 다시 실행 옵션 — 엔진 바꿔 번역만·전사부터 재실행(기존 결과 백업)
+__version__ = "0.19.4"  # 화면 꺼짐 방지: 셸 대리 wake lock + 상태 표시
 
 # 모바일 검수 데이터 스키마 버전 — 공유 UI가 옛 데이터를 만나도 견디게 분기·가드용.
 # 필드를 바꾸거나 추가하면 올리고, EDIT_HTML은 낮은 스키마도 기본값으로 처리한다.
@@ -84,8 +84,14 @@ DEEPSEEK_MODEL = "deepseek-v4-flash"
 # Kimi (Moonshot AI) — OpenAI 호환, 저가 번역 백엔드 (번역 전용).
 # 키 발급: https://platform.moonshot.ai (MOONSHOT_API_KEY 환경변수 가능)
 KIMI_URL = "https://api.moonshot.ai/v1"
-KIMI_MODEL = "kimi-k2.5"
+KIMI_MODEL = "kimi-k2.6"
 KIMI_TIMEOUT = 600      # 추론 모델은 긴 청크 번역이 3~수 분 — 180초로는 부족
+
+
+def _norm_kimi_model(m) -> str:
+    """저장된 값이 없거나 중단 예정 모델(kimi-k2.5)이면 기본(k2.6)으로."""
+    m = (m or "").strip()
+    return KIMI_MODEL if (not m or m == "kimi-k2.5") else m
 
 
 # ---------------------------------------------------------------------------
@@ -353,8 +359,12 @@ def _call_oai(base_url: str, messages: list, model: str, key: str,
         m = re.search(r"only\s*([0-9]*\.?[0-9]+)\s*is allowed", detail, re.I)
         if e.code == 400 and "temperature" in low and m:
             data = _post_safe(dict(payload, temperature=float(m.group(1))))
-        elif e.code == 400 and any(k in low for k in ("reasoning", "thinking")):
-            # 이 모델이 reasoning/thinking 파라미터를 거부 → 빼고 재시도
+        elif (e.code == 400
+              and ("reasoning_effort" in payload or "thinking" in payload)):
+            # 이 모델이 추론 관련 파라미터를 거부 → 빼고 1회 재시도.
+            # 구글은 사유 없이 "Request contains an invalid argument"라고만
+            # 오는 경우가 있어(관측: gemini-3.6-flash 전사 전면 400) 에러
+            # 문구가 아니라 '보낸 파라미터'를 기준으로 판단한다.
             data = _post_safe({k: v for k, v in payload.items()
                                if k not in ("reasoning_effort", "thinking")})
         else:
@@ -846,7 +856,7 @@ def translate_chunk(items: list[tuple[int, str]], cfg: dict, gloss: str,
     elif cfg["backend"] == "kimi":
         parsed = _parse_loose(_call_kimi(
             [{"role": "user", "content": body}],
-            cfg.get("kimi_model") or KIMI_MODEL,
+            _norm_kimi_model(cfg.get("kimi_model")),
             cfg.get("kimi_key") or "", max_tokens=16000, part="번역"))
     else:
         # retype._call_claude는 엄격 json.loads라 대사 따옴표에 취약 —
@@ -1654,6 +1664,8 @@ def edit_data(out: Path) -> Optional[dict]:
             # 북마크·읽던 위치는 book.json에 보관 — PC·폰 공용
             "bmks": book.get("bmks") or [],
             "pos": book.get("pos"),
+            "off": book.get("off"),          # 문단 내 글자 오프셋(정밀 복원)
+            "pos_ts": book.get("pos_ts"),    # 위치 저장 시각(충돌 판정)
             "ocr_modes": [["실행 설정", ""]] + [[lb, k]
                                                for lb, k in OCR_MODES],
             "xlat": {str(k): v for k, v in done.items()},
@@ -1680,11 +1692,15 @@ def write_edit_html(out: Path) -> Optional[Path]:
     return fp
 
 
-def save_marks(out: Path, bmks=None, pos=None) -> dict:
+def save_marks(out: Path, bmks=None, pos=None, off=None, ts=None) -> dict:
     """북마크 목록·읽던 위치를 book.json에 저장 (PC 편집 서버·폰 회수 공용).
 
     기기 localStorage가 아니라 책 데이터에 두어야 PC·폰 양쪽에서 같이
-    보이고 이어읽기가 된다. 인덱스는 정수·범위 검증(북마크는 정렬·중복 제거).
+    보이고 이어읽기가 된다. 북마크는 정수·범위 검증·정렬·중복 제거.
+    읽던 위치(pos)는 소수(문단+비율) 허용에, 문단 내 글자 오프셋(off)과
+    저장 시각(ts, 기기 간 충돌 판정용)을 함께 둔다 — 킨들 location처럼
+    문단 '안'의 지점까지 복원(v0.19). off는 pos에 딸린 값이라 pos 갱신 시
+    항상 함께 갱신(없으면 제거 — 옛 off가 새 pos에 붙는 것 방지).
     None인 항목은 건드리지 않는다(부분 저장)."""
     book = load_book(out)
     if not book:
@@ -1698,13 +1714,31 @@ def save_marks(out: Path, bmks=None, pos=None) -> dict:
             return None
         return i if 0 <= i < n else None
 
+    def _posv(v):                        # 읽던 위치 — 소수 허용, 범위 검증
+        try:
+            p = float(v)
+        except (TypeError, ValueError):
+            return None
+        return round(p, 3) if 0 <= p < n else None
+
     if bmks is not None:
         book["bmks"] = sorted({i for i in (_idx(x) for x in bmks)
                                if i is not None})
     if pos is not None:
-        p = _idx(pos)
+        p = _posv(pos)
         if p is not None:
             book["pos"] = p
+            try:
+                book["off"] = max(0, int(off)) if off is not None else None
+            except (TypeError, ValueError):
+                book["off"] = None
+            if book.get("off") is None:
+                book.pop("off", None)
+            try:
+                if ts is not None:
+                    book["pos_ts"] = int(ts)
+            except (TypeError, ValueError):
+                pass
     work = out / "_work"
     work.mkdir(parents=True, exist_ok=True)
     _atomic_json(work / "book.json", book)
@@ -2085,7 +2119,8 @@ def run_edit_server(cfg: dict, log, is_busy=None) -> Optional[str]:
                                            log))
                 elif p == "/api/marks":
                     self._json(save_marks(out, req.get("bmks"),
-                                          req.get("pos")))
+                                          req.get("pos"), req.get("off"),
+                                          req.get("ts")))
                 else:
                     self._json(_edit_export(out, cfg, log))
             except Exception as e:
@@ -2326,7 +2361,7 @@ def _gui() -> None:
     r = nrow()
     ttk.Label(frm, text="Kimi 모델").grid(row=r, column=0, sticky="w")
     ttk.Combobox(frm, textvariable=v["kimi_model"],
-                 values=["kimi-k2.5", "kimi-k2.6"],
+                 values=["kimi-k2.6", "kimi-k3"],
                  width=22).grid(row=r, column=1, sticky="w", padx=4)
     add_entry("Kimi API 키 (선택)", "kimi_key")
     add_entry("Ollama 모델", "ollama_model")

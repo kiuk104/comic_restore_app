@@ -1405,7 +1405,7 @@ def main() -> int:
     r = nrow(tab_env)
     ttk.Label(tab_env, text="Kimi 모델").grid(row=r, column=0, sticky="w")
     km_cb = ttk.Combobox(tab_env, textvariable=v["kimi_model"],
-                         values=["kimi-k2.5", "kimi-k2.6"], width=22)
+                         values=["kimi-k2.6", "kimi-k3"], width=22)
     km_cb.grid(row=r, column=1, sticky="w", padx=4)
     tip(km_cb, "번역 엔진을 Kimi로 선택했을 때 쓰입니다 (번역 전용).\n"
                "k2.5=가성비 멀티모달, k2.6=최신·약간 비쌈.")

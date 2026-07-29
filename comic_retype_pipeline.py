@@ -357,8 +357,14 @@ DEEPSEEK_MODEL = "deepseek-v4-flash"
 # 비전 OCR은 주력이 아니라 전사엔 미제공 — 전사는 Claude/Gemini/DeepSeek 권장.
 # 키 발급: https://platform.moonshot.ai (MOONSHOT_API_KEY 환경변수 지원)
 KIMI_URL = "https://api.moonshot.ai/v1"
-KIMI_MODEL = "kimi-k2.5"
+KIMI_MODEL = "kimi-k2.6"
 KIMI_TIMEOUT = 180
+
+
+def _norm_kimi_model(m) -> str:
+    """저장된 값이 없거나 중단 예정 모델(kimi-k2.5)이면 기본(k2.6)으로."""
+    m = (m or "").strip()
+    return KIMI_MODEL if (not m or m == "kimi-k2.5") else m
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +391,8 @@ API_PRICES = [
     ("deepseek-v4-pro", 0.435, 0.87),
     ("kimi-k2.5", 0.60, 3.00),           # 캐시 미스 기준 (히트 시 6배 쌈)
     ("kimi-k2.6", 0.95, 4.00),
-    ("kimi", 0.60, 3.00),                # 기타 kimi-* 폴백
+    ("kimi-k3", 3.00, 15.00),            # 최상위 — Sonnet급 단가
+    ("kimi", 0.95, 4.00),                # 기타 kimi-* 폴백(k2.6 기준)
     ("ollama:", 0.0, 0.0),               # 로컬 — 무료
 ]
 
@@ -500,7 +507,7 @@ def xlat_cfg(args, out_dir=None) -> Optional[dict]:
             "gemini_model": (getattr(args, "gemini_model", None)
                              or GEMINI_MODEL),
             "gemini_key": _gemini_key(args),
-            "kimi_model": (getattr(args, "kimi_model", None) or KIMI_MODEL),
+            "kimi_model": _norm_kimi_model(getattr(args, "kimi_model", None)),
             "kimi_key": _kimi_key(args)}
 
 
