@@ -216,6 +216,43 @@ _SENT_TERM = re.compile(r"[.!?。！？…~]\s*[\"”’'」』\])]*\s*$|[\"”�
 _QUOTATIVE = re.compile(r"^(하고|라고|라며|하며|하면서|하자|하니|하는|고\s|며\s|라는)")
 
 
+# ── 원본 손상(깨진 글자) 감지 ─────────────────────────────────────────
+# 2006년 txt 아카이브 일부는 파일 자체가 손상돼 한글 사이에 엉뚱한 한자·기호가
+# 박혀 있다("크리스마만찬銖?때맨毬ち?"). 바이트를 다시 맞춰도 복구되지 않으므로
+# (글자 일부가 이미 사라짐) 경고만 하고, 자동 교정·AI 판정 대상에서 뺀다.
+_GJUNK = re.compile(r"[\ue000-\uf8ff\u2500-\u257f\u3200-\u33ff\u2460-\u24ff"
+                    r"\u2190-\u21ff\u2200-\u22ff\u3040-\u30ff]")
+_GHAN = re.compile(r"(?<=[가-힣?])[\u4e00-\u9fff\uf900-\ufaff](?=[가-힣?])")
+
+
+def is_garbled(s: str, lang: str = "ko") -> bool:
+    """깨진 글자가 6% 넘게 섞인 줄·문단인가 (한국어 책 기준 — 괄호 안 한자
+    병기·「」 인용은 제외). 일본어·중국어 책은 사용자 정의 영역 문자만 본다."""
+    t = re.sub(r"\([^()]{0,30}\)", "", s or "")
+    t = re.sub(r"[「『][^」』]{0,40}[」』]", "", t)
+    n = len(t.strip())
+    if n < 6:
+        return False
+    if lang not in ("ko", "", None):
+        return len(re.findall(r"[\ue000-\uf8ff]", t)) / n > 0.06
+    junk = len(_GJUNK.findall(t)) + len(_GHAN.findall(t))
+    junk += 0.5 * len(re.findall(r"[가-힣]\?[가-힣]", t))
+    return junk / n > 0.06
+
+
+def damage(paras: list, lang: str = "ko") -> dict:
+    """문단 목록의 손상 정도 — {ratio, n, first(첫 손상 문단 번호, 연속 구간 기준)}."""
+    bad = [is_garbled(p, lang) for p in paras]
+    n = sum(bad)
+    first = None
+    for i in range(len(bad)):
+        w = bad[i:i + 10]
+        if w and w[0] and sum(w) >= min(6, len(w)):
+            first = i
+            break
+    return {"ratio": round(n / max(1, len(paras)), 3), "n": n, "first": first}
+
+
 def first_tok(s: str) -> str:
     m = re.match(r"[가-힣]+", s or "")
     return m.group(0) if m else ""
@@ -455,14 +492,15 @@ def _text_to_paras(path: Path, split: str, ruby: str, log):
     return text, enc, paras, info, nhead
 
 
-def _autofix(paras: list, p95, mode: str, cfg, log) -> tuple[list, Optional[dict], dict]:
+def _autofix(paras: list, p95, mode: str, cfg, log,
+             lang: str = "ko") -> tuple[list, Optional[dict], dict]:
     """가져오기 직후 자동 교정 (ebook_autofix). mode: off | rule | ai.
     반환 (교정된 문단, af 기록 or None, 통계)."""
     if mode not in ("rule", "ai") or not paras:
         return paras, None, {}
     import ebook_autofix as af
     book = {"paras": [{"src": p, "page": ""} for p in paras],
-            "origin": {"p95": p95}}
+            "origin": {"p95": p95}, "source_lang": lang or "ko"}
     st = af.run(book, {}, mode, cfg or {}, log)
     return [e["src"] for e in book["paras"]], book.get("af"), st
 
@@ -534,13 +572,23 @@ def import_text(src, out=None, title: Optional[str] = None,
         raise RuntimeError("문단을 하나도 만들지 못했습니다 (빈 파일?)")
     # _src.txt 왕복(사람이 고친 문단 구조)은 자동 교정하지 않는다
     paras, af_log, _st = _autofix(paras, info["p95"],
-                                  "off" if from_src else autofix, cfg, log)
+                                  "off" if from_src else autofix, cfg, log, lang)
     if af_log:
         nhead = sum(1 for p in paras if p.startswith((HEAD_MARK, SUB_MARK)))
+    dm = damage(paras, lang)
+    if dm["ratio"] >= 0.02:
+        log(f"⚠ 원본 손상: 문단 {dm['n']}개({dm['ratio']:.0%})에 깨진 글자"
+            + (f" — {dm['first'] + 1}번째 문단 부근부터" if dm["first"] is not None else "")
+            + ". 원본 파일 자체가 손상돼 복구할 수 없습니다 (다른 판본 권장). "
+              "깨진 문단은 자동 교정·AI 판정에서 제외했습니다")
     _save_book(out, title, lang, paras,
                {"file": str(src), "encoding": enc,
                 "split": info["used"], "p95": info["p95"],
-                "term": info["term"], "trail": info["trail"]},
+                "term": info["term"], "trail": info["trail"],
+                # 다시 적용(옵션 바꾸기)용 — 사용자가 고른 옵션 그대로
+                "opt": {"split": split, "ruby": ruby,
+                        "autofix": "off" if from_src else autofix},
+                "damage": dm["ratio"]},
                log, resplit_src=src if from_src else None, af_log=af_log)
     log(f"가져오기 완료: {title} — {len(paras)}문단, 제목 {nhead}개, "
         f"{enc}, 모드 {info['used']} (p95 {info['p95']}자, "
@@ -606,13 +654,14 @@ def preview(src, split: str = "auto", ruby: str = "strip", n: int = 40,
             import ebook_autofix as af
             an = af.analyze(paras, info["p95"])
             paras, _l, st = _autofix(paras, info["p95"], "rule", None,
-                                     lambda m: None)
+                                     lambda m: None, detect_lang(_t))
             r["af"] = dict(st, ask=an["stats"]["ask_J"] + an["stats"]["ask_H"]
                            + an["stats"]["ask_S"], engine=af.ai_engine_label(cfg or {}))
             nh = sum(1 for p in paras if p.startswith(HEAD_MARK))
         r["count"] = len(paras)
         r["headings"] = nh
         r["subheads"] = sum(1 for p in paras if p.startswith(SUB_MARK))
+        r["damage"] = damage(paras, detect_lang(_t))
     r.update(encoding=enc, mode=info.get("used", ""), p95=info.get("p95"),
              term=info.get("term"), trail=info.get("trail"),
              paras=[p if len(p) <= 400 else p[:400] + "…" for p in paras[:n]])
@@ -622,6 +671,8 @@ def preview(src, split: str = "auto", ruby: str = "strip", n: int = 40,
             old = json.loads(bp.read_text(encoding="utf-8"))
             r["existing"] = {"count": len(old.get("paras") or []),
                              "mode": (old.get("origin") or {}).get("split", ""),
+                             "opt": (old.get("origin") or {}).get("opt") or {},
+                             "title": old.get("title") or "",
                              "hi": sum(len(v) for k, v in (old.get("hi") or {}).items()
                                        if not str(k).startswith("_")),
                              "bmks": len(old.get("bmks") or [])}
@@ -670,13 +721,15 @@ def import_folder(src, out=None, title: Optional[str] = None,
     if lang == "auto":
         lang = detect_lang("\n".join(sample))
     p95 = sorted(p95s)[len(p95s) // 2] if p95s else None
-    paras, af_log, _st = _autofix(paras, p95, autofix, cfg, log)
+    paras, af_log, _st = _autofix(paras, p95, autofix, cfg, log, lang)
     if af_log:
         nhead = sum(1 for p in paras if p.startswith((HEAD_MARK, SUB_MARK)))
     _save_book(out, title, lang, paras,
                {"file": str(src), "folder": True, "files": len(files),
                 "encoding": ",".join(sorted(encs)), "p95": p95,
-                "split": ",".join(sorted(modes))}, log, af_log=af_log)
+                "split": ",".join(sorted(modes)),
+                "opt": {"split": split, "ruby": ruby, "autofix": autofix},
+                "damage": damage(paras, lang)["ratio"]}, log, af_log=af_log)
     log(f"폴더 가져오기 완료: {title} — 파일 {len(files)}개 → {len(paras)}문단, "
         f"제목 {nhead}개, 모드 {','.join(sorted(modes))} → {out}")
     return {"out": str(out), "title": title, "count": len(paras),

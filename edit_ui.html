@@ -429,7 +429,7 @@ body.rdmode .pgh button{display:none}
  <option value="dirty">수정됨만</option>
  <option value="toc">목차 (제목·소제목)</option>
  <option value="subc">소제목 후보 찾기</option>
- <option value="afix">자동 교정 기록</option>
+ <option value="afix">자동 교정·다시 가져오기</option>
  <option value="help">기호 도움말</option></select>
  <select id="ocrsel" title="재전사에 사용할 전사 방식"></select>
  <button id="save" data-ic="save" disabled>저장</button>
@@ -1763,6 +1763,10 @@ function showSubc(){hov.innerHTML='';const c=subCands();
    가져올 때/편집 페이지에서 자동으로 고친 곳 목록. 글자를 누르면 이동,
    [되돌리기]는 PC 편집 서버에서(문단 구조가 바뀌므로 폰 수정 큐와 충돌). */
 const AF_T={merge:'합침',split:'나눔',head:'제목',drop:'삭제'};
+/* 편집 서버는 동시 요청을 409로 거절 — 미리 계산 요청은 줄 세워 하나씩 보낸다 */
+let _apiQ=Promise.resolve();
+function apiQ(path,body){const p=_apiQ.then(()=>api(path,body));
+ _apiQ=p.catch(()=>{});return p;}
 function _afEsc(t){return String(t||'').replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));}
 async function afPrep(){                       // restruct()와 같은 사전 처리
  if(dirty.size&&!await doSave())return false;
@@ -1782,11 +1786,54 @@ function showAf(){hov.innerHTML='';
    return c?'<option value="'+k+'">'+AF_T[k]+' '+c+'</option>':'';}).join('')
   +(items.some(x=>x.by==='ai')?'<option value="ai">AI 판정 '
    +items.filter(x=>x.by==='ai').length+'</option>':'');
- hov.appendChild(hovCap('자동 교정 기록',[tsel]));
+ hov.appendChild(hovCap('자동 교정·다시 가져오기',[tsel]));
+ const IMP=D.imp||{};
+ if(PLAIN&&IMP.damage>=0.02){const w=document.createElement('div');w.className='afbox';
+  w.style.borderColor='#c0392b';
+  w.innerHTML='<b style="color:#c0392b">⚠ 원본 손상</b> — 문단의 '+Math.round(IMP.damage*100)
+   +'%에 깨진 글자가 있습니다. 원본 txt 파일 자체가 손상된 것이라 복구할 수 없고, '
+   +'깨진 문단은 자동 교정·AI 판정에서 뺐습니다. 다른 판본을 구하는 것을 권합니다.';
+  hov.appendChild(w);}
+ if(SRV&&PLAIN){                      // 원본에서 옵션만 바꿔 다시 만들기
+  const o=IMP.opt||{},box=document.createElement('div');box.className='afbox';
+  box.innerHTML='<b>원본에서 다시 만들기</b> — 가져오기 옵션만 바꿔 다시 적용합니다<br>'
+   +'<label>줄바꿈 교정 <select class="rsp"><option value="auto">자동 판별</option>'
+   +'<option value="wrap">하드 줄바꿈 재구성</option><option value="lines">한 줄 = 한 문단</option>'
+   +'<option value="blank">빈 줄 기준</option></select></label> '
+   +'<label>자동 교정 <select class="raf"><option value="rule">규칙만</option>'
+   +'<option value="ai">규칙 + AI</option><option value="off">끄기</option></select></label>'
+   +(D.source_lang==='ja'?' <label>루비 <select class="rrb"><option value="strip">지우기</option>'
+     +'<option value="paren">괄호로</option><option value="keep">그대로</option></select></label>':'')
+   +'<div class="rinfo" style="color:var(--mut);margin-top:6px">옵션을 고르면 결과를 미리 계산합니다</div>';
+  const sp=box.querySelector('.rsp'),ra=box.querySelector('.raf'),rb=box.querySelector('.rrb'),
+   ri=box.querySelector('.rinfo');
+  sp.value=o.split||'auto';ra.value=o.autofix||'rule';if(rb)rb.value=o.ruby||'strip';
+  const go=document.createElement('button');go.textContent='🔁 이 옵션으로 다시 적용';
+  const req=dry=>({split:sp.value,autofix:ra.value,ruby:rb?rb.value:(o.ruby||'strip'),dry:dry?1:0});
+  let seq=0;
+  const calc=async()=>{const my=++seq;ri.textContent='계산 중…';go.disabled=true;
+   try{const r=await apiQ('/api/reimport',req(true));if(my!==seq)return;
+    const a=r.af||{},ap=a.applied||{};
+    ri.innerHTML='→ <b>'+r.count+'문단</b> (지금 '+r.now+') · 제목 '+(r.headings||0)
+     +(r.subheads?' · 소제목 '+r.subheads:'')+' · 판별 '+_afEsc(r.mode)
+     +(ap.merge!=null?'<br>자동 교정(규칙): 합치기 '+ap.merge+' · 나누기 '+ap.split
+       +' · 제목 '+ap.head+' · PC통신 머리 '+ap.drop
+       +(a.ask?' · 애매한 곳 '+a.ask+(ra.value==='ai'?' → AI 판정(약 '
+        +Number(a.ask_tokens||0).toLocaleString()+' 토큰, '+_afEsc(a.engine)+')':' (그대로)'):''):'');
+    go.disabled=false;}
+   catch(e){if(my===seq)ri.textContent='계산 실패: '+e.message;}};
+  [sp,ra,rb].forEach(x=>{if(x)x.onchange=calc;});
+  go.onclick=()=>{if(!confirm('원본 txt에서 이 옵션으로 책을 다시 만듭니다.\n\n'
+    +'· 편집 페이지에서 고친 본문·제목 지정·합치기/나누기는 새 결과로 바뀝니다 '
+    +'(이전 book.json은 _work/reimport_… 에 사본)\n'
+    +'· 북마크·하이라이트·읽던 위치는 유지되지만 문단 수가 바뀌면 어긋날 수 있습니다'
+    +(ra.value==='ai'?'\n· AI 판정 요금이 발생합니다':'')+'\n\n진행할까요?'))return;
+   afPost('/api/reimport',req(false),'원본에서 다시 만드는 중…'+(ra.value==='ai'?' (AI 판정 포함)':''));};
+  box.appendChild(go);hov.appendChild(box);calc();}
  if(SRV&&PLAIN){const box=document.createElement('div');box.className='afbox';
   box.innerHTML='<b>다시 검사</b> — 지금 책에서 규칙이 고칠 곳을 찾는 중…';
   hov.appendChild(box);
-  api('/api/autofix',{dry:1}).then(r=>{
+  apiQ('/api/autofix',{dry:1}).then(r=>{
    const ask=(r.ask_J||0)+(r.ask_H||0)+(r.ask_S||0);
    box.innerHTML='<b>다시 검사</b> — 규칙으로 고칠 곳: 합치기 '+r.merge+' · 나누기 '
     +r.split+' · 제목 '+r.head+' · PC통신 머리 '+r.drop

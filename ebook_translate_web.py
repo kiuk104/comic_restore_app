@@ -384,7 +384,11 @@ class Api:
                        "key": "pdfdoc"},
                       {"label": "성경 캡처 — 절 단위 전사만 (성경 뷰어 가져오기용)",
                        "key": "bible"}],
-            "langs": [{"label": lb, "key": k} for lb, k in core.LANGS],
+            # ko·zh·ja는 평문 책(가져오기)이 저장하는 원서 언어 — 목록에 없으면
+            # 원서 언어 칸이 빈칸으로 보인다 (번역 시작은 평문 책에서 막혀 있음)
+            "langs": [{"label": lb, "key": k} for lb, k in core.LANGS]
+            + [{"label": "한국어 — 평문 책 (번역 없음)", "key": "ko"},
+               {"label": "중국어 — 평문 책 (번역 없음)", "key": "zh"}],
             "ocr_modes": [{"label": lb, "key": k}
                           for lb, k in core.OCR_MODES],
             "backends": [{"label": lb, "key": k}
@@ -1320,7 +1324,8 @@ WEB_HTML = r"""<!doctype html>
  <button id="b_edit" onclick="doEdit()">📝 편집 페이지</button>
  <button id="b_import" onclick="doImportBook()"
   title="라이브러리의 txt/md 파일을 골라 책으로 가져옵니다 — 하드 줄바꿈을 문단으로
-재구성해 <제목>_book 에 저장하고(서고 안 파일이면 _Ebook_Library/_books/) 바로 편집 페이지를 엽니다 (번역 없음)">📚 텍스트 책 가져오기</button>
+재구성해 <제목>_book 에 저장하고(서고 안 파일이면 _Ebook_Library/_books/) 바로 편집 페이지를 엽니다 (번역 없음).
+지금 책이 이미 가져온 txt면 그 책을 옵션만 바꿔 다시 적용하는 창으로 열립니다">📚 텍스트 책 가져오기</button>
  <button id="b_lib" onclick="doLibSync()"
   title="서고(Drive _Ebook_Library)를 다시 훑어 폰 Fokus Viewer의 [서고] 탭 목록을 갱신합니다.
 앱을 켤 때 한 번 자동으로 하고, 폰에서 요청한 책은 이 앱이 열려 있으면 약 45초 안에
@@ -1659,19 +1664,34 @@ async function doEdit(){
 /* ── 텍스트 책 가져오기 창 — 재구성 방식 선택 + 미리보기 ── */
 let _imp = {path:"", seq:0, titleTouched:false};
 async function doImportBook(){
-  _imp = {path:"", seq:0, titleTouched:false};
+  _imp = {path:"", seq:0, titleTouched:false, cur:false};
   $("im_path").textContent = "파일이나 폴더를 고르세요";
   $("im_title").value = ""; $("im_split").value = "auto"; $("im_ruby").value = "strip";
   $("im_info").innerHTML = ""; $("im_warn").innerHTML = ""; $("im_pv").innerHTML = "";
-  $("im_go").disabled = true;
+  $("im_go").disabled = true; $("im_dmg").innerHTML = "";
   $("im_af").value = $("c_af_mode").value || "rule"; $("im_af_info").innerHTML = "";
   $("imp").style.display = "block";
+  // 지금 소스가 이미 가져온 평문 책이면 그 책을 옵션만 바꿔 다시 적용하도록 연다
+  const cur = ($("c_src").value || "").trim();
+  if (cur) {
+    const r = await api().import_preview(cur, "auto", "strip", $("c_title").value || "", "off");
+    if (r && !r.err && r.existing) {
+      const o = r.existing.opt || {};
+      _imp.path = cur; _imp.cur = true; _imp.titleTouched = true;
+      $("im_title").value = r.existing.title || $("c_title").value || r.title;
+      $("im_split").value = o.split || "auto"; $("im_ruby").value = o.ruby || "strip";
+      if (o.autofix) $("im_af").value = o.autofix;
+      $("im_path").textContent = cur + "  (지금 책 — 다른 책은 [파일 고르기])";
+      impPreview();
+      return;
+    }
+  }
   await impPick("file");
 }
 async function impPick(kind){
   const p = await api().import_pick(kind);
   if (!p) return;
-  _imp.path = p; _imp.titleTouched = false; $("im_title").value = "";
+  _imp.path = p; _imp.titleTouched = false; _imp.cur = false; $("im_title").value = "";
   $("im_path").textContent = p;
   impPreview();
 }
@@ -1711,6 +1731,11 @@ async function impPreview(){
       : "<br>애매한 곳 " + a.ask + "곳은 그대로 둠 — 「규칙 + AI」를 고르면 AI가 판정 (약 " + Number(a.ask_tokens||0).toLocaleString() + " 토큰)")
      : "")
     : (afm === "off" ? "" : (r.folder ? "폴더는 가져올 때 자동 교정합니다" : ""));
+  const dm = r.damage;
+  $("im_dmg").innerHTML = (dm && dm.ratio >= 0.02) ?
+    "⛔ 원본 손상: 문단 " + dm.n + "개(" + Math.round(dm.ratio*100) + "%)에 깨진 글자" +
+    (dm.first != null ? " — " + (dm.first+1) + "번째 문단 부근부터" : "") +
+    ". 원본 txt 자체가 손상돼 복구할 수 없습니다(다른 판본 권장). 깨진 문단은 자동 교정·AI 판정에서 뺍니다." : "";
   const ex = r.existing;
   $("im_warn").innerHTML = ex ?
     "⚠ 이미 가져온 책입니다 (지금 " + ex.count + "문단" + (ex.mode ? ", " + _esc(ex.mode) : "") + "). " +
@@ -1725,6 +1750,7 @@ async function impPreview(){
   }).join("") + ((r.count == null || r.count > (r.paras||[]).length) ?
     '<div class="imp-more">… 앞부분만 표시</div>' : "");
   $("im_go").disabled = false;
+  $("im_go").textContent = ex ? "🔁 이 옵션으로 다시 적용" : "📚 가져오기";
 }
 async function impGo(){
   if (!_imp.path) return;
@@ -1743,7 +1769,7 @@ async function impGo(){
     if (typeof updSummary === "function") updSummary();
     save(); refreshRecents();
     await doEdit();
-  } finally { b.disabled = false; b.textContent = "📚 가져오기"; }
+  } finally { b.disabled = false; b.textContent = _imp.cur ? "🔁 이 옵션으로 다시 적용" : "📚 가져오기"; }
 }
 async function doLibSync(){
   const b = $("b_lib"); b.disabled = true;
@@ -1876,6 +1902,7 @@ window.addEventListener("pywebviewready", boot);
    </select></div>
   <div id="im_info" style="font-size:12px;line-height:1.6;color:var(--tx2)"></div>
   <div id="im_af_info" style="font-size:12px;line-height:1.6;color:var(--ok)"></div>
+  <div id="im_dmg" style="font-size:12px;line-height:1.6;color:var(--danger);margin-top:4px;font-weight:600"></div>
   <div id="im_warn" style="font-size:12px;line-height:1.6;color:var(--warn);margin-top:4px"></div>
   <div id="im_pv" style="flex:1;overflow:auto;min-height:160px;margin:8px 0;background:var(--field);
    border:1px solid var(--line);border-radius:6px"></div>

@@ -108,7 +108,8 @@ def _dlg_splits(p: str) -> list[int]:
 # ---------------------------------------------------------------------------
 # 1) 규칙 분석 — 확실한 ops + 애매한 asks
 # ---------------------------------------------------------------------------
-def analyze(paras: list[str], p95: Optional[int] = None) -> dict:
+def analyze(paras: list[str], p95: Optional[int] = None,
+            lang: str = "ko") -> dict:
     """paras(원문 문자열 목록) → {"ops": [...], "asks": [...], "stats": {...}}.
 
     ops (원래 문단 번호 기준):
@@ -124,6 +125,8 @@ def analyze(paras: list[str], p95: Optional[int] = None) -> dict:
         p95 = ls[int(len(ls) * 0.95) - 1] if len(ls) > 1 else 40
     ops, asks = [], []
     has_h2 = any(head_lv(x) == 2 for x in P)
+    # 원본이 손상된 문단(깨진 글자)은 손대지 않고 AI에도 보내지 않는다
+    garb = {k for k in range(n) if imp.is_garbled(P[k], lang)}
     drop = set()
     headset = {}
 
@@ -159,7 +162,8 @@ def analyze(paras: list[str], p95: Optional[int] = None) -> dict:
                  x.strip().endswith("]")) >= 20
     for k in range(n):
         t = P[k].strip()
-        if k in drop or k in headset or head_lv(t) or not t or "\n" in t:
+        if k in drop or k in headset or head_lv(t) or not t or "\n" in t \
+                or k in garb:
             continue
         if len(t) > 42:
             continue
@@ -189,7 +193,8 @@ def analyze(paras: list[str], p95: Optional[int] = None) -> dict:
 
     # ── 문단 경계 ──
     for k in range(n - 1):
-        if k in drop or k + 1 in drop or k in headset or k + 1 in headset:
+        if k in drop or k + 1 in drop or k in headset or k + 1 in headset \
+                or k in garb or k + 1 in garb:
             continue
         a, b = P[k].strip(), P[k + 1].strip()
         if not a or not b or head_lv(a) or head_lv(b):
@@ -221,7 +226,7 @@ def analyze(paras: list[str], p95: Optional[int] = None) -> dict:
     avg = tot / max(1, n)
     long_cut = 1500 if avg < 400 else 600
     for k in range(n):
-        if k in drop or head_lv(P[k]) or len(P[k]) < long_cut:
+        if k in drop or k in garb or head_lv(P[k]) or len(P[k]) < long_cut:
             continue
         offs = _dlg_splits(P[k]) if avg >= 400 else []
         if offs:
@@ -240,7 +245,7 @@ def analyze(paras: list[str], p95: Optional[int] = None) -> dict:
           "ask_J": sum(1 for a in asks if a["k"] == "J"),
           "ask_H": sum(1 for a in asks if a["k"] == "H"),
           "ask_S": sum(1 for a in asks if a["k"] == "S"),
-          "paras": n, "avg": round(avg)}
+          "paras": n, "avg": round(avg), "garbled": len(garb)}
     st["ask_chars"] = _ask_chars(P, asks)
     st["ask_tokens"] = int(st["ask_chars"] * 0.9) + 600 * _n_batches(P, asks)
     return {"ops": ops, "asks": asks, "stats": st}
@@ -567,7 +572,8 @@ def estimate(book: dict) -> dict:
     """적용 없이 예상치 — 되돌린 곳 제외 (편집 페이지 「다시 검사」)."""
     P = [e.get("src") or "" for e in book["paras"]]
     p95 = (book.get("origin") or {}).get("p95")
-    an = analyze(P, p95 if isinstance(p95, int) else None)
+    an = analyze(P, p95 if isinstance(p95, int) else None,
+                 book.get("source_lang") or "ko")
     ops, asks = _filter_no(book, P, an["ops"], an["asks"])
     st = dict(an["stats"])
     st.update(merge=sum(1 for o in ops if o["t"] == "merge"),
@@ -587,7 +593,8 @@ def run(book: dict, done: dict, mode: str = "rule", cfg: Optional[dict] = None,
     """book을 제자리 교정. mode: rule | ai(규칙+AI). 반환: 통계."""
     P = [e.get("src") or "" for e in book["paras"]]
     p95 = (book.get("origin") or {}).get("p95")
-    an = analyze(P, p95 if isinstance(p95, int) else None)
+    an = analyze(P, p95 if isinstance(p95, int) else None,
+                 book.get("source_lang") or "ko")
     ops, asks = _filter_no(book, P, an["ops"], an["asks"])
     an["asks"] = asks
     st = dict(an["stats"])

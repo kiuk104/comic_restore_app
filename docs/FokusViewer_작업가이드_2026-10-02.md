@@ -186,6 +186,10 @@
 - **실제 AI 호출은 미검증**: 사용자 PC 샌드박스에선 Anthropic만 닿고 ebook_config.json의 Claude 키가 401(앱은 환경변수 키를 쓰는 듯). 첫 실사용 때 로그의 "AI 판정 n/n 묶음"과 결과를 확인할 것.
 - **함정(세션 도구)**: `device_commit_files`는 outputs의 같은 경로를 다시 쓰면 **처음 올린 옛 사본**을 보낼 수 있음 → 매번 새 폴더(fv2…)에 담고, 커밋 후 md5로 확인.
 
+- **추가(19:4x) — 원본 손상 감지**: 사용자가 '앵무새 죽이기'를 가져왔더니 애매한 곳 1,028곳 → 조사 결과 **원본 txt 자체가 약 40% 지점부터 깨져 있음**(한글 사이에 엉뚱한 한자·기호, "크리스마만찬銖?때맨毬ち?"; CP949 재정렬로도 복구 불가 — 글자 일부 소실). 샘플 s07(무협)도 4%. `ebook_import.is_garbled(s, lang)`(괄호 병기·「」 제외, PUA·상자선·원문자·한글 사이 한자·"가?나" 비율 > 6%)·`damage(paras)` → 가져오기 로그 ⚠, `origin.damage`, 미리보기 `damage`(웹앱 창 ⛔ 줄), edit_ui 「자동 교정·다시 가져오기」 맨 위 경고. `ebook_autofix.analyze(…, lang)`는 깨진 문단을 규칙·AI 대상에서 제외(stats `garbled`) → 앵무새 애매한 곳 1,028 → 202, 합치기 197 → 24. 정상 샘플 13권은 0%.
+- **추가 — 옵션만 바꿔 다시 적용**: `origin.opt = {split, ruby, autofix}` 저장. 웹앱 [📚 텍스트 책 가져오기]는 지금 소스가 이미 가져온 책이면 그 책으로 열리고(이전 옵션·제목 복원, 버튼 "🔁 이 옵션으로 다시 적용"), 다른 책은 [파일 고르기]. 편집 페이지 「자동 교정·다시 가져오기」에 **원본에서 다시 만들기**(줄바꿈 교정·자동 교정·(일본어면 루비) → 미리 계산 → 다시 적용) — `/api/reimport {split, ruby, autofix, dry}` → `ebook_import.import_text(origin.file, out=같은 폴더, title=책 제목)` + `_struct_save`. edit_data에 `imp`(opt·damage·split·folder)·`source_lang`. 미리 계산 요청은 `apiQ`로 줄 세움(편집 서버 동시 요청 409 — 실제로 걸렸음).
+- **추가 — 원서 언어 빈칸**: 평문 책이 ko/zh로 저장되는데 웹앱 목록(core.LANGS)에 없어 빈칸 → 웹앱 `langs`에 "한국어/중국어 — 평문 책 (번역 없음)" 추가.
+
 ## 7. 검증 방법·함정
 
 - py: `python -m py_compile ebook_translate.py ebook_translate_web.py ebook_import.py`

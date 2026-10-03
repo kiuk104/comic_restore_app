@@ -1861,6 +1861,7 @@ def edit_data(out: Path) -> Optional[dict]:
             # kind: "plain" = 가져온 평문 책(원문 슬롯만 사용, 번역 없음) —
             # 검수 UI가 번역칸·원문 토글·재전사를 숨긴다. 없으면 번역책.
             "kind": book.get("kind") or "xlat",
+            "source_lang": book.get("source_lang") or "",
             "pages": book.get("page_labels") or [],
             "fp": book_fingerprint(book), "count": len(book["paras"]),
             "cover": book.get("cover") or "",
@@ -1874,6 +1875,9 @@ def edit_data(out: Path) -> Optional[dict]:
             "hi_ts": book.get("hi_ts") or 0,
             # 자동 교정 기록 {mode, ts, items:[{t,i,…}]} — 편집 페이지 목록·되돌리기
             "af": book.get("af") or {},
+            # 가져오기 옵션·원본 손상 (평문 책 '옵션 바꿔 다시 적용'용)
+            "imp": {k: (book.get("origin") or {}).get(k)
+                    for k in ("opt", "damage", "split", "folder")},
             "ocr_modes": [["실행 설정", ""]] + [[lb, k]
                                                for lb, k in OCR_MODES],
             "xlat": {str(k): v for k, v in done.items()},
@@ -2322,6 +2326,37 @@ def _edit_autofix(out: Path, cfg: dict, req: dict, log) -> dict:
     return st
 
 
+def _edit_reimport(out: Path, cfg: dict, req: dict, log) -> dict:
+    """편집 서버 /api/reimport — 평문 책을 원본 txt에서 옵션만 바꿔 다시 만든다.
+    dry=True면 미리 계산(문단 수·제목·자동 교정 예상)만."""
+    import ebook_import as imp
+    book = load_book(out)
+    if not book:
+        raise RuntimeError("편집 데이터(book.json)가 없습니다")
+    org = book.get("origin") or {}
+    src = Path(org.get("file") or "")
+    if not str(src) or not src.exists():
+        raise RuntimeError(f"원본 파일을 찾을 수 없습니다: {src}")
+    split = req.get("split") or "auto"
+    ruby = req.get("ruby") or "strip"
+    afm = req.get("autofix") or "rule"
+    if split not in ("auto", "wrap", "lines", "blank") or \
+            afm not in ("off", "rule", "ai"):
+        raise ValueError("알 수 없는 옵션")
+    title = book.get("title") or src.stem
+    if req.get("dry"):
+        r = imp.preview(src, split=split, ruby=ruby, n=0, title=title,
+                        autofix=afm, cfg=cfg)
+        r["now"] = len(book["paras"])
+        return r
+    r = imp.import_text(src, out=out, title=title,
+                        lang=book.get("source_lang") or "auto", split=split,
+                        ruby=ruby, log=log, autofix=afm, cfg=cfg)
+    nb = load_book(out)
+    _struct_save(out, nb, load_xlat(out), log)   # 폰 표식 보호(struct_ts)·src.txt·페이지
+    return {"count": r["count"], "headings": r["headings"]}
+
+
 def _edit_af_undo(out: Path, req: dict, log) -> dict:
     """편집 서버 /api/af_undo — 자동 교정 기록 하나 되돌리기."""
     import ebook_autofix as af
@@ -2685,7 +2720,7 @@ def run_edit_server(cfg: dict, log, is_busy=None) -> Optional[str]:
             if p not in ("/api/save", "/api/xlat", "/api/export",
                          "/api/rescan", "/api/cover", "/api/marks",
                          "/api/restructure", "/api/autofix",
-                         "/api/af_undo"):
+                         "/api/af_undo", "/api/reimport"):
                 self.send_error(404)
                 return
             if busy["on"] or ext_busy():
@@ -2717,6 +2752,8 @@ def run_edit_server(cfg: dict, log, is_busy=None) -> Optional[str]:
                     self._json(_edit_autofix(out, cfg, req, log))
                 elif p == "/api/af_undo":
                     self._json(_edit_af_undo(out, req, log))
+                elif p == "/api/reimport":
+                    self._json(_edit_reimport(out, cfg, req, log))
                 elif p == "/api/marks":
                     self._json(save_marks(out, req.get("bmks"),
                                           req.get("pos"), req.get("off"),
