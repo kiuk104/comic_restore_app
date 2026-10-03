@@ -28,7 +28,7 @@ Claude 번역. 실행이 끝나면(취소 포함) 전사/번역 파트별 API �
 """
 from __future__ import annotations
 
-__version__ = "0.19.4"  # 화면 꺼짐 방지: 셸 대리 wake lock + 상태 표시
+__version__ = "0.21.1"  # 성경 캡처 모드: 비전 전사 동시 요청
 
 # 모바일 검수 데이터 스키마 버전 — 공유 UI가 옛 데이터를 만나도 견디게 분기·가드용.
 # 필드를 바꾸거나 추가하면 올리고, EDIT_HTML은 낮은 스키마도 기본값으로 처리한다.
@@ -41,6 +41,7 @@ import json
 import os
 import re
 import sys
+import time
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -116,6 +117,30 @@ PROMPT_SPLIT_NOTE = """이미지 2장은 같은 페이지의 위/아래 절반�
 (겹침 없음). 이어지는 하나의 페이지로 전사하세요.
 
 """
+
+# 성경 캡처 모드 — 성경 앱 화면/전자책 페이지를 '절 단위 한 줄'로 전사.
+# 결과(<제목>_성경.txt)는 성경 뷰어 앱의 '번역본 가져오기'에 그대로 넣는다.
+# 가져오기 쪽이 장 제목줄(캡처마다 반복)로 장을 알고, 캡처 사이 겹침은
+# 절 번호로 정리하므로: 제목줄은 매번 남기고, 절 번호는 절대 빠뜨리지 않게.
+PROMPT_BIBLE = """성경 화면 캡처(앱 화면 또는 전자책 페이지) 한 장입니다. 성경 본문을 절 단위로 정확히 전사하세요.
+
+출력 형식 (이 형식만):
+- 화면 위쪽 제목줄에 책과 장이 보이면(예: '창세기 1 장', '시편 35 편', '1. Mose 3') 첫 줄에 그대로 한 줄로 쓰기 — 매 화면마다 반복돼도 반드시 출력
+- 이 화면에서 새 장이 시작되면(큰 장 번호나 장 제목) 그 자리에 '<책 이름> <장 번호>장' 한 줄을 넣기
+- 각 절은 한 줄: '절번호 본문' (예: '3 하나님이 말씀하시기를 ...'). 절 번호는 본문 앞의 작은 숫자 — 하나도 빠뜨리지 말 것. 절 안의 줄바꿈은 공백으로 이어붙임
+- 장의 첫 절에 번호가 없으면(큰 장 번호로 대신한 경우) 앞에 '1 '을 붙이기
+
+제외:
+- 화면 맨 위에 번호 없이 잘려 이어지는 앞 절의 끝부분 (화면의 첫 절 번호부터 시작)
+- 소제목(본문 사이의 짧은 제목 — 보통 색이 다르거나 가운데 정렬), 각주 표시(글자 옆의 작은 숫자·문자·기호), 단락 표시 ○, 쪽번호, 상태표시줄 시계, 앱 버튼·메뉴 글자
+- 소제목 때문에 한 절이 둘로 나뉘어 보이면 한 줄로 이어붙이기
+
+기타:
+- 화면 아래에서 잘린 마지막 절은 보이는 데까지만
+- 장 끝 표시('이전장'·'다음장'·저작권 문구 등)가 나오면 '===장끝===' 한 줄을 쓰고 그 아래(말씀카드·추천 글 등)는 전부 생략
+- 본문은 요약·수정 없이 글자 그대로 (맞춤법 교정 금지)
+
+전사 텍스트만 출력 (설명·머리말 금지)."""
 
 PROMPT_XLAT_BOOK = """책 본문 {lang} 문단 목록입니다 (이어지는 순서).
 
@@ -276,15 +301,16 @@ def _page_halves(img) -> list:
     return [img[:cut], img[cut:]]
 
 
-def transcribe_page_claude(img, model: str) -> str:
+def transcribe_page_claude(img, model: str, prompt: Optional[str] = None) -> str:
     """Claude 비전으로 한 페이지 전사 — 문단은 빈 줄 구분 평문.
 
     세로로 긴 페이지는 상/하 분할해 한 요청에 이미지 2장으로 전송."""
     import anthropic
     client = anthropic.Anthropic()
     parts = _page_halves(img)
-    prompt = (PROMPT_SCAN if len(parts) == 1
-              else PROMPT_SPLIT_NOTE + PROMPT_SCAN)
+    base = prompt or PROMPT_SCAN
+    prompt = (base if len(parts) == 1
+              else PROMPT_SPLIT_NOTE + base)
     content = [retype._img_block(_prep_for_claude(p)) for p in parts]
     content.append({"type": "text", "text": prompt})
     msg = client.messages.create(
@@ -469,15 +495,17 @@ def _parse_loose(raw: str) -> list:
             return retype._parse_json_reply(_repair_json(seg))
 
 
-def transcribe_page_gemini(img, model: str, key: str) -> str:
+def transcribe_page_gemini(img, model: str, key: str,
+                           prompt: Optional[str] = None) -> str:
     """Gemini 비전으로 한 페이지 전사 — Claude 비전의 저가 대안.
 
     세로로 긴 페이지는 상/하 분할해 한 요청에 이미지 2장으로 전송."""
     import base64
     import cv2
     parts = _page_halves(img)
-    prompt = (PROMPT_SCAN if len(parts) == 1
-              else PROMPT_SPLIT_NOTE + PROMPT_SCAN)
+    base = prompt or PROMPT_SCAN
+    prompt = (base if len(parts) == 1
+              else PROMPT_SPLIT_NOTE + base)
     content = []
     for p in parts:
         ok, buf = cv2.imencode(".png", _prep_for_claude(p))
@@ -494,7 +522,8 @@ def transcribe_page_gemini(img, model: str, key: str) -> str:
     return retype._clean_ws(raw.strip())
 
 
-def transcribe_page_deepseek(img, model: str, key: str, url: str) -> str:
+def transcribe_page_deepseek(img, model: str, key: str, url: str,
+                             prompt: Optional[str] = None) -> str:
     """DeepSeek(또는 임의 OpenAI 호환 서버) 비전 전사 — 초저가 대안.
 
     thinking 모드는 끔(전사에 불필요·토큰 절약). 이미지 입력이 400으로
@@ -502,8 +531,9 @@ def transcribe_page_deepseek(img, model: str, key: str, url: str) -> str:
     import base64
     import cv2
     parts = _page_halves(img)
-    prompt = (PROMPT_SCAN if len(parts) == 1
-              else PROMPT_SPLIT_NOTE + PROMPT_SCAN)
+    base = prompt or PROMPT_SCAN
+    prompt = (base if len(parts) == 1
+              else PROMPT_SPLIT_NOTE + base)
     content = []
     for p in parts:
         ok, buf = cv2.imencode(".png", _prep_for_claude(p))
@@ -709,6 +739,7 @@ def _join_paras(a: str, b: str) -> str:
 def _should_join(prev: str, nxt: str) -> bool:
     """앞 문단이 문장 종결 없이 끝났고 양쪽 다 제목이 아니면 병합."""
     return (not _is_heading(nxt) and not _is_heading(prev)
+            and not _is_subhead(nxt) and not _is_subhead(prev)
             and not prev.rstrip().endswith(_SENT_END))
 
 
@@ -764,11 +795,20 @@ _CHAPTER_JA_RE = re.compile(
 
 
 _HEAD_MARK = "## "      # 전사가 제목 줄에 붙이는 마커 (출력 시 제거)
+_SUB_MARK = "### "      # 소제목 — 장 안의 작은 제목 (목차 2단, 장 분할 안 함)
 
 
 def _strip_mark(s: str) -> str:
     s = (s or "").strip()
-    return s[len(_HEAD_MARK):].lstrip() if s.startswith(_HEAD_MARK) else s
+    for m in (_SUB_MARK, _HEAD_MARK):
+        if s.startswith(m):
+            return s[len(m):].lstrip()
+    return s
+
+
+def _is_subhead(s: str) -> bool:
+    """소제목(### ) — 병합 금지, 장 분할 기준은 아님."""
+    return (s or "").strip().startswith(_SUB_MARK)
 
 
 def _is_heading(s: str) -> bool:
@@ -780,6 +820,8 @@ def _is_heading(s: str) -> bool:
     s = s.strip()
     if s.startswith(_HEAD_MARK):
         return True
+    if s.startswith(_SUB_MARK):
+        return False                # 소제목 — 장을 나누지 않음
     if not s or len(s) > 60 or s.rstrip().endswith(_SENT_END):
         return False
     return (bool(_CHAPTER_RE.match(s)) or bool(_CHAPTER_JA_RE.match(s))
@@ -834,13 +876,18 @@ def _looks_untranslated(src: str, tr: str, src_lang: str) -> bool:
 
 
 def translate_chunk(items: list[tuple[int, str]], cfg: dict, gloss: str,
-                    ctx: str) -> dict[int, Optional[str]]:
-    """문단 묶음 하나 번역 — {전역 문단 인덱스: 한국어 or None(실패)}."""
+                    ctx: str, tmpl: Optional[str] = None
+                    ) -> dict[int, Optional[str]]:
+    """문단 묶음 하나 번역 — {전역 문단 인덱스: 한국어 or None(실패)}.
+
+    tmpl: 프롬프트 템플릿 교체({lang}/{gloss}/{ctx} 플레이스홀더 동일) —
+    PDF 문서 모드(ebook_pdf_translate)가 문서용 문체 프롬프트를 넘긴다.
+    기본은 책용 PROMPT_XLAT_BOOK."""
     listing = "\n\n".join(f"[{n}]\n{t}"
                           for n, (_, t) in enumerate(items, 1))
     ctx_txt = (f"\n직전 문맥 (참고용 — 번역하지 말 것):\n{ctx}\n"
                if ctx else "")
-    prompt = PROMPT_XLAT_BOOK.format(
+    prompt = (tmpl or PROMPT_XLAT_BOOK).format(
         lang=LANG_NAMES.get(cfg["source_lang"], cfg["source_lang"]),
         gloss=gloss, ctx=ctx_txt)
     body = f"{listing}\n\n{prompt}"
@@ -893,8 +940,9 @@ def translate_chunk(items: list[tuple[int, str]], cfg: dict, gloss: str,
 # ---------------------------------------------------------------------------
 # 5. 출력
 # ---------------------------------------------------------------------------
-def write_txt(path: Path, paras_ko: list[str]) -> None:
-    path.write_text("\n\n".join(paras_ko) + "\n", encoding="utf-8")
+def write_txt(path: Path, paras_ko: list[str], log=None) -> Path:
+    """번역본 TXT 저장 — 열려 있어도 결과를 잃지 않게 임시파일→교체."""
+    return retype.safe_write_text(path, "\n\n".join(paras_ko) + "\n", log)
 
 
 # 인라인 서식 마커 — 편집칸에서 입력, EPUB에서 실제 서식으로.
@@ -991,22 +1039,33 @@ def _clean_text(s) -> str:
 
 
 def _xhtml(title: str, paras: list[str]) -> str:
-    body = "\n".join(
-        (f"<h2>{_inline_html(p)}</h2>" if i == 0 and p and len(p) <= 60
-         else f"<p>{_inline_html(p)}</p>")
-        for i, p in enumerate(paras) if p)
+    """paras 중 '### '로 시작하는 것은 소제목 <h3 id="sN"> (N = 장 안 순번,
+    write_epub 목차 링크와 같은 번호)."""
+    out, ns = [], 0
+    for i, p in enumerate(paras):
+        if not p:
+            continue
+        if p.startswith(_SUB_MARK):
+            ns += 1
+            out.append(f'<h3 id="s{ns}">{_inline_html(p[len(_SUB_MARK):])}</h3>')
+        elif i == 0 and len(p) <= 60:
+            out.append(f"<h2>{_inline_html(p)}</h2>")
+        else:
+            out.append(f"<p>{_inline_html(p)}</p>")
+    body = "\n".join(out)
     return ('<?xml version="1.0" encoding="utf-8"?>\n'
             '<!DOCTYPE html>\n'
             '<html xmlns="http://www.w3.org/1999/xhtml" '
             'xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="ko">\n'
             f"<head><title>{html.escape(title)}</title>\n"
             "<style>p{margin:0 0 .1em 0;text-indent:1em;line-height:1.7}"
-            "h2{margin:1.4em 0 .8em 0}</style></head>\n"
+            "h2{margin:1.4em 0 .8em 0}h3{margin:1.2em 0 .6em 0;"
+            "font-size:1.1em}</style></head>\n"
             f"<body>\n{body}\n</body>\n</html>\n")
 
 
 def write_epub(path: Path, title: str, chapters: list[tuple[str, list[str]]],
-               src_lang: str, cover: bytes = None) -> None:
+               src_lang: str, cover: bytes = None, log=None) -> Path:
     """최소 구조 EPUB3 생성 — mimetype은 첫 항목·무압축(규격)."""
     uid = "ebook-xlat-" + re.sub(r"\W+", "-", title.lower()).strip("-")
     manifest, spine, navli, files = [], [], [], []
@@ -1016,7 +1075,13 @@ def write_epub(path: Path, title: str, chapters: list[tuple[str, list[str]]],
         manifest.append(f'<item id="c{i}" href="{fn}" '
                         'media-type="application/xhtml+xml"/>')
         spine.append(f'<itemref idref="c{i}"/>')
-        navli.append(f'<li><a href="{fn}">{html.escape(_strip_inline(label))}</a></li>')
+        subs = [p[len(_SUB_MARK):] for p in paras
+                if p and p.startswith(_SUB_MARK)]
+        sub_ol = ("<ol>" + "".join(
+            f'<li><a href="{fn}#s{k}">{html.escape(_strip_inline(t))}</a></li>'
+            for k, t in enumerate(subs, 1)) + "</ol>") if subs else ""
+        navli.append(f'<li><a href="{fn}">{html.escape(_strip_inline(label))}</a>'
+                     f'{sub_ol}</li>')
         files.append((fn, _xhtml(label if ct else title, paras)))
     cov_meta = cov_manifest = cov_spine = ""
     if cover:
@@ -1064,43 +1129,52 @@ def write_epub(path: Path, title: str, chapters: list[tuple[str, list[str]]],
                  '<rootfile full-path="OEBPS/content.opf" '
                  'media-type="application/oebps-package+xml"/>\n'
                  "</rootfiles>\n</container>\n")
-    with zipfile.ZipFile(path, "w") as z:
-        z.writestr("mimetype", "application/epub+zip",
-                   compress_type=zipfile.ZIP_STORED)
-        z.writestr("META-INF/container.xml", container,
-                   compress_type=zipfile.ZIP_DEFLATED)
-        z.writestr("OEBPS/content.opf", opf,
-                   compress_type=zipfile.ZIP_DEFLATED)
-        z.writestr("OEBPS/nav.xhtml", nav,
-                   compress_type=zipfile.ZIP_DEFLATED)
-        if cover:
-            z.writestr("OEBPS/cover.jpg", cover,
+    def _build(target):
+        with zipfile.ZipFile(target, "w") as z:
+            z.writestr("mimetype", "application/epub+zip",
                        compress_type=zipfile.ZIP_STORED)
-        for fn, content in files:
-            z.writestr(f"OEBPS/{fn}", content,
+            z.writestr("META-INF/container.xml", container,
                        compress_type=zipfile.ZIP_DEFLATED)
+            z.writestr("OEBPS/content.opf", opf,
+                       compress_type=zipfile.ZIP_DEFLATED)
+            z.writestr("OEBPS/nav.xhtml", nav,
+                       compress_type=zipfile.ZIP_DEFLATED)
+            if cover:
+                z.writestr("OEBPS/cover.jpg", cover,
+                           compress_type=zipfile.ZIP_STORED)
+            for fn, content in files:
+                z.writestr(f"OEBPS/{fn}", content,
+                           compress_type=zipfile.ZIP_DEFLATED)
+
+    # 뷰어(캘리버·리더)가 기존 EPUB을 열어둔 채여도 결과를 잃지 않게
+    return retype.safe_produce(path, _build, log)
 
 
 def export_outputs(out: Path, title: str, src_lang: str,
                    paras: list[str], done: dict,
-                   cover: bytes = None) -> dict:
+                   cover: bytes = None, log=None) -> dict:
     """번역본 TXT+EPUB 생성 (run_book·편집 모드 공용).
 
     done: {문단 인덱스: 번역 or None} — None/누락은 원문 그대로.
     "## " 제목 마커는 장 분할에 쓰고 출력 텍스트에선 제거한다."""
     paras_ko = [_strip_mark(done.get(i) or paras[i])
                 for i in range(len(paras))]
+    # EPUB용 — 소제목(원문 ### 기준)은 마커를 남겨 _xhtml이 <h3>·목차 2단으로
+    paras_ep = [(_SUB_MARK + p) if _is_subhead(paras[i]) and p else p
+                for i, p in enumerate(paras_ko)]
     marks = detect_chapters(paras)
     chapters = []
     for k, (ct, start) in enumerate(marks):
         end = marks[k + 1][1] if k + 1 < len(marks) else len(paras)
         ct_ko = _strip_mark(done.get(start) or ct) if ct else ""
-        chapters.append((ct_ko, paras_ko[start:end]))
-    txt_path = out / f"{title}_ko.txt"
-    epub_path = out / f"{title}_ko.epub"
-    write_txt(txt_path, [_strip_inline(p) for p in paras_ko])
-    write_epub(epub_path, title, chapters,
-               LANG_NAMES.get(src_lang, src_lang), cover=cover)
+        chapters.append((ct_ko, paras_ep[start:end]))
+    # 저장 경로는 write_* 가 실제로 쓴 경로로 갱신 — 원래 이름이 열려 있으면
+    # '이름 (2).txt' 로 저장되므로 로그·반환값이 어긋나지 않게 한다.
+    txt_path = write_txt(out / f"{title}_ko.txt",
+                         [_strip_inline(p) for p in paras_ko], log)
+    epub_path = write_epub(out / f"{title}_ko.epub", title, chapters,
+                           LANG_NAMES.get(src_lang, src_lang),
+                           cover=cover, log=log)
     return {"txt": txt_path, "epub": epub_path, "chapters": len(chapters)}
 
 
@@ -1202,9 +1276,54 @@ def resolve_out(cfg: dict) -> tuple[Path, str]:
     """출력 폴더와 책 제목 (run_book·편집 서버 공용)."""
     src = Path(cfg["src"])
     title = (cfg.get("title") or "").strip() or src.stem
-    out = Path(cfg.get("out") or (src.parent if src.is_file() else src)
-               / f"{title}_한글번역")
+    if cfg.get("out"):
+        out = Path(cfg["out"])
+    elif (src.is_file() and src.suffix.lower() in PLAIN_EXTS) or \
+            (src.is_dir() and plain_book_dir(src, title).exists()):
+        # 평문 책(txt/md·폴더 가져오기 — ebook_import) — 번역 산출물이 아니므로 _book
+        out = plain_book_dir(src, title)
+    else:
+        out = (src.parent if src.is_file() else src) / f"{title}_한글번역"
     return out, title
+
+
+PLAIN_EXTS = (".txt", ".md", ".markdown")
+LIB_NAME = "_Ebook_Library"     # 서고 루트 폴더 이름 (Drive)
+BOOKS_DIR = "_books"            # 서고 안 가져온 책 모음 폴더
+
+
+def lib_root(p) -> Optional[Path]:
+    """경로가 서고(_Ebook_Library) 안이면 서고 루트, 아니면 None."""
+    p = Path(p)
+    for a in [p] + list(p.parents):
+        if a.name == LIB_NAME:
+            return a
+    return None
+
+
+def plain_book_dir(src, title: str) -> Path:
+    """평문 책(_book) 폴더 위치 — 서고 안 원본이면 `_Ebook_Library/_books/`
+    모음 폴더(12,000권 사이에 흩어지지 않게, 2026-10-02 사용자 결정),
+    서고 밖이면 원본 옆. 예전 방식(원본 옆)으로 이미 만든 폴더가 있으면
+    그것을 계속 쓴다(북마크·교정 보존)."""
+    src = Path(src)
+    base = src if src.is_dir() else src.parent
+    legacy = base / f"{title}_book"
+    if legacy.exists():
+        return legacy
+    root = lib_root(src)
+    if root is not None and BOOKS_DIR not in src.parts:
+        return root / BOOKS_DIR / f"{title}_book"
+    return legacy
+
+
+def is_plain_src(src) -> bool:
+    """소스가 평문 텍스트 파일(라이브러리 가져오기)인지 — 전사·번역 대상 아님."""
+    try:
+        sp = Path(src)
+        return sp.is_file() and sp.suffix.lower() in PLAIN_EXTS
+    except Exception:
+        return False
 
 
 def redo_reset(out: Path, mode: str, log) -> None:
@@ -1389,8 +1508,21 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
     src = Path(cfg["src"])
     kind, total = probe_source(src)
     cfg["kind"] = kind
+    bible = cfg.get("mode") == "bible"      # 성경 캡처: 절 단위 전사만 (번역 없음)
+    if bible:
+        cfg["backend"] = "none"             # 번역 키 검사 제외
+        if cfg.get("source_lang") in (None, "", "auto"):
+            cfg["source_lang"] = "ko"       # 로컬 OCR 언어 (독일어 성경이면 GUI에서 지정)
+        if not (cfg.get("out") or "").strip():
+            t0 = (cfg.get("title") or "").strip() or src.stem
+            cfg["out"] = str((src.parent if src.is_file() else src)
+                             / f"{t0}_성경전사")
     out, title = resolve_out(cfg)
     out.mkdir(parents=True, exist_ok=True)
+    # 전사·번역에 시간과 요금을 쓰기 전에 출력 파일 잠김부터 확인
+    retype.check_free([out / f"{title}_성경.txt"] if bible else
+                      [out / f"{title}_ko.txt", out / f"{title}_ko.epub",
+                       out / f"{title}_src.txt"], log)
     work = out / "_work"
     (work / "pages").mkdir(parents=True, exist_ok=True)
 
@@ -1418,9 +1550,13 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
 
     kind_ko = {"images": "이미지 폴더", "pdf-text": "텍스트 PDF",
                "pdf-scan": "스캔 PDF"}[kind]
-    log(f"소스: {kind_ko}, {total}페이지 — "
-        f"{LANG_NAMES.get(cfg['source_lang'], '자동 감지')}"
-        f" → 한글, 제목 '{title}'")
+    if bible:
+        log(f"소스: {kind_ko}, {total}페이지 — 성경 캡처 모드(절 단위 전사만, "
+            f"번역 없음), 제목 '{title}'")
+    else:
+        log(f"소스: {kind_ko}, {total}페이지 — "
+            f"{LANG_NAMES.get(cfg['source_lang'], '자동 감지')}"
+            f" → 한글, 제목 '{title}'")
 
     pages = list_source_pages(src, kind)
     if (cfg.get("page_range") or "").strip():
@@ -1429,7 +1565,8 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
     _resolve_auto_lang(cfg, src, kind, pages, work, log)
 
     # ---- 전사 (페이지별 resume: _work/pages/<라벨>.txt) ----
-    lang_codes = {"de": "deu", "en": "eng", "ja": "jpn"}
+    lang_codes = {"de": "deu", "en": "eng", "ja": "jpn", "ko": "kor"}
+    vprompt = PROMPT_BIBLE if bible else None
     page_texts: list[str] = []
     if kind == "pdf-text":
         doc = _pdf_doc(src)
@@ -1449,32 +1586,50 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
                                    or DEEPSEEK_MODEL) + ")",
                     "winocr": "Windows OCR",
                     "tesseract": "Tesseract"}[ocr]
+        # 비전 API 전사는 한 장에 수십 초 걸리는 서버도 있어(DeepInfra DeepSeek-OCR 30~40초 실측)
+        # 성경 캡처 모드에서는 여러 장을 동시에 보낸다. 로컬 OCR·일반 책 모드는 종전처럼 한 장씩.
+        workers = 1
+        if bible and ocr in ("claude", "gemini", "deepseek"):
+            try:
+                workers = max(1, min(16, int(cfg.get("workers") or 6)))
+            except (TypeError, ValueError):
+                workers = 6
         log(f"전사 시작 — {ocr_name}"
-            f" ({len(pages)}페이지, 완료 페이지는 건너뜀)")
-        for i, p in enumerate(pages, 1):
-            if is_cancelled():
-                raise Cancelled()
+            f" ({len(pages)}페이지, 완료 페이지는 건너뜀"
+            + (f", 동시 {workers}장" if workers > 1 else "") + ")")
+
+        def _one(p):
             lbl = page_label(kind, p)
             cache = work / "pages" / f"{Path(lbl).stem}.txt"
             if cache.exists():
                 cached = cache.read_text(encoding="utf-8")
                 if cached.strip():                 # 내용 있는 캐시만 '완료'로 재사용
-                    page_texts.append(cached)
-                    continue
+                    return cached, True
                 # 빈 캐시 = 이전 실패분 → 완료로 보지 않고 다시 전사
+            if is_cancelled():
+                raise Cancelled()
             try:
                 img = load_page_image(src, kind, p)
+                if bible and ocr == "tesseract":
+                    # 앱 화면 캡처는 글자가 작아(~17px) Tesseract가 작은 절 번호를
+                    # 자주 놓친다 — 3배 확대로 크게 개선(실측 2026-09-23).
+                    # ※ Windows OCR은 확대하면 오히려 깨진다(한자·기호 오인식) → 원본 그대로.
+                    import cv2
+                    img = cv2.resize(img, None, fx=3, fy=3,
+                                     interpolation=cv2.INTER_CUBIC)
                 if ocr == "claude":
-                    t = transcribe_page_claude(img, cfg["claude_model"])
+                    t = transcribe_page_claude(img, cfg["claude_model"],
+                                               prompt=vprompt)
                 elif ocr == "gemini":
                     t = transcribe_page_gemini(
                         img, cfg.get("gemini_model") or GEMINI_MODEL,
-                        cfg["gemini_key"])
+                        cfg["gemini_key"], prompt=vprompt)
                 elif ocr == "deepseek":
                     t = transcribe_page_deepseek(
                         img, cfg.get("deepseek_model") or DEEPSEEK_MODEL,
                         cfg["deepseek_key"],
-                        cfg.get("deepseek_url") or DEEPSEEK_URL)
+                        cfg.get("deepseek_url") or DEEPSEEK_URL,
+                        prompt=vprompt)
                 elif ocr == "winocr":
                     t = transcribe_page_winocr(img, cfg["source_lang"])
                 else:
@@ -1492,9 +1647,54 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
                     cache.unlink()
                 except OSError:
                     pass
-            page_texts.append(t)
-            if i % 10 == 0 or i == len(pages):
-                log(f"  전사 {i}/{len(pages)}")
+            return t, False
+
+        if workers == 1:
+            for i, p in enumerate(pages, 1):
+                if is_cancelled():
+                    raise Cancelled()
+                t, cached = _one(p)
+                page_texts.append(t)
+                if not cached and (i % 10 == 0 or i == len(pages)):
+                    log(f"  전사 {i}/{len(pages)}")
+        else:
+            import concurrent.futures as _cf
+            res: list = [""] * len(pages)
+            done_n = 0
+            ex = _cf.ThreadPoolExecutor(max_workers=workers)
+            try:
+                futs = {ex.submit(_one, p): k for k, p in enumerate(pages)}
+                for f in _cf.as_completed(futs):
+                    res[futs[f]] = f.result()[0]      # 치명 오류(키·크레딧)·취소는 여기서 올라와 중단
+                    done_n += 1
+                    if done_n % 10 == 0 or done_n == len(pages):
+                        log(f"  전사 {done_n}/{len(pages)}")
+            except BaseException:
+                for f in futs:
+                    f.cancel()
+                raise
+            finally:
+                ex.shutdown(wait=True, cancel_futures=True)
+            page_texts.extend(res)
+
+    # ---- 성경 캡처 모드: 페이지 전사를 그대로 이어 저장하고 끝 ----
+    if bible:
+        body = "\n\n".join(t.strip() for t in page_texts if t.strip())
+        if not body:
+            raise RuntimeError("전사된 본문이 없습니다 — 전사 방식이나 "
+                               "페이지 범위를 확인하세요")
+        dst = out / f"{title}_성경.txt"
+        retype.safe_write_text(dst, body + "\n", log)
+        n_empty = sum(1 for t in page_texts if not t.strip())
+        log(f"완료: {dst.name} ({len(page_texts)}페이지"
+            + (f", 빈 페이지 {n_empty}" if n_empty else "") + ")")
+        log("→ 성경 뷰어 앱 ⚙ 설정 › 번역본 가져오기에 이 파일을 넣으세요 "
+            "(여러 번 나눠 넣을 땐 '이어 붙이기')")
+        usage = retype.usage_summary()
+        if usage:
+            log(usage)
+        return {"txt": str(dst), "pages": len(page_texts),
+                "empty": n_empty}
 
     # ---- 병합 (+ 편집 모드용 book.json — 원문 수정 영속) ----
     labels = [page_label(kind, p) for p in pages]
@@ -1520,8 +1720,8 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
         raise RuntimeError("전사된 본문이 없습니다 — 전사 방식을 바꾸거나 "
                            "페이지 범위를 확인하세요")
     _atomic_json(bp, book)
-    (out / f"{title}_src.txt").write_text("\n\n".join(paras) + "\n",
-                                          encoding="utf-8")
+    retype.safe_write_text(out / f"{title}_src.txt",
+                           "\n\n".join(paras) + "\n", log)
     log(f"본문 재구성: {len(paras)}문단 (원문 저장: {title}_src.txt)")
 
     # ---- 번역 (청크별 resume: _work/xlat.json) ----
@@ -1609,7 +1809,7 @@ def run_book(cfg: dict, log, is_cancelled) -> dict:
 
     # ---- 출력 ----
     r = export_outputs(out, title, cfg["source_lang"], paras, done,
-                       cover=_cover_jpg(cfg, load_book(out)))
+                       cover=_cover_jpg(cfg, load_book(out)), log=log)
     log(f"완료: {r['epub'].name} / {r['txt'].name} "
         f"({r['chapters']}개 장, {len(paras)}문단)")
     log("검토·수정: GUI [편집 페이지] 버튼 또는 --edit 옵션")
@@ -1658,6 +1858,9 @@ def edit_data(out: Path) -> Optional[dict]:
         return None
     done = load_xlat(out)
     return {"title": book.get("title") or "", "paras": book["paras"],
+            # kind: "plain" = 가져온 평문 책(원문 슬롯만 사용, 번역 없음) —
+            # 검수 UI가 번역칸·원문 토글·재전사를 숨긴다. 없으면 번역책.
+            "kind": book.get("kind") or "xlat",
             "pages": book.get("page_labels") or [],
             "fp": book_fingerprint(book), "count": len(book["paras"]),
             "cover": book.get("cover") or "",
@@ -1666,6 +1869,11 @@ def edit_data(out: Path) -> Optional[dict]:
             "pos": book.get("pos"),
             "off": book.get("off"),          # 문단 내 글자 오프셋(정밀 복원)
             "pos_ts": book.get("pos_ts"),    # 위치 저장 시각(충돌 판정)
+            # 하이라이트 {문단: [[s,e,색],…]} + 저장 시각(기기 간 최신 판정)
+            "hi": book.get("hi") or {},
+            "hi_ts": book.get("hi_ts") or 0,
+            # 자동 교정 기록 {mode, ts, items:[{t,i,…}]} — 편집 페이지 목록·되돌리기
+            "af": book.get("af") or {},
             "ocr_modes": [["실행 설정", ""]] + [[lb, k]
                                                for lb, k in OCR_MODES],
             "xlat": {str(k): v for k, v in done.items()},
@@ -1692,7 +1900,47 @@ def write_edit_html(out: Path) -> Optional[Path]:
     return fp
 
 
-def save_marks(out: Path, bmks=None, pos=None, off=None, ts=None) -> dict:
+HI_COLORS = 5          # 하이라이트 색 개수 (edit_ui HIC 팔레트와 맞춤)
+
+
+def clean_hi(hi, n: int) -> dict:
+    """하이라이트 맵 검증·정규화 — {"문단idx": [[s,e,c],…]}.
+
+    범위 밖 문단·잘못된 값 버림, [s,e](구형)는 c=0, '_'로 시작하는
+    메타 키(_ts 등)는 무시. 빈 목록 문단은 제거."""
+    out = {}
+    if not isinstance(hi, dict):
+        return out
+    for k, rs in hi.items():
+        if str(k).startswith("_") or not isinstance(rs, list):
+            continue
+        try:
+            i = int(k)
+        except (TypeError, ValueError):
+            continue
+        if not 0 <= i < n:
+            continue
+        good = []
+        for r in rs:
+            try:
+                a, b = int(r[0]), int(r[1])
+                c = int(r[2]) if len(r) > 2 else 0
+            except (TypeError, ValueError, IndexError):
+                continue
+            if 0 <= a < b:
+                good.append([a, b, c if 0 <= c < HI_COLORS else 0])
+        if good:
+            out[str(i)] = sorted(good)
+    return out
+
+
+def hi_count(hi) -> int:
+    return sum(len(v) for k, v in (hi or {}).items()
+               if not str(k).startswith("_") and isinstance(v, list))
+
+
+def save_marks(out: Path, bmks=None, pos=None, off=None, ts=None,
+               hi=None, hi_ts=None) -> dict:
     """북마크 목록·읽던 위치를 book.json에 저장 (PC 편집 서버·폰 회수 공용).
 
     기기 localStorage가 아니라 책 데이터에 두어야 PC·폰 양쪽에서 같이
@@ -1701,6 +1949,8 @@ def save_marks(out: Path, bmks=None, pos=None, off=None, ts=None) -> dict:
     저장 시각(ts, 기기 간 충돌 판정용)을 함께 둔다 — 킨들 location처럼
     문단 '안'의 지점까지 복원(v0.19). off는 pos에 딸린 값이라 pos 갱신 시
     항상 함께 갱신(없으면 제거 — 옛 off가 새 pos에 붙는 것 방지).
+    하이라이트(hi)는 {문단idx: [[s,e,c],…]} — c는 색 번호(0~HI_COLORS-1,
+    구형 [s,e]는 c=0). hi_ts는 마지막 수정 시각(ms) — 폰·PC 중 최신 채택.
     None인 항목은 건드리지 않는다(부분 저장)."""
     book = load_book(out)
     if not book:
@@ -1724,6 +1974,12 @@ def save_marks(out: Path, bmks=None, pos=None, off=None, ts=None) -> dict:
     if bmks is not None:
         book["bmks"] = sorted({i for i in (_idx(x) for x in bmks)
                                if i is not None})
+    if hi is not None:
+        book["hi"] = clean_hi(hi, n)
+        try:
+            book["hi_ts"] = int(hi_ts) if hi_ts else int(time.time() * 1000)
+        except (TypeError, ValueError):
+            book["hi_ts"] = int(time.time() * 1000)
     if pos is not None:
         p = _posv(pos)
         if p is not None:
@@ -1743,7 +1999,7 @@ def save_marks(out: Path, bmks=None, pos=None, off=None, ts=None) -> dict:
     work.mkdir(parents=True, exist_ok=True)
     _atomic_json(work / "book.json", book)
     return {"ok": True, "bmks": book.get("bmks") or [],
-            "pos": book.get("pos")}
+            "pos": book.get("pos"), "hi_n": hi_count(book.get("hi"))}
 
 
 def save_bookmarks(out: Path, bmks: list) -> dict:
@@ -1778,11 +2034,331 @@ def _edit_save(out: Path, edits: list, log) -> dict:
     _atomic_json(work / "xlat.json", {str(k): v for k, v in done.items()})
     if ns:      # 원문 검수 파일도 동기화
         title = book.get("title") or "book"
-        (out / f"{title}_src.txt").write_text(
-            "\n\n".join(e["src"] for e in book["paras"]) + "\n",
-            encoding="utf-8")
+        retype.safe_write_text(
+            out / f"{title}_src.txt",
+            "\n\n".join(e["src"] for e in book["paras"]) + "\n", log)
     log(f"편집 저장: 원문 {ns}건, 번역 {nt}건")
     return {"src": ns, "text": nt}
+
+
+_MK_PAIRS = (re.compile(r"\*\*([\s\S]+?)\*\*"), re.compile(r"~~([\s\S]+?)~~"),
+             re.compile(r"\+\+([\s\S]+?)\+\+"), re.compile(r"\*([^*\n]+?)\*"))
+_MK_RIGHT = re.compile(r"^[ \t　]*(?:>>|＞＞)\s+")
+
+
+def _disp_text(s: str) -> str:
+    """읽기 화면(edit_ui stripMark+fmtHtml)에 실제로 그려지는 글자 — 하이라이트
+    오프셋 좌표계. ##/### 머리 마커·**/~~/++/* 서식 마커·>> 정렬 마커·줄바꿈 제거."""
+    s = re.sub(r"^#{2,3}\s*", "", s or "")
+    for rx in _MK_PAIRS:
+        s = rx.sub(r"\1", s)
+    return "".join(_MK_RIGHT.sub("", ln) for ln in s.split("\n"))
+
+
+def _cjk_tight(ch: str) -> bool:
+    """띄어쓰기 없이 붙는 문자(한자·가나·전각 문장부호) — 한글은 제외."""
+    o = ord(ch)
+    return (0x3000 <= o <= 0x30FF or 0x3400 <= o <= 0x9FFF
+            or 0xF900 <= o <= 0xFAFF or 0xFF00 <= o <= 0xFF60)
+
+
+def _af_remap(book: dict, fn) -> None:
+    """자동 교정 기록(book["af"]["items"])의 문단 번호·오프셋을 구조 변경에 맞춰
+    옮긴다. fn(i, off) → (i', off') 또는 None(그 문단이 사라짐)."""
+    af = book.get("af")
+    if not isinstance(af, dict) or not af.get("items"):
+        return
+    keep = []
+    for it in af["items"]:
+        r = fn(int(it.get("i", 0)), it.get("off"))
+        if r is None:
+            continue
+        it["i"], o = r
+        if o is not None:
+            it["off"] = o
+        keep.append(it)
+    af["items"][:] = keep           # 제자리 — 호출부가 쥔 목록 참조 유지
+
+
+def _shift_marks(book: dict, done: dict, mv, drop_i=None) -> None:
+    """insert/drop 공용 — 번역 키·북마크·위치·하이라이트를 mv(k)로 옮김."""
+    nd = {}
+    for k, v in done.items():
+        if k == drop_i:
+            continue
+        nd[mv(k)] = v
+    done.clear()
+    done.update(nd)
+    if book.get("bmks"):
+        book["bmks"] = sorted({mv(int(x)) if int(x) != drop_i else
+                               max(0, int(x) - 1) for x in book["bmks"]})
+    if book.get("pos") is not None:
+        p = float(book["pos"])
+        ip = int(p)
+        if ip == drop_i:
+            book["pos"], book["off"] = float(max(0, ip - 1)), 0
+        else:
+            book["pos"] = round(p + (mv(ip) - ip), 3)
+    if book.get("hi"):
+        nh = {}
+        for k, rs in book["hi"].items():
+            try:
+                ki = int(k)
+            except (TypeError, ValueError):
+                continue
+            if ki == drop_i:
+                continue
+            nh.setdefault(str(mv(ki)), []).extend(rs)
+        book["hi"] = nh
+
+
+def restructure_book(book: dict, done: dict, op: str, i: int,
+                     off: int = 0, sep=None, text: str = "") -> dict:
+    """문단 합치기(merge: i와 i+1) / 나누기(split: i를 원문 off 위치에서) /
+    끼워 넣기(insert: i 위치에 text 문단) / 빼기(drop: i 문단 삭제).
+
+    sep: merge 이음 문자 (None = 자동: 공백 1칸, 한자·가나끼리는 붙임).
+    insert/drop은 자동 교정(잡음 줄 제거)과 그 되돌리기에서 쓴다.
+
+    book·done(xlat {int: str})을 제자리 수정. 문단 번호가 바뀌므로 함께
+    보정: 번역 키·북마크(bmks)·읽던 위치(pos/off)·하이라이트(hi, 표시 좌표).
+    fp(원문 crc)가 바뀌므로 폰의 옛 수정 큐는 fp 게이트에서 걸러진다."""
+    paras = book["paras"]
+    n = len(paras)
+    if op == "merge":
+        if not 0 <= i < n - 1:
+            raise ValueError("마지막 문단은 다음과 합칠 수 없습니다")
+        a = (paras[i].get("src") or "").rstrip()
+        b = re.sub(r"^#{2,3}\s*", "", (paras[i + 1].get("src") or "").lstrip())
+        j = "" if (a and b and _cjk_tight(a[-1]) and _cjk_tight(b[0])) else " "
+        if sep is not None:
+            j = str(sep)
+        if not a or not b:
+            j = ""
+        new = dict(paras[i], src=a + j + b)
+        pe = paras[i + 1].get("page_end") or paras[i + 1].get("page")
+        if pe and pe != new.get("page"):
+            new["page_end"] = pe
+        paras[i:i + 2] = [new]
+        # 번역: 둘 다 있으면 이어 붙이고, 뒤 문단 키는 -1
+        ta, tb = done.get(i), done.get(i + 1)
+        nd = {}
+        for k, v in done.items():
+            if k < i:
+                nd[k] = v
+            elif k > i + 1:
+                nd[k - 1] = v
+        if ta or tb:
+            nd[i] = " ".join(x.strip() for x in (ta, tb) if x)
+        done.clear()
+        done.update(nd)
+        da = len(_disp_text(a)) + len(j)        # b의 표시 오프셋 이동량
+
+        def mv(k):
+            return k if k <= i else k - 1
+        if book.get("bmks"):
+            book["bmks"] = sorted({mv(int(x)) for x in book["bmks"]})
+        if book.get("pos") is not None:
+            p = float(book["pos"])
+            ip = int(p)
+            if ip > i + 1:
+                book["pos"] = round(p - 1, 3)
+            elif ip == i + 1:
+                book["pos"] = float(i)
+                book["off"] = int(book.get("off") or 0) + da
+        if book.get("hi"):
+            nh = {}
+            for k, rs in book["hi"].items():
+                try:
+                    ki = int(k)
+                except (TypeError, ValueError):
+                    continue
+                if ki == i + 1:
+                    nh.setdefault(str(i), []).extend(
+                        [r[0] + da, r[1] + da] + list(r[2:3]) for r in rs)
+                else:
+                    nh.setdefault(str(mv(ki)), []).extend(rs)
+            book["hi"] = {k: sorted(v) for k, v in nh.items()}
+        sa = len(a) + len(j)                    # b의 원문 오프셋 이동량
+        _af_remap(book, lambda k, o: (k, o) if k <= i else
+                  ((i, (o or 0) + sa) if k == i + 1 else (k - 1, o)))
+        return {"op": "merge", "i": i, "n": len(paras),
+                "caret": len(a) + len(j)}       # 이음새(띄어쓰기 뒤) 커서 위치
+    if op == "split":
+        if not 0 <= i < n:
+            raise ValueError("문단 번호가 범위를 벗어났습니다")
+        src = paras[i].get("src") or ""
+        off = int(off)
+        a, rest = src[:off].rstrip(), src[off:]
+        b = rest.lstrip()
+        if not a.strip() or not b.strip() or a.strip() in ("##", "###"):
+            raise ValueError("나눌 위치에 커서를 두세요 (문단 처음·끝 제외)")
+        dk = len(_disp_text(src[:off]))          # 표시 좌표의 나눔 지점
+        lead = len(_disp_text(rest)) - len(_disp_text(b))
+        nb = {k: v for k, v in paras[i].items() if k not in ("src",)}
+        nb["src"] = b
+        if paras[i].get("page_end"):            # 페이지 걸침은 뒤 문단이 끝을 가짐
+            nb["page"] = paras[i]["page_end"]
+            nb.pop("page_end", None)
+        na = dict(paras[i], src=a)
+        na.pop("page_end", None)
+        paras[i:i + 1] = [na, nb]
+        nd = {}
+        for k, v in done.items():
+            nd[k if k <= i else k + 1] = v
+        done.clear()
+        done.update(nd)
+
+        def mv(k):
+            return k if k <= i else k + 1
+        if book.get("bmks"):
+            book["bmks"] = sorted({mv(int(x)) for x in book["bmks"]})
+        if book.get("pos") is not None:
+            p = float(book["pos"])
+            ip = int(p)
+            if ip > i:
+                book["pos"] = round(p + 1, 3)
+            elif ip == i and book.get("off") is not None \
+                    and int(book["off"]) >= dk:
+                book["pos"] = float(i + 1)
+                book["off"] = max(0, int(book["off"]) - dk - lead)
+        if book.get("hi"):
+            nh = {}
+            sh = dk + lead
+            for k, rs in book["hi"].items():
+                try:
+                    ki = int(k)
+                except (TypeError, ValueError):
+                    continue
+                if ki != i:
+                    nh.setdefault(str(mv(ki)), []).extend(rs)
+                    continue
+                for r in rs:
+                    s0, e0, c = r[0], r[1], list(r[2:3])
+                    if e0 <= dk:
+                        nh.setdefault(str(i), []).append([s0, e0] + c)
+                    elif s0 >= dk:
+                        a2, b2 = max(0, s0 - sh), e0 - sh
+                        if b2 > a2:
+                            nh.setdefault(str(i + 1), []).append([a2, b2] + c)
+                    else:                       # 나눔 지점에 걸침 → 둘로
+                        nh.setdefault(str(i), []).append([s0, dk] + c)
+                        if e0 - sh > 0:
+                            nh.setdefault(str(i + 1), []).append(
+                                [0, e0 - sh] + c)
+            book["hi"] = {k: sorted(v) for k, v in nh.items() if v}
+        cut = len(src) - len(b)                 # 원문 기준 뒤 문단 시작
+
+        def _sp(k, o):
+            if k < i:
+                return (k, o)
+            if k > i:
+                return (k + 1, o)
+            if o is not None and o >= off:
+                return (i + 1, max(0, o - cut))
+            return (k, o)
+        _af_remap(book, _sp)
+        return {"op": "split", "i": i, "n": len(paras)}
+    if op == "insert":
+        if not 0 <= i <= n:
+            raise ValueError("문단 번호가 범위를 벗어났습니다")
+        t = str(text or "").strip()
+        if not t:
+            raise ValueError("빈 문단은 넣을 수 없습니다")
+        ref = paras[i] if i < n else (paras[-1] if paras else {"page": ""})
+        paras.insert(i, {"src": t, "page": ref.get("page", "")})
+        _shift_marks(book, done, lambda k: k if k < i else k + 1)
+        _af_remap(book, lambda k, o: (k, o) if k < i else (k + 1, o))
+        return {"op": "insert", "i": i, "n": len(paras)}
+    if op == "drop":
+        if not 0 <= i < n or n < 2:
+            raise ValueError("문단 번호가 범위를 벗어났습니다")
+        del paras[i]
+        _shift_marks(book, done, lambda k: k if k < i else k - 1, drop_i=i)
+        _af_remap(book, lambda k, o: (k, o) if k < i else (k - 1, o))
+        return {"op": "drop", "i": i, "n": len(paras)}
+    raise ValueError(f"알 수 없는 op: {op}")
+
+
+def mark_struct_sent(out: Path, ts: int) -> None:
+    """문단 구조 변경분을 폰(GAS)에 맞춰 보냈다는 표식 (웹앱 업로드 후)."""
+    book = load_book(out)
+    if book:
+        book["struct_sent"] = int(ts)
+        _atomic_json(out / "_work" / "book.json", book)
+
+
+def _struct_save(out: Path, book: dict, done: dict, log) -> None:
+    """문단 구조가 바뀐 책 저장 (합치기·나누기·자동 교정·되돌리기 공용)."""
+    now = int(time.time() * 1000)
+    # 문단 번호가 바뀐 시각 — 폰(GAS)의 북마크·하이라이트·위치는 아직 옛 번호라
+    # 다음 업로드 전까지 회수하지 않고, 업로드 때 PC 값으로 덮어쓴다(웹앱)
+    book["struct_ts"] = now
+    if book.get("hi") is not None:
+        book["hi_ts"] = now
+    work = out / "_work"
+    _atomic_json(work / "book.json", book)
+    _atomic_json(work / "xlat.json", {str(k): v for k, v in done.items()})
+    title = book.get("title") or "book"
+    retype.safe_write_text(
+        out / f"{title}_src.txt",
+        "\n\n".join(x["src"] for x in book["paras"]) + "\n", log)
+    write_edit_html(out)                    # 새로고침용 재생성
+
+
+def _edit_autofix(out: Path, cfg: dict, req: dict, log) -> dict:
+    """편집 서버 /api/autofix — 이미 가져온 평문 책 자동 교정 (PC 전용).
+    dry=True면 적용하지 않고 예상 건수·AI 토큰만."""
+    import ebook_autofix as af
+    book = load_book(out)
+    if not book:
+        raise RuntimeError("편집 데이터(book.json)가 없습니다")
+    if req.get("dry"):
+        return dict(af.estimate(book), engine=af.ai_engine_label(cfg))
+    done = load_xlat(out)
+    mode = "ai" if req.get("mode") == "ai" else "rule"
+    st = af.run(book, done, mode, cfg, log)
+    _struct_save(out, book, done, log)
+    return st
+
+
+def _edit_af_undo(out: Path, req: dict, log) -> dict:
+    """편집 서버 /api/af_undo — 자동 교정 기록 하나 되돌리기."""
+    import ebook_autofix as af
+    book = load_book(out)
+    if not book:
+        raise RuntimeError("편집 데이터(book.json)가 없습니다")
+    done = load_xlat(out)
+    r = af.undo_item(book, done, int(req.get("k", -1)))
+    _struct_save(out, book, done, log)
+    log(f"자동 교정 되돌리기: #{r['i'] + 1}")
+    return r
+
+
+def _edit_restructure(out: Path, req: dict, log) -> dict:
+    """편집 서버 /api/restructure — 문단 합치기·나누기 (PC 전용)."""
+    book = load_book(out)
+    if not book:
+        raise RuntimeError("편집 데이터(book.json)가 없습니다")
+    done = load_xlat(out)
+    op = str(req.get("op") or "")
+    i = int(req.get("i", -1))
+    cnt = max(1, min(500, int(req.get("n") or 1)))   # 여러 문단 한 번에 합치기
+    if op == "merge" and cnt > 1:
+        if not 0 <= i < len(book["paras"]) - cnt:
+            raise ValueError("합칠 문단 범위가 책 끝을 넘습니다")
+        r = None
+        for _k in range(cnt):           # 한 쌍씩 — 번역·북마크·위치·하이라이트 보정 재사용
+            rr = restructure_book(book, done, "merge", i)
+            r = r or rr                 # caret = 첫 이음새
+        r = dict(r, n=len(book["paras"]), merged=cnt + 1)
+    else:
+        r = restructure_book(book, done, op, i, int(req.get("off") or 0))
+    _struct_save(out, book, done, log)
+    log(("문단 합치기" + (f" ({r['merged']}개)" if r.get("merged") else "")
+         if r["op"] == "merge" else "문단 나누기")
+        + f": #{r['i'] + 1} → 전체 {r['n']}문단")
+    return r
 
 
 def _edit_xlat(out: Path, cfg: dict, ids: list, log) -> dict:
@@ -1827,7 +2403,7 @@ def _edit_export(out: Path, cfg: dict, log) -> dict:
     paras = [e.get("src") or "" for e in book["paras"]]
     r = export_outputs(out, book.get("title") or "book",
                        book.get("source_lang") or "de", paras, done,
-                       cover=_cover_jpg(cfg, book))
+                       cover=_cover_jpg(cfg, book), log=log)
     log(f"재생성: {r['txt'].name} / {r['epub'].name} ({r['chapters']}개 장)")
     return {"files": [r["txt"].name, r["epub"].name],
             "chapters": r["chapters"]}
@@ -2024,13 +2600,29 @@ def _edit_rescan(out: Path, cfg: dict, label: str, log) -> dict:
             nd[s + len(new) - 1 - tm] = v
         tm += 1
     book["paras"][s:e] = new
+    # 하이라이트도 문단 번호를 따라 이동 — 그대로 남은 머리/꼬리 문단은
+    # 보존(+시프트), 내용이 바뀐 블록 안 문단의 하이라이트는 버린다
+    if book.get("hi"):
+        nh = {}
+        for k, v in book["hi"].items():
+            try:
+                i = int(k)
+            except (TypeError, ValueError):
+                continue
+            if i < s + hm:
+                nh[str(i)] = v
+            elif i >= e - tm:
+                nh[str(i + delta)] = v
+        book["hi"] = nh
+    if delta:                               # 문단 번호가 바뀜 — 폰 표식 보류
+        book["struct_ts"] = int(time.time() * 1000)
     work = out / "_work"
     _atomic_json(work / "book.json", book)
     _atomic_json(work / "xlat.json", {str(k): v for k, v in nd.items()})
     title = book.get("title") or "book"
-    (out / f"{title}_src.txt").write_text(
-        "\n\n".join(x["src"] for x in book["paras"]) + "\n",
-        encoding="utf-8")
+    retype.safe_write_text(
+        out / f"{title}_src.txt",
+        "\n\n".join(x["src"] for x in book["paras"]) + "\n", log)
     write_edit_html(out)                    # 새로고침용 재생성
     log(f"재전사 {label}: 문단 {e - s}→{len(new)}개 교체 (#{s + 1}부터) — "
         "새 문단은 번역 필요 상태 (재실행 시 실패분과 함께 번역됨)")
@@ -2091,7 +2683,9 @@ def run_edit_server(cfg: dict, log, is_busy=None) -> Optional[str]:
         def do_POST(self):
             p = self.path.split("?")[0]
             if p not in ("/api/save", "/api/xlat", "/api/export",
-                         "/api/rescan", "/api/cover", "/api/marks"):
+                         "/api/rescan", "/api/cover", "/api/marks",
+                         "/api/restructure", "/api/autofix",
+                         "/api/af_undo"):
                 self.send_error(404)
                 return
             if busy["on"] or ext_busy():
@@ -2117,10 +2711,17 @@ def run_edit_server(cfg: dict, log, is_busy=None) -> Optional[str]:
                 elif p == "/api/cover":
                     self._json(_edit_cover(out, req.get("page") or "",
                                            log))
+                elif p == "/api/restructure":
+                    self._json(_edit_restructure(out, req, log))
+                elif p == "/api/autofix":
+                    self._json(_edit_autofix(out, cfg, req, log))
+                elif p == "/api/af_undo":
+                    self._json(_edit_af_undo(out, req, log))
                 elif p == "/api/marks":
                     self._json(save_marks(out, req.get("bmks"),
                                           req.get("pos"), req.get("off"),
-                                          req.get("ts")))
+                                          req.get("ts"), req.get("hi"),
+                                          req.get("hi_ts")))
                 else:
                     self._json(_edit_export(out, cfg, log))
             except Exception as e:
@@ -2162,8 +2763,11 @@ def _cli() -> int:
     ap.add_argument("src", help="스캔 이미지 폴더 또는 PDF 파일")
     ap.add_argument("--out", default=None, help="출력 폴더 (기본 자동)")
     ap.add_argument("--title", default=None, help="책 제목 (기본 소스명)")
+    ap.add_argument("--mode", default="book", choices=["book", "bible"],
+                    help="book=전사→번역→TXT/EPUB, bible=성경 캡처 절 단위 "
+                         "전사만 (<제목>_성경.txt, 번역 없음)")
     ap.add_argument("--source-lang", default="auto",
-                    choices=["auto", "de", "en", "ja"],
+                    choices=["auto", "de", "en", "ja", "ko"],
                     help="원서 언어 (기본 auto = 첫 페이지 전사로 감지)")
     ap.add_argument("--ocr", default="claude",
                     choices=["claude", "gemini", "deepseek", "winocr",
@@ -2195,6 +2799,8 @@ def _cli() -> int:
     ap.add_argument("--ollama-model",
                     default=d.get("ollama_model", retype.OLLAMA_MODEL))
     ap.add_argument("--ollama-url", default=retype.OLLAMA_URL)
+    ap.add_argument("--workers", type=int, default=6,
+                    help="성경 캡처 모드에서 비전 API 전사를 동시에 보낼 장 수 (기본 6)")
     ap.add_argument("--glossary", default=None)
     ap.add_argument("--range", dest="page_range", default=None,
                     help="페이지 범위 (예: 5-20, 5-, -20)")
@@ -2353,8 +2959,10 @@ def _gui() -> None:
     r = nrow()
     ttk.Label(frm, text="Gemini 모델").grid(row=r, column=0, sticky="w")
     ttk.Combobox(frm, textvariable=v["gemini_model"],
-                 values=["gemini-3.6-flash", "gemini-3.1-flash-lite",
-                         "gemini-2.5-flash-lite", "gemini-3.5-flash"],
+                 values=["gemini-3.8-flash", "gemini-3.5-flash-lite",
+                         "gemini-3.1-flash-lite", "gemini-3.7-flash",
+                         "gemini-3.6-flash", "gemini-3.5-flash",
+                         "gemini-2.5-flash-lite"],
                  width=22).grid(row=r, column=1, sticky="w", padx=4)
     add_entry("Gemini API 키 (선택)", "gemini_key")
     add_entry("DeepSeek API 키 (선택)", "deepseek_key")

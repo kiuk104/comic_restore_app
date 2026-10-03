@@ -33,7 +33,11 @@
  *   hi     : 하이라이트 공유 저장/조회
  *   bmk    : 북마크 공유 저장/조회 (PC book.json과 연동)
  *   icon   : 홈 화면 아이콘 업로드 (PC가 1회 전송 → 공개 링크로 파비콘)
- *   list   : 책 목록+진행 정보 {name,count,pos,pending} (PWA 셸 서재용)
+ *   list   : 책 목록+진행 정보 {name,count,pos,pending,kind,src} (PWA 셸 서재용)
+ *   catalog: 서고 카탈로그 저장/조회 (PC가 gzip+base64로 올림, 그대로 보관·전달
+ *            — ver가 같으면 본문 생략). Fokus Viewer 4단계(2026-10-02)
+ *   importq: 폰 → PC 가져오기 요청 큐 {items:[{p,title,folder,ts,st,msg,book}]}
+ *            add(폰) / 조회 / done(PC가 처리 결과 기록)
  */
 
 var SECRET = 'CHANGE_ME';               // ★ 반드시 직접 정한 값으로 변경
@@ -76,7 +80,7 @@ function _readq(book) {
   var f = _find(book + '_edits.json');
   var d = {v: 1, fp: null, count: null, edits: {},
            snap_fp: null, snap_count: null, state: null, hi: null,
-           bmk: null};
+           bmk: null, kind: null, src: null};
   if (!f) return d;
   try {
     var q = JSON.parse(f.getBlob().getDataAsString('UTF-8'));
@@ -156,7 +160,8 @@ function handleOp(q) {
       info.push({name: names[li], count: e2.snap_count,
                  pos: (e2.state && e2.state.pos != null)
                       ? e2.state.pos : null,
-                 pending: Object.keys(e2.edits || {}).length});
+                 pending: Object.keys(e2.edits || {}).length,
+                 kind: e2.kind || null, src: e2.src || null});
     }
     var res = {ok: true, books: names, info: info};
     if (cache) { try { cache.put('list', JSON.stringify(res), 45); } catch (e) {} }
@@ -172,6 +177,60 @@ function handleOp(q) {
     var vf = _find('_ui.ver');            // 버전 조회 — 같으면 재업로드 불필요
     var cur = vf ? vf.getBlob().getDataAsString('UTF-8') : '';
     return {ok: true, have: (cur === String(q.ver || '') && !!_find('_ui.html'))};
+  }
+  if (q.op === 'catalog') {               // 서고 카탈로그 (gzip+base64 문자열)
+    var cvf = _find('_catalog.ver');
+    var cver = cvf ? cvf.getBlob().getDataAsString('UTF-8') : '';
+    if (q.set !== undefined) {            // PC 업로드
+      _write('_catalog.gz.b64', String(q.set || ''));
+      _write('_catalog.ver', String(q.ver || ''));
+      return {ok: true, ver: String(q.ver || '')};
+    }
+    if (!cver) return {ok: true, ver: null};          // 아직 없음
+    if (q.ver && q.ver === cver) return {ok: true, ver: cver, same: true};
+    var cgf = _find('_catalog.gz.b64');
+    return {ok: true, ver: cver,
+            gz: cgf ? cgf.getBlob().getDataAsString('UTF-8') : ''};
+  }
+  if (q.op === 'importq') {               // 가져오기 요청 큐 (폰 add · PC done)
+    var lock = LockService.getScriptLock();
+    try { lock.waitLock(8000); } catch (le) { return {err: '큐 잠금 실패 — 다시 시도'}; }
+    try {
+      var qf = _find('_importq.json'), iq = {items: []};
+      if (qf) { try { iq = JSON.parse(qf.getBlob().getDataAsString('UTF-8')); }
+                catch (pe) {} }
+      iq.items = iq.items || [];
+      var changed = false;
+      if (q.add && q.add.p) {             // 같은 원본이 대기 중이면 중복 추가 안 함
+        var dup = false;
+        for (var ai = 0; ai < iq.items.length; ai++)
+          if (iq.items[ai].p === q.add.p && iq.items[ai].st === 'wait') dup = true;
+        if (!dup) {
+          iq.items.push({p: String(q.add.p), title: String(q.add.title || ''),
+                         folder: !!q.add.folder, ts: Date.now(), st: 'wait'});
+          changed = true;
+        }
+      }
+      if (q.done && q.done.p) {           // PC 처리 결과
+        for (var di = 0; di < iq.items.length; di++) {
+          var it = iq.items[di];
+          if (it.p === q.done.p && it.st === 'wait') {
+            it.st = q.done.st || 'done'; it.msg = String(q.done.msg || '');
+            it.book = String(q.done.book || ''); it.dts = Date.now();
+            changed = true;
+          }
+        }
+      }
+      if (q.clear) {                      // 끝난 항목 정리(폰 목록에서 지우기)
+        iq.items = iq.items.filter(function (x) { return x.st === 'wait'; });
+        changed = true;
+      }
+      if (iq.items.length > 60)           // 오래된 완료 항목부터 정리
+        iq.items = iq.items.filter(function (x, i) {
+          return x.st === 'wait' || i >= iq.items.length - 60; });
+      if (changed) { _write('_importq.json', JSON.stringify(iq)); _bust(); }
+      return {ok: true, items: iq.items};
+    } finally { lock.releaseLock(); }
   }
   var book = _san(q.book);
   if (!book) return {err: 'book(책 제목) 누락'};
@@ -190,6 +249,8 @@ function handleOp(q) {
     var ed = _readq(book);
     ed.snap_fp = (q.snap_fp === undefined) ? null : q.snap_fp;
     ed.snap_count = (q.snap_count === undefined) ? null : q.snap_count;
+    if (q.kind !== undefined) ed.kind = q.kind;      // plain(평문)/xlat(번역) — 서재 표시
+    if (q.src !== undefined) ed.src = q.src;         // 서고 상대경로(평문 책) — 카탈로그 연결
     if (q.clear_edits) { ed.edits = {}; ed.fp = null; ed.count = null; }
     _writeq(book, ed);
     var oldh = _find(book + '.html');    // 옛 베이크드 있으면 제거 → 데이터 경로로 전환

@@ -27,6 +27,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent))
 import ebook_translate as core            # noqa: E402  (코어 재사용)
+import ebook_pdf_translate as pdfdoc      # noqa: E402  (PDF 문서 모드)
 import comic_retype_pipeline as retype    # noqa: E402
 
 CONFIG_PATH = core.CONFIG_PATH
@@ -83,24 +84,25 @@ def _on_moved(x, y):
     _GEOM["x"], _GEOM["y"] = int(x), int(y)
     _debounce_geom()
 # 최근 항목에 담을 필드 (키·비밀 제외 — 폴더/제목/엔진만 복원)
-_RECENT_KEYS = ("src", "title", "source_lang", "ocr", "backend", "glossary",
-                "page_range", "claude_model", "gemini_model",
+_RECENT_KEYS = ("src", "title", "mode", "source_lang", "ocr", "backend",
+                "glossary", "page_range", "claude_model", "gemini_model",
                 "deepseek_model", "deepseek_url", "kimi_model")
 _RECENT_MAX = 15                       # 고정(pin) 제외 최근 항목 보관 수
-# run_book 로그의 "전사 12/305" / "번역 40/1394문단" → 진행률
-_PROG_RE = re.compile(r"(전사|번역)\s+(\d+)/(\d+)")
-_SAVE_KEYS = ("src", "title", "source_lang", "ocr", "backend",
+# run_book/run_pdf_doc 로그의 "전사 12/305"·"번역 40/1394문단"·
+# "조판 3/68페이지" → 진행률
+_PROG_RE = re.compile(r"(전사|번역|조판)\s+(\d+)/(\d+)")
+_SAVE_KEYS = ("src", "title", "mode", "source_lang", "ocr", "backend",
               "claude_model", "gemini_model", "gemini_key",
               "deepseek_model", "deepseek_key", "deepseek_url",
               "kimi_model", "kimi_key",
               "ollama_model", "glossary", "api_key",
               "gas_url", "gas_key", "gas_auto_push",
-              "gas_auto_pull")   # Tk 동일+동기화
+              "gas_auto_pull", "af_mode")   # Tk 동일+동기화+텍스트 책 자동 교정
 
 
 def _default_cfg() -> dict:
     d = {
-        "src": "", "title": "", "source_lang": "auto",
+        "src": "", "title": "", "mode": "book", "source_lang": "auto",
         "ocr": "claude", "backend": "claude",
         "claude_model": "claude-sonnet-4-5",
         "gemini_model": core.GEMINI_MODEL, "gemini_key": "",
@@ -111,12 +113,37 @@ def _default_cfg() -> dict:
         "glossary": "", "page_range": "", "api_key": "",
         "gas_url": "", "gas_key": "", "gas_auto_push": "",
         "gas_auto_pull": "",
+        "af_mode": "rule",      # 텍스트 책 자동 교정: off | rule | ai
     }
     saved = core.load_defaults()          # ebook_config + 코믹스 키 공유
     for k in d:
         if saved.get(k):
             d[k] = saved[k]
     return d
+
+
+class _KeepPostRedirect(__import__("urllib.request").request.HTTPRedirectHandler):
+    """GAS POST 리다이렉트 보정 — urllib은 302를 따라갈 때 POST를 GET으로
+    바꾸는데, Google이 간헐적으로 /exec POST를 다른 script.google.com 주소로
+    302 보내면 본문(op·key)이 사라져 doGet의 '인증 실패' HTML이 온다
+    (2026-10-02 실측: op get·importq). 목적지가 script.google.com이면 POST를
+    그대로 다시 보내고, 정상 응답 경로(googleusercontent echo)는 GET 유지."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        from urllib.parse import urlparse
+        import urllib.request as _ur
+        if (req.get_method() == "POST" and code in (301, 302, 303, 307, 308)
+                and urlparse(newurl).netloc.endswith("script.google.com")):
+            hd = {k: v for k, v in req.header_items()
+                  if k.lower() not in ("content-length", "host")}
+            return _ur.Request(newurl, data=req.data, headers=hd,
+                               method="POST")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _san_title(t: str) -> str:
+    """책 제목 = 폴더명·GAS 파일명 — 금지 문자는 _ (GAS _san과 같은 규칙)."""
+    return re.sub(r'[\\/:*?"<>|]', "_", str(t or "")).strip()
 
 
 def normalize_cfg(cfg: dict) -> dict:
@@ -142,6 +169,7 @@ class Api:
         self._cfg = _default_cfg()
         self._last_pull_err = None
         threading.Thread(target=self._autopull_loop, daemon=True).start()
+        threading.Thread(target=self._libq_loop, daemon=True).start()
 
     # ---------- 폰 수정 자동 반영(주기 폴링) ----------
     def _autopull_loop(self):
@@ -153,6 +181,8 @@ class Api:
                 c = normalize_cfg(self._cfg)
                 if not c.get("gas_auto_pull"):
                     continue
+                if c.get("mode") == "pdfdoc":
+                    continue      # 문서 모드는 폰 편집 왕복 대상이 아님
                 if self._state["running"] or not (c.get("gas_url") or "").strip():
                     continue
                 if not c.get("src"):
@@ -174,6 +204,160 @@ class Api:
                     self._last_pull_err = msg
                     self._log(f"(자동 반영 일시 실패 — {msg})")
 
+    # ---------- 서고(라이브러리) — 카탈로그 업로드·가져오기 큐 (Fokus Viewer 4단계) ----------
+    _LIBQ_EVERY = 45                      # 가져오기 큐 폴링 주기(초)
+
+    def _libq_loop(self):
+        """폰 서재에서 고른 서고 txt/폴더를 PC가 가져와 업로드한다.
+        동기화 URL만 있으면 동작(자동 반영 설정과 별개). 앱 시작 후 첫 회에
+        서고 카탈로그를 훑어 바뀌었으면 올린다."""
+        first = True
+        old_gas_until = 0                 # 구 GAS 감지 시 10분 쉬었다 재확인
+        while True:
+            time.sleep(8 if first else self._LIBQ_EVERY)
+            if time.time() < old_gas_until:
+                continue
+            try:
+                c = normalize_cfg(self._cfg)
+                if not (c.get("gas_url") or "").strip():
+                    continue
+                if self._state["running"]:
+                    continue
+                if first:
+                    first = False
+                    try:
+                        self._lib_sync_c(c, quiet=True)
+                    except Exception as e:
+                        if self._old_gas(str(e)):
+                            raise             # 아래에서 '재배포 필요' 안내 1회
+                        self._log(f"(서고 카탈로그 생략: {e})")
+                self._process_importq(c)
+            except Exception as e:
+                msg = str(e)
+                if self._old_gas(msg):
+                    old_gas_until = time.time() + 600
+                    first = True              # 재배포 후엔 카탈로그부터 다시
+                    if not getattr(self, "_old_gas_logged", False):
+                        self._old_gas_logged = True
+                        self._log("📚 서고 기능(카탈로그·폰 가져오기 요청)은 동기화 서버를 "
+                                  "새 버전으로 재배포해야 동작합니다 — Apps Script 편집기에 "
+                                  "ebook_gas_sync.gs 최신본을 붙여넣고 [배포 관리 → ✏ → 새 버전]. "
+                                  "(재배포 전에도 기존 업로드·수정 반영은 그대로 됩니다)")
+                    continue
+                if getattr(self, "_last_libq_err", None) != msg:
+                    self._last_libq_err = msg
+                    self._log(f"(가져오기 큐 확인 실패 — {msg})")
+
+    @staticmethod
+    def _old_gas(msg: str) -> bool:
+        """구버전 GAS 응답 — 새 op(catalog·importq)를 모르면 book 누락/알 수 없는
+        op 오류가 나거나, 배포 상태에 따라 HTML 오류 페이지(JSON 아님)가 온다."""
+        # ※ 'JSON이 아님'은 넣지 않는다 — 새 GAS도 일시 오류 페이지를 돌려줄 수 있어
+        #   (실제로 업로드는 됐는데 '재배포 필요'로 잘못 안내한 적 있음, 10-02)
+        return any(k in msg for k in ("book(책 제목) 누락", "알 수 없는 op"))
+
+    def _lib_sync_c(self, c: dict, quiet: bool = False, cat=None) -> dict:
+        """서고 카탈로그 생성(또는 받은 cat) → GAS와 버전이 다르면 업로드."""
+        import ebook_library as lib
+        root = lib.find_lib_root(c)
+        if not root:
+            raise RuntimeError("서고(_Ebook_Library) 폴더를 찾지 못했습니다")
+        if cat is None:
+            cat = lib.scan_catalog(root, log=(lambda m: None) if quiet
+                                   else self._log)
+        s, ver = lib.catalog_json(cat)
+        lib.save_local(root, s)
+        self._lib_cat = cat
+        r = self._gas_call(c, {"op": "catalog", "ver": ver})
+        if (r or {}).get("ver") == ver:
+            if not quiet:
+                self._log(f"📚 서고 카탈로그 그대로 (버전 {ver})")
+            return {"ok": True, "ver": ver, "same": True, "n": cat["n"]}
+        self._gas_call(c, {"op": "catalog", "ver": ver,
+                           "set": lib.catalog_gz_b64(s)})
+        self._log(f"📚 서고 카탈로그 업로드: 텍스트 {cat['n']:,}개 · "
+                  f"가져온 책 {len(cat.get('imp') or {})}권 (버전 {ver})")
+        return {"ok": True, "ver": ver, "n": cat["n"]}
+
+    def lib_sync(self, cfg: dict):
+        """[📚 서고 목록 올리기] — 서고를 다시 훑어 폰 서재(서고 탭)에 반영."""
+        self._cfg = dict(cfg)
+        c = normalize_cfg(cfg)
+        try:
+            with self._cloud_lock:
+                return self._lib_sync_c(c)
+        except Exception as e:
+            if self._old_gas(str(e)):
+                return {"err": "동기화 서버(GAS)가 구버전입니다 — ebook_gas_sync.gs 최신본으로 "
+                               "재배포한 뒤 다시 누르세요 (배포 관리 → ✏ → 새 버전, URL 유지)"}
+            return {"err": str(e)}
+
+    def _process_importq(self, c: dict) -> None:
+        import ebook_import
+        import ebook_library as lib
+        r = self._gas_call(c, {"op": "importq"})
+        wait = [x for x in (r or {}).get("items") or [] if x.get("st") == "wait"]
+        if not wait:
+            return
+        root = lib.find_lib_root(c)
+        for it in wait:
+            p = it.get("p") or ""
+            done = {"p": p, "st": "err"}
+            try:
+                if not root:
+                    raise RuntimeError("PC에서 서고 폴더를 찾지 못함")
+                src = (root / p).resolve()
+                if root.resolve() not in src.parents and src != root.resolve():
+                    raise RuntimeError("서고 밖 경로")
+                if not src.exists():
+                    raise RuntimeError("원본이 없음(이동·삭제?)")
+                title = _san_title(it.get("title") or "") or \
+                    ebook_import.default_title(src)
+                title = self._unique_title(src, title)
+                self._log(f"📚 폰 요청 가져오기: {p} → 『{title}』")
+                with self._cloud_lock:
+                    ca = dict(c)
+                    core._apply_keys(ca)
+                    rr = ebook_import.import_text(
+                        src, title=title, log=self._log,
+                        autofix=c.get("af_mode") or "rule", cfg=ca)
+                    cc = dict(c, src=str(src), title=rr["title"], out="",
+                              mode="book")
+                    self._push_c(cc)
+                done = {"p": p, "st": "done", "book": rr["title"],
+                        "msg": f"{rr['count']}문단"}
+                cat = getattr(self, "_lib_cat", None)
+                if cat is not None:              # 카탈로그 '가져옴' 표시만 갱신
+                    cat.setdefault("imp", {})[p] = rr["title"]
+                    try:
+                        with self._cloud_lock:
+                            self._lib_sync_c(c, quiet=True, cat=cat)
+                    except Exception:
+                        pass
+            except Exception as e:
+                done["msg"] = str(e)[:200]
+                self._log(f"!! 폰 요청 가져오기 실패: {p} — {e}")
+            self._gas_call(c, {"op": "importq", "done": done})
+
+    @staticmethod
+    def _unique_title(src: Path, title: str) -> str:
+        """같은 제목의 다른 책(_book)이 있으면 ' (2)'… — GAS 책 키가 제목이라."""
+        import ebook_import
+        t, n = title, 2
+        while True:
+            d = core.plain_book_dir(src, t)
+            bj = d / "_work" / "book.json"
+            if not bj.exists():
+                return t
+            try:
+                o = json.loads(bj.read_text(encoding="utf-8")).get("origin") or {}
+                if Path(o.get("file") or "") == Path(src):
+                    return t                     # 같은 원본 — 재가져오기
+            except Exception:
+                return t
+            t = f"{title} ({n})"
+            n += 1
+
     # ---------- 로그 ----------
     def _log(self, msg) -> None:
         s = str(msg)
@@ -194,14 +378,22 @@ class Api:
         return {
             "cfg": self._cfg,
             "version": core.__version__,
+            "modes": [{"label": "책 — TXT/EPUB (전사→흐름 번역)",
+                       "key": "book"},
+                      {"label": "PDF 문서 — 레이아웃 유지 (텍스트 PDF 전용)",
+                       "key": "pdfdoc"},
+                      {"label": "성경 캡처 — 절 단위 전사만 (성경 뷰어 가져오기용)",
+                       "key": "bible"}],
             "langs": [{"label": lb, "key": k} for lb, k in core.LANGS],
             "ocr_modes": [{"label": lb, "key": k}
                           for lb, k in core.OCR_MODES],
             "backends": [{"label": lb, "key": k}
                          for lb, k in core.BACKENDS],
             "claude_models": ["claude-sonnet-4-5", "claude-haiku-4-5"],
-            "gemini_models": ["gemini-3.6-flash", "gemini-3.1-flash-lite",
-                              "gemini-2.5-flash-lite", "gemini-3.5-flash"],
+            "gemini_models": ["gemini-3.8-flash", "gemini-3.5-flash-lite",
+                              "gemini-3.1-flash-lite", "gemini-3.7-flash",
+                              "gemini-3.6-flash", "gemini-3.5-flash",
+                              "gemini-2.5-flash-lite"],
             "kimi_models": ["kimi-k2.6", "kimi-k3"],
             "recents": self.list_recents(),
         }
@@ -332,14 +524,24 @@ class Api:
         c = normalize_cfg(cfg)
         if not c.get("src"):
             return {"err": "소스 폴더 또는 PDF를 지정하세요."}
+        if core.is_plain_src(c["src"]):
+            return {"err": "텍스트 파일은 번역 대상이 아닙니다.\n"
+                           "[📚 텍스트 책 가져오기]로 책을 만든 뒤 [📝 편집 페이지]에서 "
+                           "읽고 고치세요."}
         self.save(self._cfg)
         self.add_recent(self._cfg)          # 최근 작업에 기록
 
         def worker():
             try:
-                core.run_book(c, self._log, lambda: self._state["cancel"])
+                if c.get("mode") == "pdfdoc":
+                    pdfdoc.run_pdf_doc(c, self._log,
+                                       lambda: self._state["cancel"])
+                else:
+                    core.run_book(c, self._log,
+                                  lambda: self._state["cancel"])
                 self._log("=== 작업 완료 ===")
-                if c.get("gas_auto_push") and (c.get("gas_url") or "").strip():
+                if (c.get("mode") not in ("pdfdoc", "bible") and c.get("gas_auto_push")
+                        and (c.get("gas_url") or "").strip()):
                     try:
                         self._push_c(c)
                     except Exception as e:
@@ -371,6 +573,20 @@ class Api:
         c = normalize_cfg(cfg)
         if not c.get("src"):
             return {"err": "소스 폴더 또는 PDF를 지정하세요."}
+        if c.get("mode") == "pdfdoc":
+            # 문서 모드는 번역 캐시(pdfxlat.json)만 백업·제거하면 전체 재번역
+            try:
+                out, _t = pdfdoc.resolve_out(c)
+                cache = out / "_work" / "pdfxlat.json"
+                if cache.exists():
+                    import datetime
+                    bak = (cache.parent / ("pdfxlat_redo_" + datetime.datetime
+                           .now().strftime("%Y%m%d_%H%M%S") + ".json"))
+                    cache.rename(bak)
+                    self._log(f"⟲ 문서 번역 캐시 백업 → _work/{bak.name}")
+            except Exception as e:
+                return {"err": f"다시 실행 준비 실패: {e}"}
+            return self.start(cfg)
         try:
             out, _t = core.resolve_out(c)
             core.redo_reset(out, mode, self._log)
@@ -383,11 +599,82 @@ class Api:
         return True
 
     # ---------- 편집 모드 ----------
+    def import_pick(self, kind: str = "file"):
+        """가져오기 창의 [파일 고르기]/[폴더 고르기] — 경로만 돌려준다."""
+        if kind == "dir":
+            return self._dialog("dir")
+        return self._dialog(
+            "open", ["텍스트 (*.txt;*.md;*.markdown)", "모든 파일 (*.*)"])
+
+    def import_preview(self, path: str, split: str = "auto",
+                       ruby: str = "strip", title: str = "",
+                       autofix: str = "rule"):
+        """가져오기 창 미리보기 — 저장 없이 앞 40문단 + 판별 정보
+        (+ 규칙 자동 교정 적용 결과, AI 예상 건수)."""
+        import ebook_import
+        try:
+            return ebook_import.preview(path, split=split or "auto",
+                                        ruby=ruby or "strip", n=40,
+                                        title=title or None,
+                                        autofix=autofix or "off",
+                                        cfg=normalize_cfg(self._cfg))
+        except Exception as e:
+            return {"err": f"미리보기 실패: {e}"}
+
+    def import_text(self, cfg: dict, path: str = "", split: str = "auto",
+                    ruby: str = "strip", title=None, autofix=None):
+        """[📚 텍스트 책 가져오기] — 라이브러리 txt/md → book.json(평문 책).
+
+        파일을 고르면 ebook_import 가 문단을 재구성해 <파일 폴더>/<제목>_book 에
+        저장하고, 폼의 소스·제목을 그 파일로 바꾼다. 이후 [📝 편집 페이지]·
+        [☁ 업로드]는 번역책과 똑같이 동작한다 (resolve_out 이 txt 소스를 _book 으로)."""
+        import ebook_import
+        path = (path or "").strip() or self._dialog(
+            "open", ["텍스트 (*.txt;*.md;*.markdown)", "모든 파일 (*.*)"])
+        if not path:
+            return {"cancel": True}
+        c = normalize_cfg(cfg)
+        src = Path(path)
+        if title is None:               # 가져오기 창을 거치지 않은 호출 (기존 동작)
+            title = (c.get("title") or "").strip()
+            # 제목칸이 이전 책 제목이면 새 파일명으로 — 소스가 바뀌었는데 제목이 남는 사고 방지
+            if title and (c.get("src") or "").strip() != str(src):
+                title = ""
+        title = (title or "").strip()
+        af_mode = autofix or c.get("af_mode") or "rule"
+        ca = dict(c)
+        core._apply_keys(ca)                 # AI 교정용 API 키
+        try:
+            r = ebook_import.import_text(src, title=title or None,
+                                         split=split or "auto",
+                                         ruby=ruby or "strip",
+                                         log=self._log,
+                                         autofix=af_mode, cfg=ca)
+        except Exception as e:
+            return {"err": f"가져오기 실패: {e}"}
+        new_cfg = dict(cfg)
+        new_cfg["src"] = str(src)
+        new_cfg["title"] = r["title"]
+        new_cfg["source_lang"] = r["lang"]
+        new_cfg["af_mode"] = af_mode         # 다음 가져오기·폰 요청도 같은 방식
+        self._cfg = new_cfg
+        self.save(new_cfg)
+        self.add_recent(new_cfg)
+        self._state["edit_url"] = None      # 다른 책 — 편집 서버 새로
+        return {"ok": True, "src": str(src), "title": r["title"],
+                "lang": r["lang"], "count": r["count"],
+                "headings": r["headings"],
+                "mode": (r.get("info") or {}).get("used", ""),
+                "out": r["out"]}
+
     def open_edit(self, cfg: dict):
         self._cfg = dict(cfg)
         c = normalize_cfg(cfg)
         if not c.get("src"):
             return {"err": "소스 폴더 또는 PDF를 지정하세요."}
+        if c.get("mode") == "pdfdoc":
+            return {"err": "문서 모드에는 편집 페이지가 없습니다 — "
+                           "결과 PDF를 직접 확인하세요."}
         try:
             if self._state["edit_url"]:      # 재클릭 — 최신 데이터로 재생성
                 core.write_edit_html(core.resolve_out(c)[0])
@@ -415,13 +702,20 @@ class Api:
         body = json.dumps(dict(payload, key=(c.get("gas_key") or "").strip()),
                           ensure_ascii=False).encode("utf-8")
         raw = None
+        opener = urllib.request.build_opener(_KeepPostRedirect)
         for attempt in range(3):          # GAS 간헐 404/5xx·리다이렉트 → 재시도
             req = urllib.request.Request(
                 url, data=body,
                 headers={"Content-Type": "text/plain;charset=utf-8"})
             try:
-                with urllib.request.urlopen(req, timeout=90) as r:
+                with opener.open(req, timeout=90) as r:
                     raw = r.read().decode("utf-8")
+                try:                       # JSON 아니면(오류 페이지) 한 번 더
+                    json.loads(raw)
+                except ValueError:
+                    if attempt < 2:
+                        time.sleep(1.3 * (attempt + 1))
+                        continue
                 break
             except urllib.error.HTTPError as e:
                 if e.code in (404, 429, 500, 502, 503) and attempt < 2:
@@ -443,8 +737,15 @@ class Api:
         try:
             out = json.loads(raw)
         except ValueError:
-            raise RuntimeError("동기화 서버 응답이 JSON이 아닙니다 — "
-                               "배포 URL(…/exec)·액세스 설정을 확인하세요")
+            # 무엇이 왔는지 보여 준다 — GAS 오류 페이지(스크립트 예외·할당량·
+            # 로그인 요구)는 HTML이라 <title>이나 본문 첫 부분에 원인이 있다
+            t = re.search(r"<title>(.*?)</title>", raw or "", re.S | re.I)
+            body = re.sub(r"<[^>]+>", " ", raw or "")
+            body = re.sub(r"\s+", " ", body).strip()
+            hint = ((t.group(1).strip() + " · ") if t else "") + body[:160]
+            raise RuntimeError("동기화 서버 응답이 JSON이 아닙니다 (op "
+                               f"{payload.get('op')}: {hint or '빈 응답'}) — "
+                               "일시 오류면 다음 주기에 회복됩니다")
         if isinstance(out, dict) and out.get("err"):
             raise RuntimeError(out["err"])
         return out
@@ -462,6 +763,16 @@ class Api:
                                "[▶ 번역 시작]으로 전사·병합 후 다시 시도")
         bk = data["title"] or title
         snap = {"snap_fp": data["fp"], "snap_count": data["count"]}
+        snap_x = {"kind": data.get("kind") or "xlat"}   # 서재 표시용(신 GAS)
+        try:                                 # 평문 책 — 서고 상대경로(카탈로그 연결)
+            import ebook_library as lib
+            ob = core.load_book(out) or {}
+            of = Path((ob.get("origin") or {}).get("file") or "")
+            lr = lib.find_lib_root(c) if of.is_absolute() else None
+            if lr:
+                snap_x["src"] = of.relative_to(lr).as_posix()
+        except Exception:
+            pass
         try:                             # (신) 데이터-분리
             u = self._gas_call(c, {"op": "ui", "ver": core.UI_VER})
             if not (u or {}).get("have"):
@@ -470,7 +781,7 @@ class Api:
                 self._log("☁ 공유 편집 UI 업데이트 — 이후 UI 변경은 책 "
                           "재업로드 없이 모든 책에 적용됩니다")
             r = self._gas_call(c, dict(
-                snap, op="putdata", book=bk, schema=core.SCHEMA_VER,
+                snap, **snap_x, op="putdata", book=bk, schema=core.SCHEMA_VER,
                 data=json.dumps(data, ensure_ascii=False)))
         except RuntimeError as e:        # 구 GAS(op 미지원) → 베이크드 폴백
             if "알 수 없는 op" not in str(e):
@@ -480,21 +791,178 @@ class Api:
             fp = core.write_edit_html(out)
             r = self._gas_call(c, dict(snap, op="upload", book=bk,
                                        html=fp.read_text(encoding="utf-8")))
-        if not (r or {}).get("icon"):    # 홈 화면 아이콘 1회 전송
-            try:
-                ic = Path(__file__).parent / "ebook_mobile_icon.png"
-                if ic.exists():
-                    import base64
+        # 문단 구조가 바뀐 뒤 첫 업로드 — 폰(GAS)의 북마크·하이라이트·위치를
+        # PC(book.json) 값으로 덮어 옛 문단 번호를 없앤다
+        try:
+            book = core.load_book(out) or {}
+            sts = int(book.get("struct_ts") or 0)
+            if sts > int(book.get("struct_sent") or 0):
+                self._gas_call(c, {"op": "bmk", "book": bk,
+                                   "set": book.get("bmks") or []})
+                self._gas_call(c, {"op": "hi", "book": bk, "set": dict(
+                    book.get("hi") or {},
+                    _ts=int(book.get("hi_ts") or sts))})
+                if book.get("pos") is not None:
+                    self._gas_call(c, {"op": "state", "book": bk,
+                                       "pos": book["pos"],
+                                       "off": book.get("off"),
+                                       "ts": int(time.time() * 1000)})
+                core.mark_struct_sent(out, sts)
+                self._log("☁ 문단 구조 변경 반영 — 폰 북마크·하이라이트·"
+                          "위치를 PC 기준으로 맞춤")
+        except Exception as e:
+            self._log(f"(구조 변경 동기화 실패 — 다시 업로드하세요: {e})")
+        # 홈 화면 아이콘 — 서버에 없거나 로컬 파일이 바뀌었으면(sha 마커) 다시 전송
+        try:
+            ic = Path(__file__).parent / "ebook_mobile_icon.png"
+            mk = ic.with_suffix(".sent")       # 마지막으로 보낸 아이콘의 sha1
+            if ic.exists():
+                import base64, hashlib
+                raw = ic.read_bytes()
+                sha = hashlib.sha1(raw).hexdigest()
+                sent = mk.read_text().strip() if mk.exists() else ""
+                if not (r or {}).get("icon") or sent != sha:
                     self._gas_call(c, {"op": "icon", "book": bk,
-                                       "png": base64.b64encode(
-                                           ic.read_bytes()).decode()})
+                                       "png": base64.b64encode(raw).decode()})
+                    mk.write_text(sha)
                     self._log("☁ 홈 화면 아이콘 업로드 — 폰에서 홈 화면에 "
                               "다시 추가하면 적용됩니다")
-            except Exception as e:
-                self._log(f"(아이콘 업로드 생략: {e})")
+        except Exception as e:
+            self._log(f"(아이콘 업로드 생략: {e})")
         self._log(f"☁ 업로드 완료: {bk} — 폰에서 배포URL?book={bk}&key=… "
                   "(목록은 ?key=… 만)")
         return bk
+
+    # ---------- 킨들(USB) 갱신 + 교정 메모 회수 ----------
+    def _kindle_ctx(self, cfg: dict):
+        self._cfg = dict(cfg)
+        c = normalize_cfg(cfg)
+        if not c.get("src"):
+            raise RuntimeError("소스 폴더 또는 책을 지정하세요.")
+        if c.get("mode") == "pdfdoc":
+            raise RuntimeError("문서 모드는 킨들 갱신 대상이 아닙니다.")
+        out, _t = core.resolve_out(c)
+        book = core.load_book(out)
+        if not book:
+            raise RuntimeError("책 데이터(book.json)가 없습니다 — 먼저 번역/가져오기를 하세요.")
+        return c, out, book
+
+    def _kindle_opts(self, book: dict, opts: dict = None) -> dict:
+        """저장된 킨들 설정(book.json "kindle") + 이번 입력. 기본값은 '제목 [저자]' 분리."""
+        import ebook_kindle as kd
+        t0, a0 = kd.split_title(book.get("title") or "")
+        o = {"title": t0, "author": a0, "font": "ridi", "cover": "auto", "cover_file": "",
+             "eject": True}
+        o.update({k: v for k, v in (book.get("kindle") or {}).items() if k in o})
+        o.update({k: v for k, v in (opts or {}).items() if k in o and v is not None})
+        return o
+
+    def _kindle_cover(self, c, book, o):
+        import ebook_kindle as kd
+        mode = o.get("cover") or "auto"
+        if mode == "none":
+            return None
+        if mode == "file" and o.get("cover_file") and Path(o["cover_file"]).is_file():
+            return kd.fit_cover(Path(o["cover_file"]).read_bytes())
+        if mode in ("auto", "scan"):
+            scan = core._cover_jpg(c, book)
+            if scan:
+                return kd.fit_cover(scan)
+        return kd.make_cover(o.get("title") or "", o.get("author") or "",
+                             kd.find_font(o.get("font")))
+
+    def kindle_info(self, cfg: dict):
+        import ebook_kindle as kd
+        try:
+            c, out, book = self._kindle_ctx(cfg)
+            o = self._kindle_opts(book)
+            kcfg = {k: c.get(k) for k in ("calibre_convert", "kindle_root") if c.get(k)}
+            return {"ok": True, "opts": o, "fonts": kd.font_list(),
+                    "has_scan": bool((book.get("page_labels") or [])),
+                    "kindle": kd.find_kindle(kcfg) or "",
+                    "calibre": kd.find_ebook_convert(kcfg) or "",
+                    "file": kd.safe_name(book.get("title") or "book") + ".azw3"}
+        except Exception as e:
+            return {"err": str(e)}
+
+    def kindle_preview(self, cfg: dict, opts: dict):
+        import base64
+        try:
+            c, out, book = self._kindle_ctx(cfg)
+            jpg = self._kindle_cover(c, book, self._kindle_opts(book, opts))
+            if not jpg:
+                return {"ok": True, "img": ""}
+            return {"ok": True, "img": "data:image/jpeg;base64," + base64.b64encode(jpg).decode()}
+        except Exception as e:
+            return {"err": f"표지 미리보기 실패: {e}"}
+
+    def kindle_pick_cover(self):
+        return self._dialog("open", ["이미지 (*.jpg;*.jpeg;*.png;*.webp)"])
+
+    def kindle_sync(self, cfg: dict, opts: dict = None):
+        """최신 EPUB 재생성 → (폰트) → AZW3(제목·저자·표지) → 킨들 같은 이름 덮어쓰기
+        + My Clippings 교정 후보. 설정은 book.json "kindle"에 기억."""
+        import ebook_kindle as kd
+        if self._state["running"]:
+            return {"err": "번역 실행 중입니다 — 끝난 뒤 다시 눌러주세요."}
+        try:
+            c, out, book = self._kindle_ctx(cfg)
+            o = self._kindle_opts(book, opts)
+            book["kindle"] = o
+            core._atomic_json(out / "_work" / "book.json", book)
+            kcfg = {k: c.get(k) for k in ("calibre_convert", "kindle_root",
+                                          "kindle_profile") if c.get(k)}
+            root = kd.find_kindle(kcfg)
+            if not root:
+                return {"err": "킨들을 찾지 못했습니다 — USB로 연결하고 탐색기에 "
+                               "'Kindle' 드라이브가 보이는지 확인하세요."}
+            fname = book.get("title") or "book"          # 파일명 고정 → 읽은 위치 유지
+            # 1) 교정 메모 먼저 (킨들에 보이는 제목·파일명 둘 다로 찾음)
+            fixes = []
+            cp = Path(root) / "documents" / "My Clippings.txt"
+            if cp.is_file():
+                done = {str(k): v for k, v in core.load_xlat(out).items()}
+                fixes = kd.collect_fixes(book, str(cp), title=[o["title"], fname], done=done)
+            # 2) 최신 EPUB → 킨들
+            r = core._edit_export(out, c, self._log)
+            epub = out / r["files"][1]
+            font = kd.find_font(o.get("font"))
+            if o.get("font") not in ("", "none", None) and not font:
+                self._log("⚠ 선택한 폰트 파일을 찾지 못해 킨들 기본 글꼴로 보냅니다.")
+            dst = kd.push(str(epub), title=o["title"] or fname, author=o.get("author") or None,
+                          cover=self._kindle_cover(c, book, o), font=font,
+                          name=fname, cfg=kcfg, log=self._log)
+            if font:
+                self._log("💡 킨들에서 폰트가 안 바뀌어 보이면: 책 열기 → Aa → 글꼴 → '출판사 글꼴'")
+            if fixes:
+                self._log(f"📝 킨들 교정 메모 {len(fixes)}개 — 목록 창에서 확인하세요.")
+            elif cp.is_file():
+                self._log("📝 새 킨들 교정 메모 없음.")
+            ejected = bool(o.get("eject")) and kd.eject(root, self._log)
+            return {"ok": True, "dst": dst, "fixes": fixes, "ejected": ejected}
+        except Exception as e:
+            return {"err": f"킨들 갱신 실패: {e}"}
+
+    def kindle_eject(self, cfg: dict = None):
+        """⏏ 킨들 꺼내기 — 탐색기 '꺼내기'와 같은 동작."""
+        import ebook_kindle as kd
+        c = normalize_cfg(cfg or self._cfg)
+        root = kd.find_kindle({k: c.get(k) for k in ("kindle_root",) if c.get(k)})
+        if not root:
+            return {"err": "연결된 킨들이 없습니다 (이미 꺼냈거나 연결 안 됨)."}
+        return {"ok": True} if kd.eject(root, self._log) else \
+            {"err": "킨들을 꺼내지 못했습니다 — 킨들 안 파일을 연 창·프로그램을 닫고 다시 눌러보세요."}
+
+    def kindle_done(self, cfg: dict, keys: list):
+        """교정 후보 처리 완료 표시 — 다음 갱신부터 다시 안 띄움."""
+        import ebook_kindle as kd
+        try:
+            c, out, book = self._kindle_ctx(cfg)
+            kd.mark_seen(book, keys or [])
+            core._atomic_json(out / "_work" / "book.json", book)
+            return {"ok": True, "n": len(keys or [])}
+        except Exception as e:
+            return {"err": str(e)}
 
     def cloud_push(self, cfg: dict):
         self._cfg = dict(cfg)
@@ -518,6 +986,14 @@ class Api:
         읽던 위치는 ts를 비교해 '폰 기록이 더 최신일 때만' 채택 —
         PC에서 읽던 최신 위치를 폰의 옛 기록으로 되감지 않는다(v0.19).
         구버전 GAS(bmk op 없음)면 조용히 넘어간다."""
+        if int(book.get("struct_ts") or 0) > int(book.get("struct_sent") or 0):
+            # PC에서 문단 합치기·나누기(재전사) 후 아직 업로드 전 — 폰 쪽
+            # 북마크·하이라이트·위치는 옛 문단 번호라 회수하면 어긋난다.
+            # [☁ 업로드] 때 PC 값으로 폰을 맞춘다(_push_c).
+            if not quiet:
+                self._log("☁ 문단 구조가 바뀌어 폰 북마크·하이라이트·위치 회수 "
+                          "보류 — [☁ 업로드] 하면 PC 기준으로 맞춰집니다")
+            return
         bmks = pos = off = ts = None
         try:
             r = self._gas_call(c, {"op": "bmk", "book": bk})
@@ -542,14 +1018,33 @@ class Api:
                     pos, off, ts = spf, st.get("off"), sts
         except Exception:
             pass
-        if bmks is None and pos is None:
+        hi = hi_ts = None
+        try:
+            # 하이라이트 — GAS는 맵을 그대로 보관(_ts = 마지막 수정 시각 ms).
+            # 폰 기록이 더 최신이거나(ts 비교), 둘 다 시각이 없는 구형인데
+            # 내용이 다르면 폰 쪽 채택. PC가 더 최신이면 폰이 열 때 가져감.
+            r = self._gas_call(c, {"op": "hi", "book": bk})
+            ch = (r or {}).get("hi")
+            if isinstance(ch, dict):
+                cts = int(ch.get("_ts") or 0)
+                bts = int(book.get("hi_ts") or 0)
+                n = len(book["paras"])
+                cur = core.clean_hi(book.get("hi") or {}, n)
+                new = core.clean_hi(ch, n)
+                if new != cur and cts >= bts:
+                    hi, hi_ts = new, (cts or None)
+        except Exception:
+            pass
+        if bmks is None and pos is None and hi is None:
             return
         try:
-            r2 = core.save_marks(out, bmks, pos, off, ts)
+            r2 = core.save_marks(out, bmks, pos, off, ts, hi, hi_ts)
             if not quiet:
                 bits = []
                 if bmks is not None:
                     bits.append(f"북마크 {len(r2['bmks'])}개")
+                if hi is not None:
+                    bits.append(f"하이라이트 {r2.get('hi_n', 0)}개")
                 if pos is not None:
                     bits.append(f"읽던 위치 #{int(pos) + 1}")
                 self._log("☁ 폰 " + " · ".join(bits) + " 반영")
@@ -703,6 +1198,11 @@ WEB_HTML = r"""<!doctype html>
   <button onclick="pinRecent()" id="b_pin" title="즐겨찾기 고정/해제">★</button>
   <button onclick="delRecent()" title="이 항목을 최근 목록에서 삭제">🗑</button>
  </div>
+ <div class="row"><label>모드</label><select id="c_mode" style="flex:1"
+   title="책: 전사→흐름 번역→TXT/EPUB. PDF 문서: 원본 레이아웃(사진·다단)을
+유지한 채 텍스트만 한글로 교체한 _ko.pdf 생성 (텍스트 레이어 필수)"></select>
+ </div>
+ <div class="hint" id="hint_mode"></div>
  <div class="row"><label>소스 (폴더/PDF)</label><input type="text" id="c_src">
   <button onclick="pickSrcDir()">폴더</button>
   <button onclick="pickSrcPdf()">PDF</button></div>
@@ -717,12 +1217,12 @@ WEB_HTML = r"""<!doctype html>
  </div>
 </fieldset>
 
-<fieldset><legend>전사 (이미지 → 원문 읽기)</legend>
+<fieldset id="fs_ocr"><legend>전사 (이미지 → 원문 읽기)</legend>
  <div class="row"><label>전사 방식</label><select id="c_ocr"></select></div>
  <div class="hint" id="hint_ocr"></div>
 </fieldset>
 
-<fieldset><legend>번역 (원서 → 한글)</legend>
+<fieldset id="fs_xlat"><legend>번역 (원서 → 한글)</legend>
  <div class="row"><label>번역 엔진</label><select id="c_backend"></select></div>
  <div class="row"><label>용어집 (선택)</label>
   <input type="text" id="c_glossary">
@@ -818,6 +1318,17 @@ WEB_HTML = r"""<!doctype html>
  <button class="pri" id="b_start" onclick="doStart()">▶ 번역 시작</button>
  <button id="b_stop" onclick="api().stop()" disabled>■ 중지</button>
  <button id="b_edit" onclick="doEdit()">📝 편집 페이지</button>
+ <button id="b_import" onclick="doImportBook()"
+  title="라이브러리의 txt/md 파일을 골라 책으로 가져옵니다 — 하드 줄바꿈을 문단으로
+재구성해 <제목>_book 에 저장하고(서고 안 파일이면 _Ebook_Library/_books/) 바로 편집 페이지를 엽니다 (번역 없음)">📚 텍스트 책 가져오기</button>
+ <button id="b_lib" onclick="doLibSync()"
+  title="서고(Drive _Ebook_Library)를 다시 훑어 폰 Fokus Viewer의 [서고] 탭 목록을 갱신합니다.
+앱을 켤 때 한 번 자동으로 하고, 폰에서 요청한 책은 이 앱이 열려 있으면 약 45초 안에
+자동으로 가져와 업로드합니다">📚 서고 올리기</button>
+ <button id="b_kindle" onclick="doKindle()"
+  title="킨들(오아시스 등)을 USB로 연결한 채 누르세요 — 제목·저자·표지·폰트를 정하고, 최신 EPUB을 AZW3로 변환해
+킨들 documents/Fokus/<제목>.azw3 에 같은 이름으로 덮어씁니다(읽던 위치 유지).
+킨들에서 하이라이트+메모(예: 오타, 합치기)로 남긴 곳을 교정 목록으로 보여줍니다">📲 킨들 갱신</button>
  <button id="b_push" onclick="doPush()"
   title="검수 페이지를 동기화 서버(Drive)에 업로드 — 폰에서 열람·수정">☁ 업로드</button>
  <button id="b_pull" onclick="doPull()"
@@ -843,10 +1354,10 @@ const $ = id => document.getElementById(id);
 const api = () => window.pywebview.api;
 let INIT = null;
 
-const FIELDS = ["src","title","source_lang","page_range","ocr","backend",
+const FIELDS = ["src","title","mode","source_lang","page_range","ocr","backend",
   "claude_model","gemini_model","gemini_key","deepseek_model",
   "deepseek_key","deepseek_url","kimi_model","kimi_key",
-  "ollama_model","glossary","api_key",
+  "ollama_model","glossary","api_key","af_mode",
   "gas_url","gas_key","gas_auto_push","gas_auto_pull"];
 
 function opt(id, items, val){
@@ -933,9 +1444,11 @@ function updSummary(){
     const lb = id => ($(id).selectedOptions[0] || {textContent:""})
       .textContent.split(" (")[0];
     const om = modelOf($("c_ocr").value), bm = modelOf($("c_backend").value);
-    const parts = [lb("c_source_lang"),
-                   "전사 " + lb("c_ocr") + (om ? " (" + om + ")" : ""),
-                   "번역 " + lb("c_backend") + (bm ? " (" + bm + ")" : "")];
+    const docMode = c.mode === "pdfdoc", bibleMode = c.mode === "bible";
+    const parts = [bibleMode ? "성경 캡처 (번역 없음)" : lb("c_source_lang")];
+    if (docMode) parts.push("PDF 문서 모드 (레이아웃 유지)");
+    else parts.push("전사 " + lb("c_ocr") + (om ? " (" + om + ")" : ""));
+    if (!bibleMode) parts.push("번역 " + lb("c_backend") + (bm ? " (" + bm + ")" : ""));
     if (c.page_range) parts.push("범위 " + c.page_range);
     $("summary").textContent = "이번 실행 설정:  " + parts.join(" · ");
   }catch(e){}
@@ -953,8 +1466,23 @@ function modelOf(key){
 
 // ── 전사/번역 엔진 선택에 따라 쓰이는 모델·키 블록만 표시 ──
 function updateEngineUI(){
-  const eng = $("c_ocr").value;      // 전사 방식
-  const be = $("c_backend").value;   // 번역 엔진
+  const docMode = $("c_mode").value === "pdfdoc";
+  const bibleMode = $("c_mode").value === "bible";   // 성경 캡처 = 번역 없음
+  const eng = docMode ? "" : $("c_ocr").value;   // 문서 모드 = 전사 없음
+  const be = bibleMode ? "" : $("c_backend").value;   // 번역 엔진
+  $("fs_xlat").style.display = bibleMode ? "none" : "";
+  // 문서 모드: 전사 fieldset 숨김 + 책 전용 버튼(편집·동기화·다시 실행) 비활성
+  $("fs_ocr").style.display = docMode ? "none" : "";
+  for (const id of ["b_edit", "b_push", "b_pull", "b_redo_a"])
+    { const el = $(id); if (el) el.disabled = docMode || bibleMode; }
+  $("hint_mode").textContent = docMode
+    ? "레이아웃 유지 번역 — 텍스트 레이어가 있는 PDF 전용 (전사 생략), "
+      + "결과는 출력 폴더의 <제목>_ko.pdf"
+    : bibleMode
+    ? "성경 앱 캡처(capture_tool 앱 스크롤 모드) → 절 단위 전사만. 결과는 "
+      + "<소스>\\<제목>_성경전사\\<제목>_성경.txt — 성경 뷰어 ⚙ 번역본 가져오기에 넣으세요. "
+      + "Gemini 비전 권장 (작은 절 번호 인식). 원서 언어는 자동=한국어, 독일어 성경이면 독일어 선택"
+    : "";
   const roles = {
     claude:   [eng === "claude" && "전사", be === "claude" && "번역"],
     gemini:   [eng === "gemini" && "전사", be === "gemini" && "번역"],
@@ -989,6 +1517,8 @@ function updateEngineUI(){
     hx = "Claude가 이미지에서 전사+번역을 처리합니다";
   else
     hx = "전사된 원문을 " + beName + "가 텍스트로 번역합니다";
+  if (docMode)
+    hx = "PDF 문단을 " + beName + "가 번역해 같은 자리에 재조판합니다";
   hx += " · 번역 모델 " + (modelOf(be) || "?");
   hx += " · 끝나면 파트별 예상 요금 표시";
   $("hint_xlat").textContent = hx;
@@ -1126,6 +1656,103 @@ async function doEdit(){
   const r = await api().open_edit(collectCfg());
   if (r && r.err) alert(r.err);
 }
+/* ── 텍스트 책 가져오기 창 — 재구성 방식 선택 + 미리보기 ── */
+let _imp = {path:"", seq:0, titleTouched:false};
+async function doImportBook(){
+  _imp = {path:"", seq:0, titleTouched:false};
+  $("im_path").textContent = "파일이나 폴더를 고르세요";
+  $("im_title").value = ""; $("im_split").value = "auto"; $("im_ruby").value = "strip";
+  $("im_info").innerHTML = ""; $("im_warn").innerHTML = ""; $("im_pv").innerHTML = "";
+  $("im_go").disabled = true;
+  $("im_af").value = $("c_af_mode").value || "rule"; $("im_af_info").innerHTML = "";
+  $("imp").style.display = "block";
+  await impPick("file");
+}
+async function impPick(kind){
+  const p = await api().import_pick(kind);
+  if (!p) return;
+  _imp.path = p; _imp.titleTouched = false; $("im_title").value = "";
+  $("im_path").textContent = p;
+  impPreview();
+}
+let _impT = null;
+function impPreviewSoon(){ clearTimeout(_impT); _impT = setTimeout(impPreview, 450); }
+async function impPreview(){
+  if (!_imp.path) return;
+  const seq = ++_imp.seq;
+  $("im_info").textContent = "미리보기 만드는 중…"; $("im_go").disabled = true;
+  const r = await api().import_preview(_imp.path, $("im_split").value,
+                                       $("im_ruby").value,
+                                       _imp.titleTouched ? $("im_title").value : "",
+                                       $("im_af").value);
+  if (seq !== _imp.seq) return;              // 그 사이 옵션이 또 바뀜
+  if (!r || r.err) { $("im_info").textContent = (r && r.err) || "미리보기 실패";
+    $("im_pv").innerHTML = ""; return; }
+  if (!_imp.titleTouched) $("im_title").value = r.title || "";
+  const MODE = {wrap:"하드 줄바꿈 재구성", lines:"한 줄 = 한 문단",
+                blank:"빈 줄 기준", auto:"자동"};
+  const ml = String(r.mode||"").split(",").map(m => MODE[m] || m).join(", ");
+  let info = "판별: <b>" + _esc(ml) + "</b>";
+  if (r.p95 != null) info += " · 줄 길이 p95 " + r.p95 + "자";
+  if (r.term != null) info += " · 문장종결 줄 " + Math.round(r.term*100) + "%";
+  if (r.trail != null) info += " · 줄끝 공백 " + Math.round(r.trail*100) + "%";
+  info += " · " + _esc(r.encoding || "");
+  info += r.folder ? "<br>폴더: 텍스트 " + r.files + "개 (파일마다 따로 재구성, 앞부분만 미리보기)"
+                   : "<br>→ <b>" + r.count + "문단</b>, 장 제목 " + (r.headings||0) + "개" +
+                     (r.subheads ? ", 소제목 " + r.subheads + "개" : "");
+  info += "<br>저장 위치: " + _esc(r.out);
+  $("im_info").innerHTML = info;
+  const a = r.af, afm = $("im_af").value;
+  $("im_af_info").innerHTML = (a && a.applied) ?
+    "자동 교정(규칙, 미리보기에 반영됨): 합치기 " + a.applied.merge + " · 나누기 " + a.applied.split +
+    " · 제목 " + a.applied.head + " · PC통신 머리 제거 " + a.applied.drop +
+    (a.ask ? (afm === "ai"
+      ? "<br>+ AI 판정 " + a.ask + "곳 — 약 " + Number(a.ask_tokens||0).toLocaleString() + " 토큰 (" + _esc(a.engine) + "), 가져올 때 실행"
+      : "<br>애매한 곳 " + a.ask + "곳은 그대로 둠 — 「규칙 + AI」를 고르면 AI가 판정 (약 " + Number(a.ask_tokens||0).toLocaleString() + " 토큰)")
+     : "")
+    : (afm === "off" ? "" : (r.folder ? "폴더는 가져올 때 자동 교정합니다" : ""));
+  const ex = r.existing;
+  $("im_warn").innerHTML = ex ?
+    "⚠ 이미 가져온 책입니다 (지금 " + ex.count + "문단" + (ex.mode ? ", " + _esc(ex.mode) : "") + "). " +
+    "다시 가져오면 문단을 새로 만들어 <b>편집 페이지에서 고친 본문·제목 지정은 새 결과로 바뀝니다</b> " +
+    "(이전 book.json은 _work/reimport_… 에 사본). 북마크·위치·하이라이트는 유지되지만 " +
+    "문단 수가 바뀌면 위치가 어긋날 수 있습니다" +
+    ((ex.hi || ex.bmks) ? " — 하이라이트 " + (ex.hi||0) + "개, 북마크 " + (ex.bmks||0) + "개" : "") + "." : "";
+  $("im_pv").innerHTML = (r.paras||[]).map((p, i) => {
+    const lv = p.startsWith("### ") ? 3 : p.startsWith("## ") ? 2 : 0;
+    const t = _esc(lv ? p.replace(/^#{2,3}\s*/, "") : p).replace(/\n/g, "<br>");
+    return '<div class="imp-p' + (lv ? " h" + lv : "") + '"><span>' + (i+1) + "</span>" + t + "</div>";
+  }).join("") + ((r.count == null || r.count > (r.paras||[]).length) ?
+    '<div class="imp-more">… 앞부분만 표시</div>' : "");
+  $("im_go").disabled = false;
+}
+async function impGo(){
+  if (!_imp.path) return;
+  const b = $("im_go"); b.disabled = true; b.textContent = "가져오는 중…";
+  try{
+    if ($("im_af").value === "ai") b.textContent = "가져오는 중… (AI 판정 포함 — 수십 초)";
+    const r = await api().import_text(collectCfg(), _imp.path, $("im_split").value,
+                                      $("im_ruby").value, $("im_title").value,
+                                      $("im_af").value);
+    if (!r || r.cancel) return;
+    if (r.err) { alert(r.err); return; }
+    $("imp").style.display = "none";
+    $("c_src").value = r.src; $("c_title").value = r.title;
+    if ($("c_source_lang")) $("c_source_lang").value = r.lang;
+    if ($("c_mode")) { $("c_mode").value = "book"; }   // 문서/성경 모드였어도 책 모드로
+    if (typeof updSummary === "function") updSummary();
+    save(); refreshRecents();
+    await doEdit();
+  } finally { b.disabled = false; b.textContent = "📚 가져오기"; }
+}
+async function doLibSync(){
+  const b = $("b_lib"); b.disabled = true;
+  const t = b.textContent; b.textContent = "📚 훑는 중…";
+  try{
+    const r = await api().lib_sync(collectCfg());
+    if (r && r.err) alert(r.err);
+  } finally { b.disabled = false; b.textContent = t; }
+}
 async function doPush(){
   const b = $("b_push"); b.disabled = true;
   b.textContent = "☁ 업로드 중…";
@@ -1175,6 +1802,7 @@ async function tick(){
 async function boot(){
   INIT = await api().get_init();
   document.title = "스캔 이북 한글 번역 v" + INIT.version + " — 웹앱";
+  opt("c_mode", INIT.modes, INIT.cfg.mode || "book");
   opt("c_source_lang", INIT.langs, INIT.cfg.source_lang);
   opt("c_ocr", INIT.ocr_modes, INIT.cfg.ocr);
   opt("c_backend", INIT.backends, INIT.cfg.backend);
@@ -1205,7 +1833,201 @@ document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
   updSummary();
 });
 window.addEventListener("pywebviewready", boot);
-</script></body></html>"""
+</script>
+<style>
+ #imp .imp-p{padding:5px 8px 5px 40px;position:relative;border-bottom:1px solid var(--line);
+   line-height:1.6;font-size:13px}
+ #imp .imp-p span{position:absolute;left:6px;color:var(--tx3);font-size:11px;top:7px}
+ #imp .imp-p.h2{font-weight:700;font-size:15px;color:var(--pri)}
+ #imp .imp-p.h3{font-weight:700;color:var(--tx2)}
+ #imp .imp-more{color:var(--tx3);padding:8px;text-align:center;font-size:12px}
+ #imp .imr{display:flex;gap:8px;align-items:center;margin:7px 0}
+ #imp .imr > label{flex:0 0 92px}
+</style>
+<input type="hidden" id="c_af_mode" value="rule">
+<div id="imp" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:50">
+ <div style="position:absolute;left:50%;top:4%;transform:translateX(-50%);width:min(820px,94vw);
+  max-height:92vh;display:flex;flex-direction:column;background:var(--bg);color:var(--tx);
+  border:1px solid var(--line2);border-radius:10px;padding:14px 16px">
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+   <b style="flex:1">📚 텍스트 책 가져오기</b>
+   <button onclick="impPick('file')">📄 파일 고르기</button>
+   <button onclick="impPick('dir')" title="여러 파일(권·장 분할본)이 든 폴더를 한 권으로">📁 폴더 고르기</button>
+   <button onclick="$('imp').style.display='none'">닫기</button>
+  </div>
+  <div id="im_path" style="color:var(--tx2);font-size:12px;word-break:break-all;margin-bottom:4px"></div>
+  <div class="imr"><label>책 제목</label>
+   <input type="text" id="im_title" oninput="_imp.titleTouched=true;impPreviewSoon()"></div>
+  <div class="imr"><label title="원본 txt의 줄바꿈을 문단으로 바꾸는 방식">줄바꿈 교정</label>
+   <select id="im_split" onchange="impPreview()">
+    <option value="auto">자동 판별 (권장)</option>
+    <option value="wrap">하드 줄바꿈 재구성 — 40자 안팎마다 끊긴 한국 txt</option>
+    <option value="lines">한 줄 = 한 문단 — 번역 라노벨·중국어·青空文庫</option>
+    <option value="blank">빈 줄 기준 — 빈 줄로만 문단이 나뉜 글 (_src.txt 왕복)</option>
+   </select>
+   <select id="im_ruby" onchange="impPreview()" style="flex:0 0 170px" title="青空文庫 루비(읽기) 처리 — 일본어 책만 해당">
+    <option value="strip">루비 지우기</option><option value="paren">루비 괄호로 漢字(かな)</option>
+    <option value="keep">루비 그대로</option></select></div>
+  <div class="imr"><label title="잘린 문단 합치기·제목 찾기·PC통신 머리 제거·긴 문단 나누기">자동 교정</label>
+   <select id="im_af" onchange="$('c_af_mode').value=this.value;impPreview()">
+    <option value="rule">규칙만 (무료) — 확실한 곳만 고침</option>
+    <option value="ai">규칙 + AI — 애매한 곳은 번역 엔진에 물어봄 (유료)</option>
+    <option value="off">끄기 — 줄바꿈 교정만</option>
+   </select></div>
+  <div id="im_info" style="font-size:12px;line-height:1.6;color:var(--tx2)"></div>
+  <div id="im_af_info" style="font-size:12px;line-height:1.6;color:var(--ok)"></div>
+  <div id="im_warn" style="font-size:12px;line-height:1.6;color:var(--warn);margin-top:4px"></div>
+  <div id="im_pv" style="flex:1;overflow:auto;min-height:160px;margin:8px 0;background:var(--field);
+   border:1px solid var(--line);border-radius:6px"></div>
+  <div style="display:flex;gap:8px;align-items:center">
+   <span class="hint" style="flex:1">미리보기가 이상하면 줄바꿈 교정 방식을 바꿔 보세요. 소제목은 가져온 뒤
+    편집 페이지 필터의 「소제목 후보 찾기」로 지정합니다.</span>
+   <button class="pri" id="im_go" onclick="impGo()" disabled>📚 가져오기</button>
+  </div>
+ </div>
+</div>
+<div id="kset" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:50">
+ <div style="position:absolute;left:50%;top:5%;transform:translateX(-50%);width:min(720px,94vw);
+  max-height:90vh;overflow:auto;background:var(--bg);color:var(--tx);
+  border:1px solid var(--line2);border-radius:10px;padding:14px 16px">
+  <div style="display:flex;align-items:center;margin-bottom:10px">
+   <b style="flex:1">📲 킨들로 보내기</b>
+   <button onclick="$('kset').style.display='none'">닫기</button>
+  </div>
+  <div style="display:flex;gap:16px;flex-wrap:wrap">
+   <div style="flex:1;min-width:260px;display:grid;gap:9px;align-content:start">
+    <label>제목 <input id="k_title" style="width:100%" oninput="kPreviewSoon()"></label>
+    <label>저자 <input id="k_author" style="width:100%" oninput="kPreviewSoon()"></label>
+    <label>본문 폰트 <select id="k_font" style="width:100%" onchange="kPreview()"></select></label>
+    <label>표지 <select id="k_cover" style="width:100%" onchange="kPreview()">
+      <option value="auto" id="k_scanopt">자동</option>
+      <option value="text">글자 표지 (제목·저자)</option>
+      <option value="file">이미지 파일…</option>
+      <option value="none">표지 없음</option></select></label>
+    <div><button onclick="kPick()">🖼 표지 이미지 고르기…</button>
+     <span id="k_file" style="color:var(--tx2);font-size:12px"></span></div>
+    <div style="color:var(--tx2);font-size:12px;line-height:1.5">
+     킨들에 보이는 제목·저자만 바뀌고, 파일명은 그대로라 읽던 위치가 유지됩니다.<br>
+     폰트는 킨들에서 <b>Aa → 글꼴 → 출판사 글꼴</b>을 골라야 보입니다.</div>
+    <div id="k_stat" style="font-size:12px;line-height:1.5"></div>
+    <label style="font-size:13px"><input type="checkbox" id="k_eject" checked>
+     갱신이 끝나면 킨들 자동으로 꺼내기 (바로 케이블을 뽑아도 됨)</label>
+    <div style="display:flex;gap:8px">
+     <button class="pri" id="k_go" onclick="kGo()" style="flex:1">📲 킨들 갱신</button>
+     <button id="k_ej" onclick="kEject(this)" title="탐색기 '꺼내기'와 같습니다 — 갱신 없이 꺼내기만">⏏ 꺼내기</button>
+    </div>
+   </div>
+   <div style="width:210px;text-align:center">
+    <img id="k_pv" style="width:210px;border:1px solid var(--line2);border-radius:4px;background:#fff">
+    <div id="k_nopv" style="display:none;color:var(--tx3);padding:40px 0">표지 없음</div>
+   </div>
+  </div>
+ </div>
+</div>
+<div id="kfx" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:50">
+ <div style="position:absolute;left:50%;top:6%;transform:translateX(-50%);width:min(760px,92vw);
+  max-height:84vh;overflow:auto;background:var(--bg);color:var(--tx);
+  border:1px solid var(--line,#444);border-radius:10px;padding:14px 16px">
+  <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+   <b style="flex:1">📲 킨들 교정 메모 <span id="kfx_n"></span></b>
+   <button onclick="kfxEdit()">📝 편집 페이지</button>
+   <button onclick="kfxDone()" title="체크한 항목을 처리 완료로 — 다음부터 안 보입니다">✓ 처리 완료</button>
+   <button onclick="$('kfx').style.display='none'">닫기</button>
+  </div>
+  <div id="kfx_list"></div>
+ </div>
+</div>
+<script>
+let _kfx = [];
+function _esc(t){ return String(t||"").replace(/[&<>]/g, m=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[m])); }
+let _ksel = {};
+async function doKindle(){
+  const r = await api().kindle_info(collectCfg());
+  if (!r) return;
+  if (r.err) { alert(r.err); return; }
+  const o = r.opts;
+  $("k_title").value = o.title || ""; $("k_author").value = o.author || "";
+  $("k_font").innerHTML = '<option value="none">킨들 기본 글꼴</option>' +
+    r.fonts.map(f => '<option value="' + f.key + '"' + (f.ok ? "" : " disabled") + '>' +
+      f.label + (f.ok ? "" : " (폰트 파일 없음)") + '</option>').join("");
+  $("k_font").value = o.font || "none";
+  $("k_cover").value = o.cover || "auto";
+  $("k_eject").checked = o.eject !== false;
+  $("k_ej").disabled = !r.kindle;
+  _ksel.cover_file = o.cover_file || "";
+  $("k_file").textContent = _ksel.cover_file ? _ksel.cover_file.split(/[\\/]/).pop() : "";
+  $("k_scanopt").textContent = r.has_scan ? "자동 (스캔 첫 페이지/지정 표지)" : "자동 (글자 표지)";
+  $("k_stat").innerHTML = (r.kindle ? "✅ 킨들: " + _esc(r.kindle) : "⚠ 킨들이 연결되지 않았습니다") +
+    " · 파일: documents/Fokus/" + _esc(r.file) +
+    (r.calibre ? "" : "<br>⚠ Calibre(ebook-convert)를 찾지 못했습니다");
+  $("k_go").disabled = !r.kindle || !r.calibre;
+  $("kset").style.display = "block";
+  kPreview();
+}
+function kOpts(){
+  return {title: $("k_title").value.trim(), author: $("k_author").value.trim(),
+          font: $("k_font").value, cover: $("k_cover").value, cover_file: _ksel.cover_file || "",
+          eject: $("k_eject").checked};
+}
+let _kpvT = null;
+function kPreviewSoon(){ clearTimeout(_kpvT); _kpvT = setTimeout(kPreview, 400); }
+async function kPreview(){
+  $("k_pv").style.opacity = .4;
+  const r = await api().kindle_preview(collectCfg(), kOpts());
+  $("k_pv").style.opacity = 1;
+  if (r && r.img) { $("k_pv").src = r.img; $("k_pv").style.display = ""; $("k_nopv").style.display = "none"; }
+  else { $("k_pv").style.display = "none"; $("k_nopv").style.display = ""; }
+}
+async function kPick(){
+  const p = await api().kindle_pick_cover();
+  if (!p) return;
+  _ksel.cover_file = p; $("k_cover").value = "file";
+  $("k_file").textContent = p.split(/[\\/]/).pop();
+  kPreview();
+}
+async function kEject(btn){
+  const b = btn || $("k_ej"); b.disabled = true;
+  const t = b.textContent; b.textContent = "⏏ 꺼내는 중…";
+  try{
+    const r = await api().kindle_eject(collectCfg());
+    if (r && r.err) alert(r.err);
+    else { $("k_go").disabled = true; $("k_stat").innerHTML = "⏏ 킨들을 꺼냈습니다 — 케이블을 뽑아도 됩니다."; }
+  } finally { b.textContent = t; b.disabled = false; }
+}
+async function kGo(){
+  const b = $("k_go"); b.disabled = true;
+  const t = b.textContent; b.textContent = "📲 변환·복사 중…";
+  try{
+    const r = await api().kindle_sync(collectCfg(), kOpts());
+    if (!r) return;
+    if (r.err) { alert(r.err); return; }
+    $("kset").style.display = "none";
+    _kfx = r.fixes || [];
+    if (_kfx.length) showKfx();
+  } finally { b.disabled = false; b.textContent = t; }
+}
+function showKfx(){
+  $("kfx_n").textContent = "(" + _kfx.length + ")";
+  $("kfx_list").innerHTML = _kfx.map((x, k) =>
+    '<label style="display:flex;gap:8px;padding:7px 0;border-top:1px solid var(--line,#333)">' +
+    '<input type="checkbox" data-k="' + k + '" checked>' +
+    '<span style="min-width:4.5em;opacity:.7">' + (x.i == null ? "못 찾음" : "#" + x.i) + '</span>' +
+    '<span style="flex:1"><b>' + _esc(x.note) + '</b><br><span style="opacity:.8">' +
+    _esc(x.text) + '</span></span></label>').join("");
+  $("kfx").style.display = "block";
+}
+async function kfxEdit(){ await doEdit(); }
+async function kfxDone(){
+  const keys = [...document.querySelectorAll("#kfx_list input:checked")]
+    .map(e => _kfx[+e.dataset.k].key);
+  if (!keys.length) { $("kfx").style.display = "none"; return; }
+  const r = await api().kindle_done(collectCfg(), keys);
+  if (r && r.err) { alert(r.err); return; }
+  _kfx = _kfx.filter(x => !keys.includes(x.key));
+  if (_kfx.length) showKfx(); else $("kfx").style.display = "none";
+}
+</script>
+</body></html>"""
 
 
 def _set_win_icon(title: str, ico: Path) -> None:

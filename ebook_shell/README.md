@@ -1,4 +1,4 @@
-# ebook_shell — 이북 검수 PWA 셸
+# ebook_shell — Fokus Viewer PWA 셸 (구 "이북 검수")
 
 GAS 검수 페이지를 주소창 없는 standalone 앱으로 여는 얇은 껍데기.
 서재(책 목록)를 자체 렌더하고, 책을 열면 GAS 페이지를 전체화면 iframe으로 품는다.
@@ -7,8 +7,10 @@ GAS 검수 페이지를 주소창 없는 standalone 앱으로 여는 얇은 껍�
 ## 배포 (1회, GitHub Pages)
 
 1. github.com 에서 **공개** 저장소 생성 (예: `ebook-shell`)
-2. 이 폴더의 5개 파일 업로드 (웹에서 드래그&드롭 가능):
-   index.html · manifest.json · sw.js · icon-192.png · icon-512.png
+2. 이 폴더의 8개 파일 업로드 (웹에서 드래그&드롭 가능):
+   index.html · manifest.json · sw.js · favicon.svg ·
+   icon-192.png · icon-512.png · icon-maskable-512.png · apple-touch-icon.png
+   (아이콘은 Fokus 패밀리 공통 — 플럼 배경 #2e2140 + 크림 F + 오른쪽 골드 펼친 책, Lesen·Alltag과 같은 배치)
 3. 저장소 Settings → Pages → Source: "Deploy from a branch",
    Branch: main / (root) → Save
 4. 1~2분 후 `https://<계정>.github.io/ebook-shell/` 접속 가능

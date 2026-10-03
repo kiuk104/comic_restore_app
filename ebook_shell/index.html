@@ -2,13 +2,14 @@
 <html lang="ko"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
-<meta name="theme-color" content="#064e3b">
-<title>이북 검수</title>
+<meta name="theme-color" content="#2e2140">
+<title>Fokus Viewer</title>
 <link rel="manifest" href="manifest.json">
-<link rel="icon" href="icon-192.png">
-<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="icon" href="icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
 <style>
-:root{--bg:#f4f5f7;--tx:#21242b;--tx2:#5b6270;--acc:#10b981;--deep:#064e3b}
+:root{--bg:#f4f5f7;--tx:#21242b;--tx2:#5b6270;--acc:#bf8729;--deep:#2e2140}
 *{box-sizing:border-box}
 html,body{height:100%;margin:0}
 body{font-family:'Malgun Gothic',sans-serif;background:var(--bg);
@@ -20,7 +21,53 @@ body{font-family:'Malgun Gothic',sans-serif;background:var(--bg);
  calc(14px + env(safe-area-inset-top)) 18px 14px;font-size:18px;
  font-weight:700;display:flex;align-items:center;gap:10px}
 #home header img{width:26px;height:26px;border-radius:6px}
-#books{flex:1;overflow:auto;padding:14px}
+#books{padding:14px}
+/* ---- 서재 탭 (읽는 중 / 서고 / 요청) — 4단계 라이브러리 ---- */
+#tabs{display:flex;background:var(--deep);padding:0 8px;gap:2px}
+#tabs button{flex:1;border:0;background:none;color:#cbbfdc;font-size:14px;
+ font-weight:700;padding:10px 4px 9px;border-bottom:3px solid transparent;cursor:pointer}
+#tabs button.on{color:#fff;border-bottom-color:var(--acc)}
+#tabs .bdg{display:inline-block;min-width:17px;padding:0 5px;margin-left:4px;
+ border-radius:9px;background:var(--acc);color:#fff;font-size:11px;line-height:17px}
+.tab{display:none;flex:1;min-height:0;overflow:auto}
+.tab.on{display:block}
+.tbar{display:flex;gap:8px;align-items:center;padding:10px 14px 0}
+.tbar select,.tbar input{flex:1;padding:9px 10px;font-size:14px;border:1px solid #c2c8d3;
+ border-radius:8px;background:#fff;color:var(--tx);min-width:0}
+.chip{display:inline-block;font-size:11px;font-weight:700;padding:1px 7px;
+ border-radius:9px;margin-left:6px;vertical-align:2px}
+.chip.plain{background:#efe4cf;color:#7a5413}.chip.xlat{background:#e3dbef;color:#4a3470}
+.chip.done{background:#dcefdc;color:#2b6b2b}.chip.wait{background:#efe4cf;color:#7a5413}
+#crumb{padding:10px 14px 2px;font-size:13px;color:var(--tx2);line-height:1.7}
+#crumb a{color:var(--deep);text-decoration:none;font-weight:700;cursor:pointer}
+#libl,#reql{padding:8px 14px 24px}
+.li{display:flex;align-items:center;gap:10px;width:100%;text-align:left;background:#fff;
+ border:1px solid #e0e3e9;border-radius:10px;padding:11px 12px;margin:0 0 6px;
+ font-size:15px;color:var(--tx);cursor:pointer}
+.li:active{background:#f3ece0}
+.li .nm{flex:1;min-width:0;overflow-wrap:anywhere}
+.li small{display:block;color:var(--tx2);font-size:11.5px;margin-top:2px}
+.li .ct{color:var(--tx2);font-size:12px;white-space:nowrap}
+.act{display:block;width:100%;border:0;border-radius:10px;padding:12px;margin:2px 0 10px;
+ font-size:14.5px;font-weight:700;background:var(--acc);color:#fff;cursor:pointer}
+.act.sub{background:#fff;color:var(--deep);border:1px solid #cfc3e0}
+.note{color:var(--tx2);font-size:13px;padding:14px 4px;line-height:1.6}
+/* 가져오기 요청 시트 */
+#sheet{position:fixed;inset:0;background:rgba(20,14,30,.45);z-index:20;display:none;
+ align-items:flex-end}
+#sheet.on{display:flex}
+#sheet .box{background:#fff;width:100%;border-radius:16px 16px 0 0;
+ padding:18px 18px calc(18px + env(safe-area-inset-bottom))}
+#sheet h3{margin:0 0 4px;font-size:16px}
+#sheet p{margin:0 0 10px;font-size:12.5px;color:var(--tx2);overflow-wrap:anywhere}
+#sheet label{font-size:12.5px;color:var(--tx2)}
+#sheet input{width:100%;padding:10px;font-size:15px;border:1px solid #c2c8d3;
+ border-radius:8px;margin:4px 0 12px}
+#toast{position:fixed;left:50%;bottom:calc(24px + env(safe-area-inset-bottom));
+ transform:translateX(-50%);background:rgba(33,36,43,.94);color:#fff;font-size:13px;
+ padding:9px 14px;border-radius:10px;z-index:30;opacity:0;pointer-events:none;
+ transition:opacity .2s;max-width:86vw;text-align:center}
+#toast.on{opacity:1}
 .bk{display:block;width:100%;text-align:left;background:#fff;
  border:1px solid #d5d9e0;border-radius:12px;padding:16px 16px;
  margin:0 0 10px;font-size:16px;color:var(--tx);cursor:pointer}
@@ -60,25 +107,52 @@ body{font-family:'Malgun Gothic',sans-serif;background:var(--bg);
 </style></head><body>
 
 <div class="pg" id="setup">
- <h2>📚 이북 검수 설정</h2>
+ <h2>📚 Fokus Viewer 설정</h2>
  <p>Apps Script 배포 주소와 동기화 키를 한 번만 입력하면
   이 기기에 저장됩니다.</p>
  <label>동기화 URL (…/exec)</label>
  <input id="s_url" type="url" placeholder="https://script.google.com/macros/s/…/exec">
- <label>동기화 키</label>
+ <label>동기화 키 <button type="button" onclick="const k=document.getElementById('s_key');k.type=k.type==='password'?'text':'password'" style="border:0;background:none;cursor:pointer;font-size:13px" title="키 보기/숨기기">👁</button></label>
  <input id="s_key" type="password">
  <button onclick="saveSetup()">저장하고 시작</button>
  <div id="err"></div>
 </div>
 
 <div class="pg" id="home">
- <header><img src="icon-192.png" alt="">이북 검수
+ <header><img src="icon-192.png" alt="">Fokus Viewer
   <span style="flex:1"></span>
   <button onclick="show('setup')" style="border:0;background:none;color:#fff;
    font-size:17px;cursor:pointer" title="설정">⚙</button></header>
- <div id="books"><div class="spin">목록 불러오는 중…</div></div>
- <div id="hint"></div>
+ <nav id="tabs">
+  <button data-t="read" class="on">읽는 중</button>
+  <button data-t="lib">서고</button>
+  <button data-t="req">요청<span id="reqn"></span></button>
+ </nav>
+ <div class="tab on" id="t_read">
+  <div class="tbar"><select id="sortsel" aria-label="정렬">
+   <option value="recent">최근 연 순</option><option value="title">제목순</option>
+   <option value="prog">진행률순</option></select></div>
+  <div id="books"><div class="spin">목록 불러오는 중…</div></div>
+  <div id="hint"></div>
+ </div>
+ <div class="tab" id="t_lib">
+  <div class="tbar"><input id="libq" type="search" placeholder="서고 검색 — 제목·폴더 이름"
+   autocomplete="off"></div>
+  <div id="crumb"></div>
+  <div id="libl"><div class="spin">서고 목록 불러오는 중…</div></div>
+ </div>
+ <div class="tab" id="t_req"><div id="reql"></div></div>
 </div>
+
+<div id="sheet"><div class="box">
+ <h3 id="sh_h">가져오기 요청</h3>
+ <p id="sh_p"></p>
+ <label>책 제목</label>
+ <input id="sh_t" autocomplete="off">
+ <button class="act" id="sh_ok">📥 PC에 가져오기 요청</button>
+ <button class="act sub" onclick="sheetClose()">취소</button>
+</div></div>
+<div id="toast"></div>
 
 <div class="pg" id="view">
  <!-- screen-wake-lock·autoplay는 기본 허용 범위가 'self'라 크로스오리진
@@ -104,6 +178,10 @@ if (qp.get("gas")) {
 }
 
 function show(id) {
+  if (id === "setup" && cfg) {                 // 저장된 값 미리 채움 — PC 설정 복구용으로도 읽을 수 있게
+    document.getElementById("s_url").value = cfg.url || "";
+    document.getElementById("s_key").value = cfg.key || "";
+  }
   document.querySelectorAll(".pg").forEach(p =>
     p.classList.toggle("on", p.id === id));
   document.getElementById("back").style.display =
@@ -126,7 +204,9 @@ let autoOpened = false;
 function renderBooks(d, fromCache) {
   const bx = document.getElementById("books");
   bx.innerHTML = "";
-  const items = d.info || (d.books || []).map(n => ({name: n}));
+  LIST = d;
+  const items = (d.info || (d.books || []).map(n => ({name: n}))).slice();
+  sortItems(items);
   items.forEach(it => {
     const el = document.createElement("button");
     el.className = "bk";
@@ -143,7 +223,9 @@ function renderBooks(d, fromCache) {
     }
     if (it.pending)
       sub += (sub ? " · " : "") + "☁ PC 반영 대기 " + it.pending + "건";
-    el.innerHTML = "📖 " + nm + (sub ? "<small>" + sub + "</small>" : "");
+    const chip = it.kind === "plain" ? '<span class="chip plain">평문</span>'
+      : it.kind === "xlat" ? '<span class="chip xlat">번역</span>' : "";
+    el.innerHTML = "📖 " + nm + chip + (sub ? "<small>" + sub + "</small>" : "");
     el.onclick = () => openBook(it.name);
     bx.appendChild(el);
   });
@@ -192,6 +274,10 @@ function openBook(b) {
   edWin = null;                              // 새 책 로드 — 프레임 핸들 재확보 대기
   wkSet(false);                              // 새 책이 다시 요청할 때까지 해제
   localStorage.setItem("ebookShellLast", b);
+  try {                                       // '최근 연 순' 정렬용
+    const op = JSON.parse(localStorage.getItem("fvOpened") || "{}");
+    op[b] = Date.now(); localStorage.setItem("fvOpened", JSON.stringify(op));
+  } catch (e) {}
   document.getElementById("fr").src = cfg.url +
     "?book=" + encodeURIComponent(b) + "&key=" + encodeURIComponent(cfg.key);
   show("view");
@@ -317,9 +403,303 @@ addEventListener("message", e => {
   }
 });
 
+// ══ 서재 탭 · 서고(카탈로그) · 가져오기 요청 — Fokus Viewer 4단계 ══════════
+//   서고 = PC가 훑어 올린 카탈로그(gzip+base64)를 받아 기기 안에서 탐색·검색.
+//   txt/폴더를 고르면 '가져오기 요청'(GAS importq) → PC 웹앱이 켜져 있으면
+//   약 45초 안에 문단 재구성·업로드 → [읽는 중]에 나타난다.
+let LIST = null;                              // 마지막 op:list 응답
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g,
+  c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+const coll = new Intl.Collator("ko", {numeric: true, sensitivity: "base"});
+function toast(m, ms) {
+  const t = document.getElementById("toast");
+  t.textContent = m; t.classList.add("on");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("on"), ms || 2600);
+}
+async function gas(body, _retry) {
+  const r = await fetch(cfg.url, {method: "POST",
+    body: JSON.stringify(Object.assign({key: cfg.key}, body))});
+  const t = await r.text();
+  let d;
+  try { d = JSON.parse(t); }
+  catch (e) {     // GAS가 간헐적으로 오류 페이지(HTML)를 돌려줌 — 한 번 더
+    if (!_retry) { await new Promise(ok => setTimeout(ok, 1200)); return gas(body, 1); }
+    throw new Error("동기화 서버 응답 오류 — 잠시 뒤 다시 시도하세요");
+  }
+  if (d.err) throw new Error(d.err);
+  return d;
+}
+function sortItems(items) {
+  const m = localStorage.getItem("fvSort") || "recent";
+  let op = {};
+  try { op = JSON.parse(localStorage.getItem("fvOpened") || "{}"); } catch (e) {}
+  const pr = it => it.count && it.pos != null ? (Math.floor(it.pos) + 1) / it.count : -1;
+  items.sort((a, b) =>
+    m === "title" ? coll.compare(a.name, b.name)
+    : m === "prog" ? (pr(b) - pr(a)) || coll.compare(a.name, b.name)
+    : ((op[b.name] || 0) - (op[a.name] || 0)) || coll.compare(a.name, b.name));
+}
+const sortSel = document.getElementById("sortsel");
+sortSel.value = localStorage.getItem("fvSort") || "recent";
+sortSel.onchange = () => {
+  localStorage.setItem("fvSort", sortSel.value);
+  if (LIST) renderBooks(LIST, true);
+};
+
+let curTab = localStorage.getItem("fvTab") || "read";
+function setTab(t) {
+  curTab = t; localStorage.setItem("fvTab", t);
+  document.querySelectorAll("#tabs button").forEach(b =>
+    b.classList.toggle("on", b.dataset.t === t));
+  document.querySelectorAll(".tab").forEach(x =>
+    x.classList.toggle("on", x.id === "t_" + t));
+  if (t === "lib") loadCatalog();
+  if (t === "req") loadReq();
+}
+document.querySelectorAll("#tabs button").forEach(b =>
+  b.onclick = () => setTab(b.dataset.t));
+
+// ---- 카탈로그 ----
+let CAT = null, KIDS = null, FILES = null, CNT = null, libCur = 0, catBusy = false;
+async function gunzipB64(b64) {
+  if (typeof DecompressionStream === "undefined")
+    throw new Error("이 브라우저는 압축 해제를 지원하지 않습니다 — Chrome 최신판을 쓰세요");
+  const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const st = new Blob([bin]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return await new Response(st).text();
+}
+function buildTree(c) {
+  const n = c.d.length;
+  KIDS = Array.from({length: n}, () => []);
+  FILES = Array.from({length: n}, () => []);
+  CNT = new Array(n).fill(0);
+  for (let i = 1; i < n; i++) KIDS[c.d[i][0]].push(i);
+  c.f.forEach((f, k) => FILES[f[0]].push(k));
+  for (let i = n - 1; i >= 0; i--) {          // 자식은 부모보다 뒤 번호 → 역순 누적
+    CNT[i] += FILES[i].length;
+    if (i > 0) CNT[c.d[i][0]] += CNT[i];
+  }
+  KIDS.forEach(a => a.sort((x, y) => coll.compare(c.d[x][1], c.d[y][1])));
+  FILES.forEach(a => a.sort((x, y) => coll.compare(c.f[x][1], c.f[y][1])));
+}
+function dpath(i) {
+  const ps = [];
+  while (i > 0) { ps.push(CAT.d[i][1]); i = CAT.d[i][0]; }
+  return ps.reverse().join("/");
+}
+function fpath(k) { const d = dpath(CAT.f[k][0]); return (d ? d + "/" : "") + CAT.f[k][1]; }
+function fsize(b) { return b < 0 ? "" : b < 1024 * 1024 ? Math.max(1, Math.round(b / 1024)) + "KB"
+  : (b / 1048576).toFixed(1) + "MB"; }
+// 원본 경로 → 올라온 책 이름 (카탈로그 imp + 서재 목록의 src)
+function bookOf(p) {
+  if (LIST && LIST.info) for (const it of LIST.info) if (it.src === p) return it.name;
+  const t = CAT && CAT.imp && CAT.imp[p];
+  return t && LIST && (LIST.books || []).includes(t) ? t : null;
+}
+function reqOf(p) { return (REQ || []).find(x => x.p === p && x.st === "wait"); }
+async function loadCatalog(force) {
+  if (catBusy || (CAT && !force)) { if (CAT) renderLib(); return; }
+  catBusy = true;
+  const box = document.getElementById("libl");
+  let cached = null;
+  try { cached = JSON.parse(localStorage.getItem("fvCat") || "null"); } catch (e) {}
+  try {
+    if (cached && cached.gz && !CAT) {
+      CAT = JSON.parse(await gunzipB64(cached.gz)); buildTree(CAT); renderLib();
+    }
+    const d = await gas({op: "catalog", ver: cached ? cached.ver : ""});
+    if (!d.ver) {
+      if (!CAT) box.innerHTML = '<div class="note">서고 목록이 아직 없습니다.<br>' +
+        'PC 이북 앱에서 <b>📚 서고 목록 올리기</b>를 누르세요 (앱을 켜면 자동으로도 올라갑니다).</div>';
+    } else if (d.gz) {
+      CAT = JSON.parse(await gunzipB64(d.gz)); buildTree(CAT);
+      try { localStorage.setItem("fvCat", JSON.stringify({ver: d.ver, gz: d.gz})); }
+      catch (e) {}                             // 용량 초과면 캐시만 생략
+      renderLib();
+    }
+  } catch (e) {
+    if (!CAT) box.innerHTML = '<div class="note">서고 목록을 불러오지 못했습니다 — ' +
+      esc(e.message || e) + '<br><button class="act sub" onclick="loadCatalog(true)">다시 시도</button></div>';
+  } finally { catBusy = false; }
+}
+function renderLib() {
+  if (!CAT) return;
+  const q = document.getElementById("libq").value.trim().toLowerCase();
+  const box = document.getElementById("libl"), cr = document.getElementById("crumb");
+  let h = "";
+  if (q) {                                     // ---- 검색 ----
+    cr.textContent = "";
+    const res = [];
+    for (let i = 1; i < CAT.d.length && res.length < 150; i++)
+      if (CAT.d[i][1].toLowerCase().includes(q)) res.push(["d", i]);
+    for (let k = 0; k < CAT.f.length && res.length < 150; k++)
+      if (CAT.f[k][1].toLowerCase().includes(q)) res.push(["f", k]);
+    if (!res.length) h = '<div class="note">“' + esc(q) + '” — 찾은 책이 없습니다</div>';
+    res.forEach(([t, i]) => {
+      if (t === "d") h += '<button class="li" data-d="' + i + '">📁<span class="nm">' +
+        esc(CAT.d[i][1]) + "<small>" + esc(dpath(CAT.d[i][0]) || "서고") +
+        '</small></span><span class="ct">' + CNT[i] + "개</span></button>";
+      else h += fileRow(i, true);
+    });
+    if (res.length >= 150) h += '<div class="note">결과가 많아 150개까지만 보여 줍니다 — 더 구체적으로 검색하세요</div>';
+  } else {                                     // ---- 폴더 탐색 ----
+    const chain = [];
+    for (let i = libCur; i > 0; i = CAT.d[i][0]) chain.push(i);
+    cr.innerHTML = '<a data-d="0">서고</a>' + chain.reverse().map(i =>
+      ' › <a data-d="' + i + '">' + esc(CAT.d[i][1]) + "</a>").join("");
+    if (libCur > 0) {
+      const p = dpath(libCur), bk = bookOf(p), rq = reqOf(p);
+      if (bk) h += '<button class="act" data-open="' + esc(bk) + '">📖 『' + esc(bk) + '』 열기</button>';
+      else if (rq) h += '<div class="note">⏳ 이 폴더를 가져오기 요청함 — PC가 처리하면 [읽는 중]에 나타납니다</div>';
+      else if (CNT[libCur] >= 2) h += '<button class="act sub" data-fold="' + libCur +
+        '">📥 이 폴더를 한 권으로 가져오기 (텍스트 ' + CNT[libCur] + "개)</button>";
+    }
+    KIDS[libCur].forEach(i => {
+      h += '<button class="li" data-d="' + i + '">📁<span class="nm">' + esc(CAT.d[i][1]) +
+        (bookOf(dpath(i)) ? '<span class="chip done">가져옴</span>' : "") +
+        '</span><span class="ct">' + CNT[i] + "개</span></button>";
+    });
+    FILES[libCur].forEach(k => { h += fileRow(k, false); });
+    if (!h) h = '<div class="note">비어 있는 폴더입니다</div>';
+    if (libCur === 0) h += '<div class="note">텍스트 ' + CAT.n.toLocaleString() +
+      "개 · 목록 생성 " + new Date(CAT.gen).toLocaleDateString() +
+      ' <button class="act sub" style="margin-top:8px" onclick="loadCatalog(true)">목록 새로 받기</button></div>';
+  }
+  box.innerHTML = h;
+}
+function fileRow(k, withPath) {
+  const p = fpath(k), bk = bookOf(p), rq = reqOf(p);
+  const chip = bk ? '<span class="chip done">가져옴</span>' : rq ? '<span class="chip wait">요청됨</span>' : "";
+  return '<button class="li" data-f="' + k + '">📄<span class="nm">' + esc(CAT.f[k][1]) + chip +
+    (withPath ? "<small>" + esc(dpath(CAT.f[k][0]) || "서고") + "</small>" : "") +
+    '</span><span class="ct">' + fsize(CAT.f[k][2]) + "</span></button>";
+}
+function defTitle(k) {                         // PC ebook_import.default_title과 같은 규칙
+  const di = CAT.f[k][0], fn = CAT.f[k][1], dn = (CAT.d[di][1] || "").trim();
+  const stem = fn.replace(/\.[^.]+$/, "");
+  return (FILES[di].length === 1 && di > 0 && !/^\[[^\]]*\]$/.test(dn)) ? dn : stem;
+}
+function libClick(e) {
+  const b = e.target.closest("[data-d],[data-f],[data-fold],[data-open]");
+  if (!b) return;
+  if (b.dataset.open) { openBook(b.dataset.open); return; }
+  if (b.dataset.d != null) {
+    libCur = +b.dataset.d; document.getElementById("libq").value = "";
+    renderLib(); document.getElementById("t_lib").scrollTop = 0; return;
+  }
+  if (b.dataset.fold != null) {
+    const i = +b.dataset.fold;
+    sheetOpen(dpath(i), true, CAT.d[i][1], "폴더 안 텍스트 " + CNT[i] +
+      "개를 이름 순서대로 이어 한 권으로 만듭니다 (파일마다 장 제목)."); return;
+  }
+  const k = +b.dataset.f, p = fpath(k), bk = bookOf(p);
+  if (bk) { openBook(bk); return; }
+  if (reqOf(p)) { toast("이미 요청했습니다 — PC가 처리하면 [읽는 중]에 나타납니다"); return; }
+  sheetOpen(p, false, defTitle(k), p + " · " + fsize(CAT.f[k][2]));
+}
+document.getElementById("libl").onclick = libClick;
+document.getElementById("crumb").onclick = libClick;
+let _lq = null;
+document.getElementById("libq").oninput = () => { clearTimeout(_lq); _lq = setTimeout(renderLib, 250); };
+
+// ---- 가져오기 요청 ----
+let REQ = null, sheetItem = null, reqTimer = null;
+function sheetOpen(p, folder, title, desc) {
+  sheetItem = {p: p, folder: folder};
+  document.getElementById("sh_h").textContent = folder ? "폴더를 한 권으로 가져오기" : "가져오기 요청";
+  document.getElementById("sh_p").textContent = desc;
+  document.getElementById("sh_t").value = title;
+  document.getElementById("sheet").classList.add("on");
+}
+function sheetClose() { document.getElementById("sheet").classList.remove("on"); }
+document.getElementById("sheet").onclick = e => { if (e.target.id === "sheet") sheetClose(); };
+document.getElementById("sh_ok").onclick = async () => {
+  if (!sheetItem) return;
+  const btn = document.getElementById("sh_ok"); btn.disabled = true;
+  try {
+    const d = await gas({op: "importq", add: {p: sheetItem.p, folder: sheetItem.folder,
+      title: document.getElementById("sh_t").value.trim()}});
+    REQ = d.items || []; updReqBadge(); sheetClose(); renderLib();
+    toast("요청했습니다 — PC 이북 앱이 켜져 있으면 1분쯤 뒤 [읽는 중]에 나타납니다", 3600);
+    pollReq();
+  } catch (e) { toast("요청 실패: " + (e.message || e)); }
+  finally { btn.disabled = false; }
+};
+function updReqBadge() {
+  const n = (REQ || []).filter(x => x.st === "wait").length;
+  document.getElementById("reqn").innerHTML = n ? '<span class="bdg">' + n + "</span>" : "";
+}
+async function loadReq() {
+  try { const d = await gas({op: "importq"}); REQ = d.items || []; }
+  catch (e) {
+    document.getElementById("reql").innerHTML = '<div class="note">요청 목록을 불러오지 못했습니다 — ' +
+      esc(e.message || e) + "<br>(동기화 서버를 새 버전으로 재배포했는지 확인)</div>";
+    return;
+  }
+  updReqBadge(); renderReq(); pollReq();
+}
+function renderReq() {
+  const box = document.getElementById("reql");
+  const it = (REQ || []).slice().reverse();
+  if (!it.length) {
+    box.innerHTML = '<div class="note">가져오기 요청이 없습니다.<br>[서고] 탭에서 txt나 폴더를 골라 요청하세요.</div>';
+    return;
+  }
+  let h = "";
+  it.forEach(x => {
+    const st = x.st === "wait" ? "⏳ 대기 중" : x.st === "done" ? "✅ 완료" : "⚠ 실패";
+    const name = x.book || x.title || x.p.split("/").pop();
+    h += '<button class="li"' + (x.st === "done" && x.book ? ' data-open="' + esc(x.book) + '"' : "") +
+      '><span class="nm">' + (x.folder ? "📁 " : "📄 ") + esc(name) + "<small>" + st +
+      (x.msg ? " · " + esc(x.msg) : "") + " · " + esc(x.p) + "</small></span>" +
+      (x.st === "done" && x.book ? '<span class="ct">열기 ›</span>' : "") + "</button>";
+  });
+  if (it.some(x => x.st !== "wait"))
+    h += '<button class="act sub" id="reqclr">끝난 항목 지우기</button>';
+  if (it.some(x => x.st === "wait"))
+    h += '<div class="note">PC 이북 앱이 켜져 있어야 처리됩니다 (약 45초 간격 확인).</div>';
+  box.innerHTML = h;
+  const c = document.getElementById("reqclr");
+  if (c) c.onclick = async () => {
+    try { const d = await gas({op: "importq", clear: true}); REQ = d.items || []; updReqBadge(); renderReq(); }
+    catch (e) { toast("실패: " + (e.message || e)); }
+  };
+}
+document.getElementById("reql").onclick = e => {
+  const b = e.target.closest("[data-open]");
+  if (b) openBook(b.dataset.open);
+};
+// 대기 중인 요청이 있으면 30초마다 확인 — 끝나면 서재 목록도 새로 받는다
+function pollReq() {
+  clearTimeout(reqTimer);
+  if (!(REQ || []).some(x => x.st === "wait")) return;
+  reqTimer = setTimeout(async () => {
+    if (document.visibilityState !== "visible" ||
+        !document.getElementById("home").classList.contains("on")) { pollReq(); return; }
+    const before = (REQ || []).filter(x => x.st === "wait").length;
+    try { const d = await gas({op: "importq"}); REQ = d.items || []; } catch (e) {}
+    updReqBadge();
+    const after = (REQ || []).filter(x => x.st === "wait").length;
+    if (after < before) {
+      toast("📚 가져오기 완료 — [읽는 중]에 추가됐습니다");
+      try {
+        const r = await gas({op: "list"});
+        localStorage.setItem("ebookShellList", JSON.stringify(r));
+        renderBooks(r, false);
+      } catch (e) {}
+    }
+    if (curTab === "req") renderReq();
+    if (curTab === "lib") renderLib();
+    pollReq();
+  }, 30000);
+}
+
 if ("serviceWorker" in navigator)
   navigator.serviceWorker.register("sw.js").catch(() => {});
 
-if (cfg && cfg.url) loadList();
-else show("setup");
+if (cfg && cfg.url) {
+  loadList(); setTab(curTab);
+  gas({op: "importq"}).then(d => { REQ = d.items || []; updReqBadge(); pollReq(); })
+    .catch(() => {});                          // 구 GAS(op 없음)면 조용히
+} else show("setup");
 </script></body></html>

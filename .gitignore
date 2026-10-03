@@ -5,6 +5,8 @@ ebook_config.json
 # 로컬 UI 상태 (개인 경로·창 크기 — 기기마다 다름)
 ebook_recents.json
 ebook_winsize.json
+# 폰 아이콘 업로드 표식 (PC 상태)
+ebook_mobile_icon.sent
 
 # 파이썬
 __pycache__/
