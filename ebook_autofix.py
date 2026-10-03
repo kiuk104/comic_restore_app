@@ -183,12 +183,18 @@ def analyze(paras: list[str], p95: Optional[int] = None,
         lv = 2 if (not has_h2 and len(ks) >= 3 and name in
                    ("num", "chapter", "bracket", "numtitle")) else 3
         for k in ks:
-            headset[k] = (lv, None)
+            txt = None
+            if name in ("bracket", "angle"):    # '[ 여행' · '<제목>' → 괄호 떼고 제목만
+                inner = re.sub(r"^[\[<〈《【]\s*|\s*[\]>〉》】]$", "", P[k].strip()).strip()
+                if inner:
+                    txt = (_H2 if lv == 2 else _H3) + inner
+            headset[k] = (lv, txt)
     for k, (lv, txt) in sorted(headset.items()):
         op = {"t": "head", "i": k, "lv": lv, "why": "제목 꼴"}
         if txt:
             op["text"] = txt
-            op["why"] = "게시물 차례 줄 → 장 제목"
+            if _BBS_TOC.match(P[k].strip()):
+                op["why"] = "게시물 차례 줄 → 장 제목"
         ops.append(op)
 
     # ── 문단 경계 ──

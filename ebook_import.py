@@ -530,7 +530,8 @@ def _save_book(out: Path, title: str, lang: str, paras: list, origin: dict,
             log(f"(이전 book.json 사본 실패: {e})")
         try:
             old = json.loads(bp.read_text(encoding="utf-8"))
-            for k in ("bmks", "pos", "off", "pos_ts", "cover", "hi", "hi_ts"):
+            for k in ("bmks", "pos", "off", "pos_ts", "cover", "hi", "hi_ts",
+                      "kindle", "kindle_seen"):     # 킨들 설정(제목·저자·폰트·표지)·처리한 메모
                 if k in old:
                     book[k] = old[k]
             if resplit_src and isinstance(old.get("origin"), dict):

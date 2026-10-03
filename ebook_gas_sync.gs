@@ -235,6 +235,19 @@ function handleOp(q) {
   var book = _san(q.book);
   if (!book) return {err: 'book(책 제목) 누락'};
 
+  if (q.op === 'remove') {               // 서재 '읽는 중'에서 책 지우기 (폰 사본만)
+    // PC 원본(book.json)과는 무관 — PC에서 다시 [☁ 업로드]하면 돌아온다.
+    // 지운 파일은 Drive 휴지통으로(30일 안에 복구 가능).
+    var rq = _readq(book), pend = Object.keys(rq.edits || {}).length;
+    if (pend && !q.force) return {err: 'pending', pending: pend};
+    var n = 0, names = [book + '.data.json', book + '.html', book + '_edits.json'];
+    for (var ri = 0; ri < names.length; ri++) {
+      var rf = _find(names[ri]);
+      while (rf) { rf.setTrashed(true); n++; rf = _find(names[ri]); }
+    }
+    _bust();
+    return {ok: true, removed: n};
+  }
   if (q.op === 'upload') {               // (구) 베이크드 업로드 — 하위호환 유지
     _write(book + '.html', q.html || '');
     var e = _readq(book);

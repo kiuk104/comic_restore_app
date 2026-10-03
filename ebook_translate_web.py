@@ -856,18 +856,42 @@ class Api:
         import ebook_kindle as kd
         t0, a0 = kd.split_title(book.get("title") or "")
         o = {"title": t0, "author": a0, "font": "ridi", "cover": "auto", "cover_file": "",
-             "eject": True}
+             "cover_name": "", "eject": True}
         o.update({k: v for k, v in (book.get("kindle") or {}).items() if k in o})
         o.update({k: v for k, v in (opts or {}).items() if k in o and v is not None})
         return o
+
+    @staticmethod
+    def _kindle_cover_path(c, o):
+        """지정 표지 파일 — 책 폴더(_work/kindle_cover.*)에 복사해 둔 사본 우선,
+        없으면 처음 고른 원래 경로 (예전 설정 호환)."""
+        try:
+            out, _t = core.resolve_out(c)
+            for p in sorted((out / "_work").glob("kindle_cover.*")):
+                if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                    return p
+        except Exception:
+            pass
+        cf = o.get("cover_file") or ""
+        if not (cf and Path(cf).is_file()):
+            return None
+        try:                    # 예전 설정(원래 경로만 기억) → 책 폴더로 옮겨 담기
+            import shutil
+            dst = out / "_work" / ("kindle_cover" + Path(cf).suffix.lower())
+            shutil.copyfile(cf, dst)
+            return dst
+        except Exception:
+            return Path(cf)
 
     def _kindle_cover(self, c, book, o):
         import ebook_kindle as kd
         mode = o.get("cover") or "auto"
         if mode == "none":
             return None
-        if mode == "file" and o.get("cover_file") and Path(o["cover_file"]).is_file():
-            return kd.fit_cover(Path(o["cover_file"]).read_bytes())
+        if mode == "file":
+            cf = self._kindle_cover_path(c, o)
+            if cf:
+                return kd.fit_cover(cf.read_bytes())
         if mode in ("auto", "scan"):
             scan = core._cover_jpg(c, book)
             if scan:
@@ -900,8 +924,33 @@ class Api:
         except Exception as e:
             return {"err": f"표지 미리보기 실패: {e}"}
 
-    def kindle_pick_cover(self):
-        return self._dialog("open", ["이미지 (*.jpg;*.jpeg;*.png;*.webp)"])
+    def kindle_pick_cover(self, cfg: dict = None):
+        """표지 이미지 고르기 — 고르는 즉시 책 폴더 _work/kindle_cover.<확장자>로
+        복사하고 book.json "kindle"에 저장한다(원본 파일을 옮기거나 지워도, 창을
+        닫아도, 다시 가져오기를 해도 기억)."""
+        import shutil
+        p = self._dialog("open", ["이미지 (*.jpg;*.jpeg;*.png;*.webp)"])
+        if not p:
+            return {"cancel": True}
+        try:
+            c, out, book = self._kindle_ctx(cfg or self._cfg)
+            work = out / "_work"
+            for old in work.glob("kindle_cover.*"):     # 이전 표지 사본 정리
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
+            dst = work / ("kindle_cover" + Path(p).suffix.lower())
+            shutil.copyfile(p, dst)
+            o = self._kindle_opts(book, {"cover": "file", "cover_file": str(dst),
+                                         "cover_name": Path(p).name})
+            book["kindle"] = o
+            core._atomic_json(work / "book.json", book)
+            self._log(f"🖼 킨들 표지 지정: {Path(p).name} (책 폴더에 사본 저장 — 다음 갱신에도 사용)")
+            return {"ok": True, "path": str(dst), "name": Path(p).name}
+        except Exception as e:
+            return {"ok": True, "path": p, "name": Path(p).name,
+                    "warn": f"표지를 책 폴더에 저장하지 못했습니다: {e}"}
 
     def kindle_sync(self, cfg: dict, opts: dict = None):
         """최신 EPUB 재생성 → (폰트) → AZW3(제목·저자·표지) → 킨들 같은 이름 덮어쓰기
@@ -942,7 +991,11 @@ class Api:
                 self._log(f"📝 킨들 교정 메모 {len(fixes)}개 — 목록 창에서 확인하세요.")
             elif cp.is_file():
                 self._log("📝 새 킨들 교정 메모 없음.")
-            ejected = bool(o.get("eject")) and kd.eject(root, self._log)
+            try:                    # 꺼내기 실패는 갱신 실패가 아님 (복사는 끝남)
+                ejected = bool(o.get("eject")) and kd.eject(root, self._log)
+            except Exception as e:
+                self._log(f"⚠ 킨들 꺼내기 실패: {e} — 탐색기에서 직접 꺼내세요")
+                ejected = False
             return {"ok": True, "dst": dst, "fixes": fixes, "ejected": ejected}
         except Exception as e:
             return {"err": f"킨들 갱신 실패: {e}"}
@@ -1982,7 +2035,9 @@ async function doKindle(){
   $("k_eject").checked = o.eject !== false;
   $("k_ej").disabled = !r.kindle;
   _ksel.cover_file = o.cover_file || "";
-  $("k_file").textContent = _ksel.cover_file ? _ksel.cover_file.split(/[\\/]/).pop() : "";
+  _ksel.cover_name = o.cover_name || "";
+  $("k_file").textContent = _ksel.cover_file
+    ? (_ksel.cover_name || _ksel.cover_file.split(/[\\/]/).pop()) + " (저장됨)" : "";
   $("k_scanopt").textContent = r.has_scan ? "자동 (스캔 첫 페이지/지정 표지)" : "자동 (글자 표지)";
   $("k_stat").innerHTML = (r.kindle ? "✅ 킨들: " + _esc(r.kindle) : "⚠ 킨들이 연결되지 않았습니다") +
     " · 파일: documents/Fokus/" + _esc(r.file) +
@@ -1994,6 +2049,7 @@ async function doKindle(){
 function kOpts(){
   return {title: $("k_title").value.trim(), author: $("k_author").value.trim(),
           font: $("k_font").value, cover: $("k_cover").value, cover_file: _ksel.cover_file || "",
+          cover_name: _ksel.cover_name || "",
           eject: $("k_eject").checked};
 }
 let _kpvT = null;
@@ -2006,10 +2062,12 @@ async function kPreview(){
   else { $("k_pv").style.display = "none"; $("k_nopv").style.display = ""; }
 }
 async function kPick(){
-  const p = await api().kindle_pick_cover();
-  if (!p) return;
-  _ksel.cover_file = p; $("k_cover").value = "file";
-  $("k_file").textContent = p.split(/[\\/]/).pop();
+  const r = await api().kindle_pick_cover(collectCfg());
+  if (!r || r.cancel) return;
+  if (r.warn) alert(r.warn);
+  _ksel.cover_file = r.path; _ksel.cover_name = r.name;
+  $("k_cover").value = "file";
+  $("k_file").textContent = r.name + " (저장됨)";
   kPreview();
 }
 async function kEject(btn){

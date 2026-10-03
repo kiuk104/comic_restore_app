@@ -1,37 +1,45 @@
 <!doctype html>
 <html lang="ko"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="theme-color" content="#ffffff">
+<meta name="theme-color" content="#f2f3ef">
 <title>__TITLE__ — Fokus Viewer</title>
 <style>
 /* ── 테마 토큰 ────────────────────────────────────────────────────────
    밝게(기본) / 어둡게(body.dark) — ⚙ 보기 설정에서 전환, 기기에 저장.
    어두운 팔레트는 Basiswortschatz 앱(검정 배경 + 앰버 강조)에서 가져옴. */
-:root{--bg:#f5f5f4;--fg:#222;--card:#fff;--mut:#666;--bd2:#999;
- --srcbg:#fffbf3;
- --bd:#ddd;--src:#b45309;--fail:#dc2626;--acc:#2563eb;
+:root{--bg:#f2f3ef;--fg:#1b211f;--card:#fbfbf8;--mut:#66706b;--bd2:#c3c9c1;
+ --srcbg:#fbf7ee;
+ --bd:#d8dcd5;--src:#94620c;--fail:#b4382f;--acc:#5b3f78;
+ /* 디자인 토큰 (Fokus Bibel 계열) — 표면 3단 + 보조 잉크 + 강조 연한 면 */
+ --raise:#ffffff;--ink2:#3a4440;--line2:#e7eae4;--accsoft:#ebe4f1;
+ --accink:#ffffff;--shadow:0 12px 34px rgba(20,30,26,.16);
+ --sans:"Pretendard","IBM Plex Sans KR","Malgun Gothic","Apple SD Gothic Neo",system-ui,sans-serif;
+ --lh:1.8;
  /* 원문만 보기·미번역 식별색 — 테마별로 밝기를 맞춘다 */
  --srconly:#6b4f2a;--untr:#8a6d3b;--rdo:#8a6d3b;
  /* 북마크 리본 마스크용 (Feather bookmark) */
  --bmk-ic:url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="black"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>')}
 /* 어둡게 — 배경/표면/글자만 뒤집고, 강조는 앰버로(눈부심 낮음) */
-body.dark{--bg:#131313;--fg:#e8e6e3;--card:#1e1e20;--mut:#9a9aa0;
- --bd:#3a3a3c;--bd2:#4a4a4e;--srcbg:#2a2418;--src:#e6c789;
- --acc:#bf8729;--fail:#f87171;--srconly:#d8b978;--untr:#c9a86a}
+body.dark{--bg:#121514;--fg:#e1e5df;--card:#171b19;--mut:#909b95;
+ --bd:#2d3531;--bd2:#3b4540;--srcbg:#2a2418;--src:#dcaa4c;
+ --acc:#d39c3c;--fail:#f08a80;--srconly:#d8b978;--untr:#c9a86a;
+ --raise:#1e2321;--ink2:#c3cac4;--line2:#232a27;--accsoft:#3a2f1c;
+ --accink:#1a1408;--shadow:0 12px 34px rgba(0,0,0,.55)}
 body.dark{--rdo:#c9b48a}
 body.dark .rd .rdo{border-bottom-color:#4a4030}
 body.dark .rd.untr,body.dark .rd.rdsronly{color:#c9a86a}
 body.dark mark.hl{background:#5c4a12;color:#f2e6c4}
-body.dark #focus{background:#131313}
+body.dark #focus{background:#121514}
 body.dark ::selection{background:#5c4a12;color:#fff}
 body.dark input,body.dark select,body.dark textarea{
  background:var(--card);color:var(--fg);border-color:var(--bd)}
 body.dark img{filter:brightness(.88)}
 /* 어둡게(진회색) — 완전 검정이 부담스러울 때. 표면 대비를 조금 올렸다 */
-body.dim{--bg:#2b2d31;--fg:#e6e6e8;--card:#34363b;--mut:#a6a8ae;
- --bd:#4a4d53;--bd2:#5a5e66;--srcbg:#3b3527;--src:#e6c789;
+body.dim{--bg:#2b2d31;--fg:#e6e6e8;--card:#303237;--mut:#a6a8ae;
+ --bd:#4a4d53;--bd2:#5a5e66;--srcbg:#3b3527;--src:#dcbe83;
  --acc:#c08f36;--fail:#f08a8a;--srconly:#dcbe83;--untr:#cdae74;
- --rdo:#cdb891}
+ --rdo:#cdb891;--raise:#34363b;--ink2:#c9cacf;--line2:#3a3d42;
+ --accsoft:#4a3d24;--accink:#1a1408;--shadow:0 12px 34px rgba(0,0,0,.45)}
 body.dim .rd .rdo{border-bottom-color:#55504a}
 body.dim mark.hl{background:#5f5220;color:#f3e8c8}
 body.dim #focus{background:#2b2d31}
@@ -42,7 +50,24 @@ body.dim img{filter:brightness(.9)}
 /* 세피아(종이) — 따뜻한 미색 종이 느낌, 눈부심이 흰 배경보다 낮다 */
 body.sepia{--bg:#cfc9bb;--fg:#3a3733;--card:#d8d3c7;--mut:#6b6558;
  --bd:#b6b0a0;--bd2:#a49d8b;--srcbg:#e0dbcd;--src:#7a5a2a;
- --acc:#8a6d3b;--fail:#a33a3a;--srconly:#7a5a2a;--untr:#7a6540}
+ --acc:#7a5a2a;--fail:#a33a3a;--srconly:#7a5a2a;--untr:#7a6540;
+ --raise:#e0dbcd;--ink2:#4d4943;--line2:#c3bca9;--accsoft:#c2b394;
+ --accink:#fff8ec;--shadow:0 12px 34px rgba(60,40,10,.24)}
+/* 종이 — 세피아보다 밝은 크림 미색 (Fokus Bibel '종이') */
+body.paper{--bg:#ece4d4;--fg:#2a2219;--card:#f4eee2;--mut:#7a6c5c;
+ --bd:#d6cab4;--bd2:#c4b69c;--srcbg:#f7f0e2;--src:#8a5a10;
+ --acc:#6b4a1f;--fail:#a33a3a;--srconly:#7a5a2a;--untr:#7a6540;--rdo:#7a6540;
+ --raise:#faf6ee;--ink2:#4a3f33;--line2:#e3d9c6;--accsoft:#e2d3b6;
+ --accink:#fff8ec;--shadow:0 12px 34px rgba(60,40,10,.18)}
+body.paper mark.hl{background:#f3dc8e}
+body.paper .rd .rdo{border-bottom-color:#d6cab4}
+body.paper .rd.untr,body.paper .rd.rdsronly{color:#7a5a2a}
+body.paper #focus{background:linear-gradient(to bottom,
+ rgba(170,156,128,0) 0%,rgba(170,156,128,0) 37.25%,
+ rgba(170,156,128,.42) 37.5%,rgba(170,156,128,.42) 42.75%,
+ rgba(170,156,128,0) 43%,rgba(170,156,128,0) 57%,
+ rgba(170,156,128,.42) 57.25%,rgba(170,156,128,.42) 62.5%,
+ rgba(170,156,128,0) 62.75%,rgba(170,156,128,0) 100%)}
 body.sepia{--rdo:#7a6540}
 body.sepia .rd .rdo{border-bottom-color:#c3bca9}
 body.sepia .rd.untr,body.sepia .rd.rdsronly{color:#7a5a2a}
@@ -421,6 +446,137 @@ body.rdmode .pgh button{display:none}
   max-width:none;height:100%;z-index:30;border-left:0}
  aside .cap{position:sticky;top:0;background:var(--card);
   border-bottom:1px solid var(--bd);z-index:1}}
+
+/* ════════════════════════════════════════════════════════════════════
+   디자인 v2 (2026-10-03) — Fokus Bibel(E:\Coding\bible_viewer) 언어를 이식.
+   차분한 표면 3단(bg·card·raise) + 머리줄 반투명·무테 아이콘 버튼 +
+   가운데 읽기 칼럼 + 제목 활자 + 아래 시트형 설정. 강조색은 한 곳에만:
+   장 제목 밑 짧은 선(밝은 테마 플럼 / 어두운 테마 골드).
+   ※ 기능 CSS는 위에 그대로 — 여기는 겉모양만 덮는다.
+   ════════════════════════════════════════════════════════════════════ */
+body{font-family:var(--sans);-webkit-font-smoothing:antialiased;
+ text-rendering:optimizeLegibility}
+::selection{background:var(--accsoft)}
+/* ── 머리줄 ── */
+header{background:color-mix(in srgb,var(--bg) 88%,transparent);
+ -webkit-backdrop-filter:saturate(1.3) blur(14px);backdrop-filter:saturate(1.3) blur(14px);
+ border-bottom:1px solid var(--line2);gap:4px;
+ padding:7px max(14px,calc((100vw - 1060px)/2))}
+header b{font-family:'RIDIBatang','Noto Serif KR',Batang,serif;font-size:17px;
+ font-weight:700;letter-spacing:-.01em;color:var(--fg);margin-right:4px}
+#cnt{color:var(--mut);font-size:12px;font-variant-numeric:tabular-nums}
+header button{border:0;background:transparent;color:var(--ink2);border-radius:10px;
+ padding:7px 9px;min-height:36px;font-size:13px;transition:background .15s,color .15s}
+header button:hover:not(:disabled){background:var(--accsoft);color:var(--fg)}
+header button:focus-visible,#setmenu button:focus-visible,#hov button:focus-visible{
+ outline:2px solid var(--acc);outline-offset:1px}
+header button .btxt{font-size:13px}
+#save{background:var(--acc);color:var(--accink);border-radius:999px;padding:7px 14px;font-weight:700}
+#save:hover:not(:disabled){background:var(--acc);color:var(--accink);filter:brightness(1.08)}
+#save:disabled{background:transparent;color:var(--mut);opacity:.55}
+#mode{border:1px solid var(--bd);border-radius:999px;padding:6px 13px;color:var(--fg)}
+header select{border:1px solid var(--line2);background:var(--raise);color:var(--ink2);
+ border-radius:999px;padding:5px 10px;font-size:12.5px;min-height:32px}
+#st{color:var(--mut)}
+@media (min-width:641px){
+ #cnt{flex-grow:1}                      /* 제목은 왼쪽, 도구는 오른쪽으로 */
+ header select{max-width:150px}
+}
+/* ── 본문 칼럼 ── */
+main{max-width:1040px;margin:0 auto;box-sizing:border-box}
+body.rdmode main{max-width:min(var(--col,700px),100%);padding:26px 26px 60vh}
+body.rdmode .row{padding:0 4px}
+.row{background:var(--raise);border-color:var(--line2);border-radius:12px}
+body.rdmode .row.ed{background:var(--raise);border-color:var(--acc);border-radius:14px;
+ box-shadow:var(--shadow)}
+/* 장 제목 · 소제목 — 본문 글꼴 그대로, 크기·굵기·여백으로 위계 */
+#list .rd.rdh{font-weight:700;letter-spacing:-.015em;line-height:1.35!important;
+ text-indent:0;margin:2.3em 0 1.05em;color:var(--fg);text-wrap:balance}
+#list .rd.rdh::after{content:"";display:block;width:2.4em;height:2px;border-radius:2px;
+ background:var(--acc);margin-top:.6em;opacity:.85}
+#list .row:first-child .rd.rdh,#list .pgh+.row .rd.rdh{margin-top:.4em}
+#list .rd.rdsh{font-weight:700;line-height:1.4!important;text-indent:0;
+ margin:1.7em 0 .6em;color:var(--ink2)}
+.rd{padding:0 2px}
+.rd.untr{color:var(--untr)}
+.rd.rdsronly{color:var(--srconly)}
+#pv h2,#pv h3{font-weight:700;letter-spacing:-.01em}
+/* ── 하단 위치 표시 · 팝업 ── */
+#posbar{background:var(--raise);border:1px solid var(--line2);color:var(--mut);
+ box-shadow:0 2px 10px rgba(0,0,0,.06)}
+#hlpop{color:var(--accink);box-shadow:var(--shadow),0 0 0 2px var(--raise)}
+#hlpop button{color:var(--accink)}
+/* ── 공통 컨트롤 ── */
+button{border-color:var(--bd);border-radius:9px;background:var(--raise);color:var(--fg)}
+textarea{border-color:var(--bd);border-radius:10px;background:var(--raise);
+ font-family:var(--sans)}
+select{border:1px solid var(--bd);background:var(--raise);color:var(--fg)}
+/* ── 설정 패널 — 데스크톱: 오른쪽 위 떠 있는 패널 / 폰: 아래 시트 ── */
+#bmenu,#setmenu{background:var(--raise);border:1px solid var(--line2);border-radius:16px;
+ box-shadow:var(--shadow);padding:14px 16px}
+#setmenu{width:340px;max-width:calc(100vw - 20px);box-sizing:border-box}
+#setmenu .lbl{color:var(--mut);font-size:12.5px;margin:16px 2px 8px;font-weight:600}
+#setmenu .lbl b{color:var(--fg);font-weight:700;font-variant-numeric:tabular-nums}
+#setmenu .fsrow{gap:10px;margin:0}
+#setmenu .fsrow button{flex:0 0 38px;min-width:38px;min-height:38px;border-radius:50%;
+ font-size:18px;font-weight:500;padding:0;line-height:1;background:var(--raise);
+ border:1px solid var(--bd)}
+#setmenu .fsrow .fsrange{flex:1;margin:0;height:28px}
+#setmenu select{border-radius:10px;border-color:var(--bd);background:var(--raise)}
+/* 테마 견본 '가 Aa' — 각 카드가 그 테마의 실제 바탕·글자색 */
+#setmenu .thgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+#setmenu .thc{display:flex;flex-direction:column;align-items:center;gap:2px;
+ padding:10px 4px 7px;border-radius:12px;border:1.5px solid var(--bd);min-height:0}
+#setmenu .thc .ths{font-family:'RIDIBatang','Noto Serif KR',Batang,serif;
+ font-size:18px;font-weight:700;letter-spacing:-.01em}
+#setmenu .thc small{font-size:11px;opacity:.75}
+#setmenu .thc.on{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc)}
+#setmenu .thc-light{background:#fbfbf8;color:#1b211f}
+#setmenu .thc-paper{background:#f4eee2;color:#2a2219}
+#setmenu .thc-sepia{background:#d8d3c7;color:#3a3733}
+#setmenu .thc-dim{background:#303237;color:#e6e6e8}
+#setmenu .thc-dark{background:#121514;color:#e1e5df}
+#setmenu .thc-auto{background:linear-gradient(135deg,#fbfbf8 0 50%,#121514 50% 100%);
+ color:#1b211f}
+#setmenu .thc-auto .ths{background:#fbfbf8;border-radius:6px;padding:0 5px}
+#setmenu .thc-auto small{background:#fbfbf8;border-radius:5px;padding:0 4px;opacity:.85}
+/* 글꼴 카드 — 2열, 이름을 그 글꼴로 */
+#setmenu .ffgrid{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+#setmenu .ffgrid button{display:flex;flex-direction:column;align-items:flex-start;
+ text-align:left;padding:8px 11px;min-height:46px;border-radius:11px;
+ border:1px solid var(--bd);background:var(--raise);color:var(--fg);font-size:15px;line-height:1.3}
+#setmenu .ffgrid button small{font-family:var(--sans);font-size:11px;color:var(--mut)}
+#setmenu .ffgrid button.on{border-color:var(--acc);background:var(--accsoft)}
+#setmenu .latgrid{display:flex;flex-wrap:wrap;gap:6px}
+#setmenu .latgrid button{display:inline-flex;flex-direction:column;align-items:flex-start;
+ padding:6px 11px;min-height:38px;border-radius:11px;border:1px solid var(--bd);
+ background:var(--raise);color:var(--fg);font-size:15px;line-height:1.2}
+#setmenu .latgrid button small{font-family:var(--sans);font-size:10.5px;color:var(--mut)}
+#setmenu .latgrid button.on{border-color:var(--acc);background:var(--accsoft);font-weight:700}
+#setmenu .clrow .sw{border-color:var(--line2)}
+#setmenu .clrow .sw.on{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc)}
+#setmenu .chkrow{margin:10px 2px 2px}
+/* 목차·후보·자동 교정 오버레이도 같은 표면 */
+#hov,#help{background:var(--bg)}
+#hov .hvcap{background:var(--bg);border-bottom-color:var(--line2)}
+#hov .afbox{background:var(--raise);border-color:var(--line2);border-radius:12px}
+#hov .toc{border-bottom-color:var(--line2)}
+@media (max-width:640px){
+ header{padding:6px 8px;gap:2px}
+ header b{font-size:15px}
+ header select,header button{padding:5px 7px;min-height:36px}
+ body.rdmode main{padding:16px 18px 60vh}
+ /* 설정은 아래에서 올라오는 시트 (JS가 주는 top/right 위치는 무시) */
+ #setmenu{left:0!important;right:0!important;top:auto!important;bottom:0;width:auto;
+  max-width:none;max-height:82vh!important;border-radius:20px 20px 0 0;
+  padding:8px 18px calc(18px + env(safe-area-inset-bottom));
+  transform:translateY(24px);transform-origin:bottom center;
+  box-shadow:0 0 0 100vmax rgba(10,14,12,.32),var(--shadow)}
+ #setmenu.on{transform:translateY(0)}
+ #setmenu::before{content:"";display:block;width:38px;height:4px;border-radius:2px;
+  background:var(--bd);margin:2px auto 6px}
+}
+@media (prefers-reduced-motion:reduce){header button{transition:none}}
 </style></head><body>
 <header>
  <b>__TITLE__</b><span id="cnt"></span>
@@ -535,16 +691,18 @@ function applyTheme(){
    .matches)?'dark':'light';
  const b=document.body.classList;
  b.toggle('dark',t==='dark');b.toggle('sepia',t==='sepia');
- b.toggle('dim',t==='dim');
+ b.toggle('dim',t==='dim');b.toggle('paper',t==='paper');
  const m=document.querySelector('meta[name="theme-color"]');
- if(m)m.content=(t==='dark'?'#131313':t==='dim'?'#2b2d31'
-   :t==='sepia'?'#cfc9bb':'#ffffff');}
+ if(m)m.content=(t==='dark'?'#121514':t==='dim'?'#2b2d31'
+   :t==='sepia'?'#cfc9bb':t==='paper'?'#ece4d4':'#f2f3ef');
+ if(window._focApply)window._focApply();}
 applyTheme();
 // 문단 탭 → 편집 여부 (⚙에서 토글, 기본 켬) — 행 생성 전에 읽어둔다
 try{window._tapEdit=localStorage.getItem('edTapEdit')!=='0';}
 catch(e){window._tapEdit=true;}
 try{matchMedia('(prefers-color-scheme:dark)').addEventListener('change',()=>{
- if((localStorage.getItem('edTheme')||'light')==='auto')applyTheme();});}catch(e){}
+ if((localStorage.getItem('edTheme')||'light')==='auto'){applyTheme();
+  if(window._applyView)window._applyView();}});}catch(e){}
 icFill();                       // 헤더 정적 버튼에 아이콘 채우기
 D.ocr_modes=Array.isArray(D.ocr_modes)?D.ocr_modes:[['실행 설정','']];
 D.title=D.title||'';D.count=D.count||D.paras.length;
@@ -2059,14 +2217,63 @@ function initViewSettings(){
  const FONTHOST='https://kiuk104.github.io/ebook-shell';   // 셸 호스팅 폰트(fonts.css)
  (function(){const l=document.createElement('link');l.rel='stylesheet';
    l.href=FONTHOST+'/fonts.css';document.head.appendChild(l);})();
- const FONTS=[['바탕 (명조)',"Batang,'Noto Serif KR',Georgia,serif"],
-   ['리디바탕 (명조)',"'RIDIBatang',Batang,'Noto Serif KR',serif"],
-   ['에스코어드림 Light',"'SCDreamLight','Malgun Gothic',sans-serif"],
-   ['에스코어드림 Bold',"'SCDreamBold','Malgun Gothic',sans-serif"],
-   ['맑은 고딕',"'Malgun Gothic','Noto Sans KR','Apple SD Gothic Neo',sans-serif"],
-   ['나눔명조',"'Nanum Myeongjo',Batang,serif"],
-   ['나눔고딕',"'Nanum Gothic','Malgun Gothic',sans-serif"],
-   ['돋움 (고딕)',"Dotum,Gulim,sans-serif"]];
+ /* 글꼴 — Fokus Bibel과 같은 목록. 고른 글꼴만 그때 불러온다(한 번 받으면 캐시).
+    [이름, font-family 스택, Google Fonts 질의, @font-face CSS]. 저장값은 스택 문자열
+    (예전 저장값 그대로 호환 — 바탕·맑은 고딕·돋움은 기기 글꼴로 유지). */
+ const NOON='https://cdn.jsdelivr.net/gh/projectnoonnu/';
+ const NSQ='https://hangeul.pstatic.net/hangeul_static/webfont/NanumSquare/';
+ const KPW='https://cdn.jsdelivr.net/npm/font-kopubworld@1.0.3/fonts/';
+ const FONTS=[['본명조 (바탕 계열)',"'Noto Serif KR',Batang,serif",'Noto+Serif+KR:wght@400;700'],
+   ['리디바탕 (명조)',"'RIDIBatang',Batang,'Noto Serif KR',serif",null,
+    "@font-face{font-family:'RIDIBatang';src:url('"+NOON+"noonfonts_twelve@1.0/RIDIBatang.woff') format('woff');font-display:swap}"],
+   ['에스코어드림 Light',"'SCDreamLight','Malgun Gothic',sans-serif",null,
+    "@font-face{font-family:'SCDreamLight';src:url('"+NOON+"noonfonts_six@1.2/S-CoreDream-3Light.woff') format('woff');font-display:swap}"],
+   ['에스코어드림 Bold',"'SCDreamBold','Malgun Gothic',sans-serif",null,
+    "@font-face{font-family:'SCDreamBold';src:url('"+NOON+"noonfonts_six@1.2/S-CoreDream-6Bold.woff') format('woff');font-display:swap}"],
+   ['본고딕 (맑은 고딕 대신)',"'Noto Sans KR','Malgun Gothic',sans-serif",'Noto+Sans+KR:wght@400;700'],
+   ['나눔명조',"'Nanum Myeongjo',Batang,serif",'Nanum+Myeongjo:wght@400;700'],
+   ['나눔고딕',"'Nanum Gothic','Malgun Gothic',sans-serif",'Nanum+Gothic:wght@400;700'],
+   ['나눔스퀘어',"'NanumSquare','Noto Sans KR',sans-serif",null,
+    "@font-face{font-family:'NanumSquare';src:url('"+NSQ+"NanumSquareR.woff') format('woff');font-display:swap}"],
+   ['KoPub 바탕',"'KoPubWorld Batang','Noto Serif KR',serif",null,
+    "@font-face{font-family:'KoPubWorld Batang';src:url('"+KPW+"KoPubWorld-Batang-Medium.woff2') format('woff2');font-display:swap}"
+    +"@font-face{font-family:'KoPubWorld Batang';font-weight:700;src:url('"+KPW+"KoPubWorld-Batang-Bold.woff2') format('woff2');font-display:swap}"],
+   ['KoPub 돋움',"'KoPubWorld Dotum','Noto Sans KR',sans-serif",null,
+    "@font-face{font-family:'KoPubWorld Dotum';src:url('"+KPW+"KoPubWorld-Dotum-Medium.woff2') format('woff2');font-display:swap}"
+    +"@font-face{font-family:'KoPubWorld Dotum';font-weight:700;src:url('"+KPW+"KoPubWorld-Dotum-Bold.woff2') format('woff2');font-display:swap}"],
+   ['고운바탕',"'Gowun Batang','Noto Serif KR',serif",'Gowun+Batang:wght@400;700'],
+   ['고운돋움 (돋움 대신)',"'Gowun Dodum','Noto Sans KR',sans-serif",'Gowun+Dodum'],
+   ['IBM Plex Sans',"'IBM Plex Sans KR',system-ui,sans-serif",'IBM+Plex+Sans+KR:wght@400;600'],
+   ['바탕 (기기 글꼴)',"Batang,'Noto Serif KR',Georgia,serif"],
+   ['맑은 고딕 (기기 글꼴)',"'Malgun Gothic','Noto Sans KR','Apple SD Gothic Neo',sans-serif"],
+   ['기기 기본 글꼴',"system-ui,-apple-system,'Apple SD Gothic Neo',sans-serif"]];
+ // 라틴 글꼴 — 독일어·영어 문단(번역책 원문, 영어책)에 따로. 앞은 세리프, 뒤는 산세리프
+ const LATF=[['기본 (한글 글꼴 따름)',''],
+   ['Literata',"'Literata',Georgia,serif",'Literata:opsz,wght@7..72,400;7..72,600'],
+   ['Source Serif 4',"'Source Serif 4',Georgia,serif",'Source+Serif+4:opsz,wght@8..60,400;8..60,600'],
+   ['EB Garamond',"'EB Garamond',Georgia,serif",'EB+Garamond:wght@400;600'],
+   ['Libre Baskerville',"'Libre Baskerville',Georgia,serif",'Libre+Baskerville:wght@400;700'],
+   ['Noto Serif',"'Noto Serif',Georgia,serif",'Noto+Serif:wght@400;600'],
+   ['Crimson Pro',"'Crimson Pro',Georgia,serif",'Crimson+Pro:wght@400;600'],
+   ['Lora',"'Lora',Georgia,serif",'Lora:wght@400;600'],
+   ['Merriweather',"'Merriweather',Georgia,serif",'Merriweather:wght@400;700'],
+   ['Playfair Display',"'Playfair Display',Georgia,serif",'Playfair+Display:wght@400;600'],
+   ['UnifrakturMaguntia (독일 흑체)',"'UnifrakturMaguntia','Literata',serif",'UnifrakturMaguntia'],
+   ['Inter',"'Inter',system-ui,sans-serif",'Inter:wght@400;600'],
+   ['Fira Sans',"'Fira Sans',system-ui,sans-serif",'Fira+Sans:wght@400;600'],
+   ['Source Sans 3',"'Source Sans 3',system-ui,sans-serif",'Source+Sans+3:wght@400;600'],
+   ['Noto Sans',"'Noto Sans',system-ui,sans-serif",'Noto+Sans:wght@400;600'],
+   ['Lato',"'Lato',system-ui,sans-serif",'Lato:wght@400;700'],
+   ['기기 기본 글꼴',"system-ui,-apple-system,'Segoe UI',sans-serif"]];
+ function loadFace(css){if(!css)return;const m=/font-family:'([^']+)'/.exec(css);
+  const id='ff-'+(m?m[1]:'x').replace(/\W/g,'');if(document.getElementById(id))return;
+  const st=document.createElement('style');st.id=id;st.textContent=css;document.head.appendChild(st);}
+ function loadGF(q){if(!q)return;const id='gf-'+q.replace(/\W/g,'');
+  if(document.getElementById(id))return;const l=document.createElement('link');l.id=id;
+  l.rel='stylesheet';l.href='https://fonts.googleapis.com/css2?family='+q+'&display=swap';
+  document.head.appendChild(l);}
+ function loadStack(stk,list){const f=(list||FONTS).find(x=>x[1]===stk);
+  if(f){loadGF(f[2]);loadFace(f[3]);}}
  // 글자 굵기 — text-stroke(획을 실제로 두껍게)로 얇은 명조도 또렷하게.
  // 폰트 자체 굵은 자족(Bold)이 없어도 먹히고, 0이면 아무 것도 안 건다.
  const STROKES=[['가늘게',0],['보통',0.2],['굵게',0.4],['아주 굵게',0.65]];
@@ -2079,14 +2286,19 @@ function initViewSettings(){
    ['짙은 남색','#20304a'],
    ['밝은 회색','#e8e6e3'],['따뜻한 크림','#ece3d2'],
    ['저채도 앰버','#d8c9a8'],['연한 청회색','#ccd6e2'],
-   ['차분한 연녹','#cfdccd']];
+   ['차분한 연녹','#cfdccd'],
+   // 추가 (2026-10-03) — 밝은 테마용 3 · 어두운 테마용 3
+   ['짙은 녹회','#26332e'],['자두 잉크','#3b2a42'],['잉크 청','#1f3a5a'],
+   ['은회','#bfc5c2'],['연살구','#e6cdb8'],['연보라','#d6c8e3']];
+ // 각 색이 어느 테마용인지 — 밝은 테마(어두운 글자) / 어두운 테마(밝은 글자)
+ const PAL_DARK=new Set([5,6,7,8,9,13,14,15]);
  // 프리셋은 사용자가 바꿀 수 있다 — 견본을 길게 누르면 색 선택기가 열리고
  // 그 칸의 색이 바뀐다(localStorage edPalette). 기본값 복구 버튼도 있음.
  function loadPal(){
   try{const a=JSON.parse(localStorage.getItem('edPalette')||'null');
-   if(Array.isArray(a)&&a.length===DEFCOLORS.length
+   if(Array.isArray(a)&&a.length<=DEFCOLORS.length
       &&a.every(x=>/^#[0-9a-fA-F]{6}$/.test(String(x))))
-    return DEFCOLORS.map(([nm],i)=>[nm,a[i]]);}catch(e){}
+    return DEFCOLORS.map(([nm,d],i)=>[nm,a[i]||d]);}catch(e){}   // 예전 10색 저장도 그대로
   return DEFCOLORS.map(x=>x.slice());}
  function savePal(){try{localStorage.setItem('edPalette',
    JSON.stringify(COLORS.map(c=>c[1])))}catch(e){}}
@@ -2114,7 +2326,11 @@ function initViewSettings(){
   return '#'+_h2((r+m)*255)+_h2((g+m)*255)+_h2((b+m)*255);}
  // 편집 textarea·읽기 문단·미리보기 글자 크기/글꼴/굵기/색 모두 반영
  function applyView(){const px=window._fs||16,ff=window._ff||FONTS[0][1];
-  const sw=window._sw||0,col=window._col||COLORS[0][1];
+  const sw=window._sw||0,col=curCol()||'var(--fg)';   // 기본 = 테마 글자색
+  loadStack(ff);                                   // 고른 글꼴만 불러오기
+  const lfd=window._lfd||'',lfe=window._lfe||'';
+  if(lfd)loadStack(lfd,LATF);if(lfe)loadStack(lfe,LATF);
+  const lh=window._lh||1.8;
   let se=document.getElementById('fscss');
   if(!se){se=document.createElement('style');se.id='fscss';
    document.head.appendChild(se);}
@@ -2126,8 +2342,16 @@ function initViewSettings(){
    +'#pv{font-size:'+(px+1)+'px;font-family:'+ff+';color:'+col+';'+stk+'}'
    +'#list .rd{font-size:'+(px+1)+'px;font-family:'+ff+';color:'+col+';'
      +stk+'}'
-   +'#list .rd.rdh{font-size:'+Math.round((px+1)*1.15)+'px}'
-   +'#list .rd.rdsh{font-size:'+Math.round((px+1)*1.05)+'px}'
+   +'#list .rd.rdh{font-size:'+Math.round((px+1)*1.42)+'px}'
+   +'#list .rd.rdsh{font-size:'+Math.round((px+1)*1.14)+'px}'
+   +'#list .rd,#pv p{line-height:'+lh+'}'
+   // 본문 칼럼 너비 (읽기 모드) — 최대값이면 화면 가득
+   +':root{--col:'+((window._col_w||700)>=COLMAX?'100vw':(window._col_w||700)+'px')+'}'
+   // 평문 책은 모든 문단이 '미번역'이라 아래 untr 색이 덮던 것 — 고른 글자색 적용
+   +'body.plain #list .rd.untr{color:'+col+'}'
+   // 독일어·영어 문단은 라틴 글꼴 따로 (문단 lang은 rdFill이 붙임)
+   +(lfd?'#list .rd[lang="de"],#pv:lang(de){font-family:'+lfd+'}':'')
+   +(lfe?'#list .rd[lang="en"],#pv:lang(en){font-family:'+lfe+'}':'')
    // 원문(전사) 계열은 번역과 구분되게 별도 색 — 사용자가 안 고르면
    // 테마 변수(다크에선 밝은 톤). 원문만 보기·병기 원문·편집칸 공통.
    +'#list .rd.rdsronly{color:'+(sc||'var(--srconly)')+'}'
@@ -2143,8 +2367,29 @@ function initViewSettings(){
   try{localStorage.setItem('edFont',ff)}catch(e){}applyView();}
  function setStroke(w){window._sw=w;
   try{localStorage.setItem('edStroke',String(w))}catch(e){}applyView();}
- function setColor(c){window._col=c;
-  try{localStorage.setItem('edColor',c)}catch(e){}applyView();}
+ const isDk=()=>{const bc=document.body.classList;return bc.contains('dark')||bc.contains('dim');};
+ // 글자색은 밝은 테마용·어두운 테마용을 따로 기억 (Fokus Bibel과 같게) — 테마를 바꾸면
+ // 그 테마 쪽 색이 자동으로 쓰인다. 빈 값 = 테마 기본 글자색
+ const curCol=()=>isDk()?(window._colD||''):(window._colL||'');
+ const LHMIN=1.3,LHMAX=2.4;
+ const COLMIN=480,COLMAX=1400;      // 본문 너비(px) — COLMAX = 화면 가득
+ function setColW(v){window._col_w=Math.min(COLMAX,Math.max(COLMIN,Math.round(v/20)*20));
+  try{localStorage.setItem('edColW',String(window._col_w))}catch(e){}applyView();}
+ function setLh(v){window._lh=Math.min(LHMAX,Math.max(LHMIN,Math.round(v*20)/20));
+  try{localStorage.setItem('edLh',String(window._lh))}catch(e){}applyView();}
+ // 테마를 바꿀 때 고른 글자색이 새 바탕과 같은 계열(어두운 바탕에 어두운 글자
+ // 등)이면 테마 기본색으로 되돌린다
+ window._colFit=function(){const c=window._scol;if(!c)return;   // 원문 글자색만 (본문은 테마별 저장)
+  const m=/^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(c);if(!m)return;
+  const L=(.299*parseInt(m[1],16)+.587*parseInt(m[2],16)+.114*parseInt(m[3],16))/255;
+  const bc=document.body.classList,dk=bc.contains('dark')||bc.contains('dim');
+  if((dk&&L<.5)||(!dk&&L>.6))setSrcColor('');};
+ function setColor(c){c=c||'';
+  if(isDk()){window._colD=c;try{localStorage.setItem('edColorD',c)}catch(e){}}
+  else{window._colL=c;try{localStorage.setItem('edColorL',c)}catch(e){}}
+  window._col=curCol();applyView();}
+ function setLatFont(which,stk){window[which==='de'?'_lfd':'_lfe']=stk||'';
+  try{localStorage.setItem(which==='de'?'edFontDe':'edFontEn',stk||'')}catch(e){}applyView();}
  function setSrcColor(c){window._scol=c||'';   // '' = 테마 기본으로 되돌림
   try{localStorage.setItem('edSrcColor',window._scol)}catch(e){}applyView();}
  if(matchMedia('(max-width:640px)').matches)
@@ -2154,16 +2399,28 @@ function initViewSettings(){
  window._ff=localStorage.getItem('edFont')||FONTS[0][1];
  const sw0=parseFloat(localStorage.getItem('edStroke')||'0');
  window._sw=isNaN(sw0)?0:Math.min(1.2,Math.max(0,sw0));
- window._col=localStorage.getItem('edColor')||COLORS[0][1];
+ // 예전 단일 글자색(edColor)은 밝기에 따라 밝은/어두운 테마 쪽으로 옮겨 담는다
+ window._colL=localStorage.getItem('edColorL');window._colD=localStorage.getItem('edColorD');
+ if(window._colL==null&&window._colD==null){const o=localStorage.getItem('edColor')||'';
+  const m=/^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(o);
+  const L=m?(.299*parseInt(m[1],16)+.587*parseInt(m[2],16)+.114*parseInt(m[3],16))/255:0;
+  window._colL=(m&&L<.5)?o:'';window._colD=(m&&L>=.5)?o:'';}
+ window._colL=window._colL||'';window._colD=window._colD||'';window._col=curCol();
+ window._lfd=localStorage.getItem('edFontDe')||'';window._lfe=localStorage.getItem('edFontEn')||'';
+ window._applyView=()=>{window._col=curCol();applyView();rows2.forEach(f=>f());};
+ const cw0=parseInt(localStorage.getItem('edColW')||'700',10);
+ window._col_w=isNaN(cw0)?700:Math.min(1400,Math.max(480,cw0));
+ const lh0=parseFloat(localStorage.getItem('edLh')||'1.8');
+ window._lh=isNaN(lh0)?1.8:Math.min(2.4,Math.max(1.3,lh0));
  window._scol=localStorage.getItem('edSrcColor')||'';
  applyView();
  const cfgb=document.getElementById('cfg');cfgb.style.display='';
  const smenu=document.createElement('div');smenu.id='setmenu';
- const fsl=document.createElement('div');fsl.className='lbl';fsl.textContent='글자 크기';
+ const fsl=document.createElement('div');fsl.className='lbl';fsl.textContent='글자 크기 ';
  const fsrow=document.createElement('div');fsrow.className='fsrow';
- const bm=document.createElement('button');bm.textContent='A−';
- const bp=document.createElement('button');bp.textContent='A+';
- const fsv=document.createElement('span');
+ const bm=document.createElement('button');bm.textContent='−';bm.title='1px 작게';
+ const bp=document.createElement('button');bp.textContent='+';bp.title='1px 크게';
+ const fsv=document.createElement('b');fsl.appendChild(fsv);
  // 1px 단위 — 버튼은 미세 조정, 슬라이더는 크게 이동 (둘 다 같은 값 공유)
  const fsr=document.createElement('input');fsr.type='range';
  fsr.className='fsrange';fsr.min=String(FSMIN);fsr.max=String(FSMAX);
@@ -2174,13 +2431,75 @@ function initViewSettings(){
  bm.onclick=()=>{setFs((window._fs||16)-1);showv();};
  bp.onclick=()=>{setFs((window._fs||16)+1);showv();};
  fsr.oninput=()=>{setFs(parseInt(fsr.value,10));showv();};
- fsrow.append(bm,fsv,bp);
+ fsrow.append(bm,fsr,bp);
+ // 줄 간격 — 글자 크기와 같은 [−] 슬라이더 [+] 꼴
+ const lhl=document.createElement('div');lhl.className='lbl';lhl.textContent='줄 간격 ';
+ const lhv=document.createElement('b');lhl.appendChild(lhv);
+ const lhrow=document.createElement('div');lhrow.className='fsrow';
+ const lm=document.createElement('button');lm.textContent='−';lm.title='줄 간격 좁게';
+ const lp=document.createElement('button');lp.textContent='+';lp.title='줄 간격 넓게';
+ const lhr=document.createElement('input');lhr.type='range';lhr.className='fsrange';
+ lhr.min=String(LHMIN);lhr.max=String(LHMAX);lhr.step='0.05';
+ const showl=()=>{lhv.textContent=(window._lh||1.8).toFixed(2);lhr.value=String(window._lh||1.8);};
+ showl();
+ lm.onclick=()=>{setLh((window._lh||1.8)-.05);showl();};
+ lp.onclick=()=>{setLh((window._lh||1.8)+.05);showl();};
+ lhr.oninput=()=>{setLh(parseFloat(lhr.value));showl();};
+ lhrow.append(lm,lhr,lp);
+ // 본문 너비 — 같은 [−] 슬라이더 [+] 꼴. 폰처럼 좁은 화면에선 늘 화면 폭이라 숨김
+ const cwl=document.createElement('div');cwl.className='lbl';cwl.textContent='본문 너비 ';
+ const cwv=document.createElement('b');cwl.appendChild(cwv);
+ const cwrow=document.createElement('div');cwrow.className='fsrow';
+ const cm=document.createElement('button');cm.textContent='−';cm.title='좁게 (20px)';
+ const cp=document.createElement('button');cp.textContent='+';cp.title='넓게 (20px)';
+ const cwr=document.createElement('input');cwr.type='range';cwr.className='fsrange';
+ cwr.min=String(COLMIN);cwr.max=String(COLMAX);cwr.step='20';
+ const showc=()=>{const w=window._col_w||700;
+  cwv.textContent=w>=COLMAX?'화면 가득':w+'px';cwr.value=String(w);};
+ showc();
+ cm.onclick=()=>{setColW((window._col_w||700)-20);showc();};
+ cp.onclick=()=>{setColW((window._col_w||700)+20);showc();};
+ cwr.oninput=()=>{setColW(parseInt(cwr.value,10));showc();};
+ cwrow.append(cm,cwr,cp);
+ const cwHide=()=>{const hide=innerWidth<=640;cwl.style.display=cwrow.style.display=hide?'none':'';};
+ cwHide();addEventListener('resize',cwHide);
  const ffl=document.createElement('div');ffl.className='lbl';ffl.textContent='글꼴';
  const ffsel=document.createElement('select');
  FONTS.forEach(([nm,stk])=>{const o=document.createElement('option');
   o.value=stk;o.textContent=nm;ffsel.appendChild(o);});
  ffsel.value=window._ff;if(ffsel.selectedIndex<0)ffsel.selectedIndex=0;
  ffsel.onchange=()=>setFont(ffsel.value);
+ // 글꼴 카드 — 이름을 그 글꼴로 미리 보여 준다 (select는 숨겨 두고 값만 공유)
+ const ffgrid=document.createElement('div');ffgrid.className='ffgrid';
+ const ffMark=()=>ffgrid.querySelectorAll('button').forEach(b=>
+  b.classList.toggle('on',b.dataset.v===ffsel.value));
+ FONTS.forEach(([nm,stk])=>{const b=document.createElement('button');
+  b.dataset.v=stk;b.style.fontFamily=stk;
+  const m=/^(.*?)\s*\((.*)\)$/.exec(nm);
+  b.innerHTML='<span>'+(m?m[1]:nm)+'</span>'+(m?'<small>'+m[2]+'</small>':'');
+  b.onclick=()=>{ffsel.value=stk;setFont(stk);ffMark();};
+  ffgrid.appendChild(b);});
+ ffMark();ffsel.style.display='none';
+ // 독일어·영어 글꼴 — 칩 목록 (Fokus Bibel과 같은 꼴)
+ function mkLat(which,label){
+  const l=document.createElement('div');l.className='lbl';l.textContent=label;
+  l.style.marginTop='14px';
+  const g=document.createElement('div');g.className='latgrid';
+  const cur=()=>window[which==='de'?'_lfd':'_lfe']||'';
+  const mk=()=>g.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v===cur()));
+  LATF.forEach(([nm,stk])=>{const b=document.createElement('button');b.dataset.v=stk;
+   if(stk)b.style.fontFamily=stk;
+   const m=/^(.*?)\s*\((.*)\)$/.exec(nm);
+   b.innerHTML='<span>'+(m?m[1]:nm)+'</span>'+(m?'<small>'+m[2]+'</small>':'');
+   b.onclick=()=>{setLatFont(which,stk);mk();};g.appendChild(b);});
+  mk();return [l,g];}
+ const [ldl,ldg]=mkLat('de','독일어 글꼴');
+ const [lel,leg]=mkLat('en','영어 글꼴');
+ // 글꼴 이름을 그 글꼴로 미리 보이게 — 설정을 처음 열 때 가벼운 Google Fonts만 불러온다
+ // (눈누·KoPub 같은 통짜 파일은 고를 때만)
+ let _pvLoaded=false;
+ window._fontPreview=()=>{if(_pvLoaded)return;_pvLoaded=true;
+  FONTS.forEach(f=>loadGF(f[2]));LATF.forEach(f=>loadGF(f[2]));};
  // 글자 굵기 (획 두께) — 얇은 명조를 폰에서 또렷하게
  const swl=document.createElement('div');swl.className='lbl';
  swl.textContent='글자 굵기';swl.style.marginTop='12px';
@@ -2195,15 +2514,17 @@ function initViewSettings(){
  function mkPalette(getCur,onPick,reset){
   const row=document.createElement('div');row.className='clrow';
   const sws=[];
-  const mark=()=>sws.forEach(([b,c])=>b.classList.toggle('on',
-    (c||'').toLowerCase()===String(getCur()||'').toLowerCase()));
+  const mark=()=>{const dk=isDk();
+   sws.forEach(([b,c])=>{const ci=b.dataset.ci;
+    const cc=ci!=null?COLORS[+ci][1]:c;
+    // 지금 테마에 맞는 색 묶음만 보인다 (밝은 테마 → 어두운 글자 8색, 어두운 테마 → 밝은 글자 8색)
+    if(ci!=null)b.style.display=(PAL_DARK.has(+ci)===dk)?'':'none';
+    b.classList.toggle('on',(cc||'').toLowerCase()===String(getCur()||'').toLowerCase());});};
   if(reset){const b0=document.createElement('button');
    b0.className='sw def';b0.title='테마 기본색';b0.textContent='기본';
    b0.onclick=()=>{onPick('');mark();};
    row.appendChild(b0);sws.push([b0,'']);}
   COLORS.forEach(([nm,c],ci)=>{
-   if(ci===5){const brk=document.createElement('div');  // 어두운 배경용 줄 분리
-    brk.className='brk';row.appendChild(brk);}
    const b=document.createElement('button');
    b.className='sw';b.title=nm+' — 길게 누르면 색 변경';
    b.style.background=c;b.dataset.ci=ci;
@@ -2269,13 +2590,16 @@ function initViewSettings(){
  // 번역(본문) 글자색
  const cll=document.createElement('div');cll.className='lbl';
  cll.style.marginTop='12px';
- cll.innerHTML='번역 글자색 <span class="tip">— 견본 길게 누르면 색 편집'
-  +'</span> <button class="palrst">기본 프리셋</button>';
+ cll.innerHTML=(PLAIN?'글자색':'번역 글자색')+' <span class="tip tcw"></span>'
+  +' <button class="palrst">기본 프리셋</button>';
+ const tcw=cll.querySelector('.tcw');
+ const tcHint=()=>{tcw.textContent='· '+(isDk()?'어두운':'밝은')+' 테마용 — 길게 누르면 색 편집';};
+ tcHint();
  cll.querySelector('.palrst').onclick=()=>{
   COLORS=DEFCOLORS.map(x=>x.slice());
   try{localStorage.removeItem('edPalette')}catch(e){}
   repaintPal();};
- const clrow=mkPalette(()=>window._col,c=>setColor(c),false);
+ const clrow=mkPalette(()=>curCol(),c=>setColor(c),true);
  // 원문(전사) 글자색 — 원문 보기·병기 원문·편집칸에 함께 적용
  const scl=document.createElement('div');scl.className='lbl';
  scl.textContent='원문 글자색';scl.style.marginTop='12px';
@@ -2284,14 +2608,26 @@ function initViewSettings(){
  const thl=document.createElement('div');thl.className='lbl';
  thl.textContent='테마';thl.style.marginTop='12px';
  const thsel=document.createElement('select');
- [['밝게','light'],['세피아 (종이)','sepia'],['어둡게 (검정)','dark'],
+ [['밝게','light'],['종이','paper'],['세피아','sepia'],['어둡게 (검정)','dark'],
   ['어둡게 (진회색)','dim'],['기기 설정 따름','auto']].forEach(
   ([nm,v2])=>{const o=document.createElement('option');
    o.value=v2;o.textContent=nm;thsel.appendChild(o);});
  thsel.value=localStorage.getItem('edTheme')||'light';
  if(thsel.selectedIndex<0)thsel.selectedIndex=0;
  thsel.onchange=()=>{try{localStorage.setItem('edTheme',thsel.value)}catch(e){}
-  applyTheme();};
+  applyTheme();if(window._colFit)window._colFit();thMark();
+  window._applyView();tcHint();};
+ // 테마 견본 카드 '가 Aa' (Fokus Bibel과 같은 꼴) — select는 숨겨 두고 값만 공유
+ const thgrid=document.createElement('div');thgrid.className='thgrid';
+ const TH=[['auto','시스템'],['light','밝게'],['paper','종이'],['sepia','세피아'],
+  ['dim','진회색'],['dark','검정']];
+ const thMark=()=>thgrid.querySelectorAll('button').forEach(b=>
+  b.classList.toggle('on',b.dataset.t===thsel.value));
+ TH.forEach(([v,nm])=>{const b=document.createElement('button');
+  b.dataset.t=v;b.className='thc thc-'+v;
+  b.innerHTML='<span class="ths">가 Aa</span><small>'+nm+'</small>';
+  b.onclick=()=>{thsel.value=v;thsel.onchange();};thgrid.appendChild(b);});
+ thMark();thsel.style.display='none';
  // 하단 위치 표시(킨들 로케이션식) — 읽기 모드 하단 알약의 형식 선택
  const pbl=document.createElement('div');pbl.className='lbl';
  pbl.textContent='하단 위치 표시 (읽기 모드)';pbl.style.marginTop='12px';
@@ -2356,8 +2692,14 @@ function initViewSettings(){
  window._wkNote=s=>{const n=wkl.querySelector('.wknote');if(!n)return;
   n.textContent=WKTXT[s]||'';};
  if(window._wkMode)window._wkNote(window._wkMode);
- smenu.append(fsl,fsrow,fsr,ffl,ffsel,swl,swsel,cll,clrow,scl,scrow,ped,
-   thl,thsel,jsl,jssel,pbl,pbsel,bml,tel,wkl);
+ // 순서 — 가장 자주 쓰는 테마·글자 크기·줄 간격·글꼴을 맨 위로 (Fokus Bibel과 같게)
+ thl.style.marginTop='2px';
+ [lhl,cwl,ffl,swl,cll].forEach(x=>{x.style.marginTop='14px';});
+ ffl.textContent='한글 글꼴';
+ if(PLAIN){scl.style.display='none';scrow.style.display='none';}  // 평문 책은 원문=본문
+ smenu.append(thl,thgrid,thsel,fsl,fsrow,lhl,lhrow,cwl,cwrow,ffl,ffsel,ffgrid,
+   ldl,ldg,lel,leg,swl,swsel,
+   cll,clrow,scl,scrow,ped,jsl,jssel,pbl,pbsel,bml,tel,wkl);
  // ── 좁은 화면: 헤더가 두 줄로 접히지 않게 보조 컨트롤을 ⚙ 안으로 이동 ──
  //   (핸들러가 붙은 DOM 노드를 그대로 옮기므로 동작은 그대로)
  if(NARROW){
@@ -2381,6 +2723,7 @@ function initViewSettings(){
  window._smenu=smenu;
  const closeS=()=>smenu.classList.remove('on');
  cfgb.onclick=()=>{if(smenu.classList.contains('on')){closeS();return}
+  if(window._fontPreview)window._fontPreview();
   const r=cfgb.getBoundingClientRect();
   smenu.style.right=Math.max(6,innerWidth-r.right)+'px';
   // 버튼 아래로 펼치되, 화면 밖으로 잘리지 않게 높이를 화면 안으로 제한.
@@ -2415,7 +2758,11 @@ function initCloud(){
  document.body.appendChild(foc);
  // 세로 중심(c%) 기준 — 선명 구역(c±clear)은 통과, 그 바로 위·아래 '좁은'
  // 띠만 밝은 회색 베일로 음영(평평·저대비), 가장자리 1% 또렷한 전환, far 밖 정상.
- const focGrad=(c)=>{const clear=7,dimIn=7.25,dimOut=12.5,far=12.75,DIM='.58',G='198,200,208';
+ const focGrad=(c)=>{const clear=7,dimIn=7.25,dimOut=12.5,far=12.75;
+  const bc=document.body.classList;     // 테마별 베일 색 (배경과 같은 계열)
+  const G=bc.contains('paper')?'170,156,128':bc.contains('sepia')?'160,152,134'
+   :bc.contains('dark')?'6,8,8':bc.contains('dim')?'22,24,28':'198,202,196';
+  const DIM=(bc.contains('dark')||bc.contains('dim'))?'.6':bc.contains('paper')?'.42':'.58';
   const V=(a)=>'rgba('+G+','+a+')';
   const s=(v)=>Math.max(0,Math.min(100,v));
   return 'linear-gradient(to bottom,'
@@ -2431,6 +2778,7 @@ function initCloud(){
  const fp0=parseInt(localStorage.getItem('edFocusPos')||'50',10);
  window._fpos=isNaN(fp0)?50:Math.min(82,Math.max(18,fp0));
  const applyPos=()=>{foc.style.background=focGrad(window._fpos);
+  window._focApply=applyPos;           // 테마가 바뀌면 베일 색 다시 칠하기
   const c=window._fpos;   // 그랩 밴드 = 흐림 띠 부근(제한 높이). 가운데·먼 곳은 통과
   fdt.style.top=Math.max(0,c-16)+'vh';fdt.style.height='11vh';   // 위 흐림 띠
   fdb.style.top=Math.min(100,c+5)+'vh';fdb.style.height='11vh';};// 아래 흐림 띠

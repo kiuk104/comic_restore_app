@@ -72,6 +72,15 @@ body{font-family:'Malgun Gothic',sans-serif;background:var(--bg);
  border:1px solid #d5d9e0;border-radius:12px;padding:16px 16px;
  margin:0 0 10px;font-size:16px;color:var(--tx);cursor:pointer}
 .bk:active{background:#eef7f3}
+/* 책 줄 + 오른쪽 지우기 버튼 (button 안에 button을 못 넣어 감싸는 상자) */
+.bkw{position:relative}
+.bkw .bk{padding-right:52px}
+.bkdel{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:40px;height:40px;
+ border:0;border-radius:10px;background:none;color:#9aa1ad;font-size:18px;cursor:pointer}
+.bkdel:active{background:#f6e3e3;color:#b4382f}
+#hidn{color:var(--tx2);font-size:12.5px;padding:0 4px 12px}
+#hidn button{border:0;background:none;color:var(--deep);text-decoration:underline;
+ font-size:12.5px;cursor:pointer;padding:0}
 .bk small{display:block;color:var(--tx2);font-size:12px;margin-top:3px}
 #hint{color:var(--tx2);font-size:13px;padding:4px 16px 18px}
 #hint button{border:0;background:none;color:var(--acc);font-size:13px;
@@ -205,9 +214,13 @@ function renderBooks(d, fromCache) {
   const bx = document.getElementById("books");
   bx.innerHTML = "";
   LIST = d;
-  const items = (d.info || (d.books || []).map(n => ({name: n}))).slice();
+  const hid = hiddenSet();
+  const all = (d.info || (d.books || []).map(n => ({name: n}))).slice();
+  const items = all.filter(it => !hid.has(it.name));
   sortItems(items);
   items.forEach(it => {
+    const wrap = document.createElement("div");
+    wrap.className = "bkw";
     const el = document.createElement("button");
     el.className = "bk";
     const nm = String(it.name).replace(/[<>&]/g, "");
@@ -227,14 +240,68 @@ function renderBooks(d, fromCache) {
       : it.kind === "xlat" ? '<span class="chip xlat">번역</span>' : "";
     el.innerHTML = "📖 " + nm + chip + (sub ? "<small>" + sub + "</small>" : "");
     el.onclick = () => openBook(it.name);
-    bx.appendChild(el);
+    const del = document.createElement("button");
+    del.className = "bkdel"; del.textContent = "✕";
+    del.title = "읽는 중 목록에서 지우기"; del.setAttribute("aria-label", nm + " 지우기");
+    del.onclick = ev => { ev.stopPropagation(); removeBook(it); };
+    wrap.append(el, del);
+    bx.appendChild(wrap);
   });
+  const nh = all.length - items.length;
+  if (nh > 0) {                                   // 이 폰에서만 숨긴 책
+    const h = document.createElement("div"); h.id = "hidn";
+    h.innerHTML = "이 폰에서 숨긴 책 " + nh + "권 · ";
+    const b = document.createElement("button"); b.textContent = "다시 보이기";
+    b.onclick = () => { localStorage.removeItem("fvHidden"); renderBooks(LIST, true); };
+    h.appendChild(b); bx.appendChild(h);
+  }
   if (!(d.books || []).length)
     bx.innerHTML = '<div class="spin">아직 업로드된 책이 없습니다 — ' +
                    "PC에서 [☁ 업로드]</div>";
   const last = localStorage.getItem("ebookShellLast");
   if (last && !autoOpened && (d.books || []).includes(last)) {
     autoOpened = true; openBook(last);
+  }
+}
+
+// ---- 읽는 중 목록에서 지우기 ----
+//   동기화 서버(GAS)의 폰용 사본(책 데이터·수정 큐)을 휴지통으로 보낸다. PC의 책은
+//   그대로라 PC에서 다시 [☁ 업로드]하면 돌아온다. 서버가 아직 이 기능이 없는
+//   옛 버전이면(재배포 전) 이 폰에서만 숨긴다.
+function hiddenSet() {
+  try { return new Set(JSON.parse(localStorage.getItem("fvHidden") || "[]")); }
+  catch (e) { return new Set(); }
+}
+function hideLocal(name) {
+  const h = hiddenSet(); h.add(name);
+  localStorage.setItem("fvHidden", JSON.stringify([...h]));
+}
+async function removeBook(it) {
+  const nm = it.name;
+  let msg = "『" + nm + "』을(를) 읽는 중 목록에서 지울까요?\n\n"
+    + "폰에 올라간 사본만 지워집니다 — PC의 책·교정은 그대로이고, "
+    + "PC에서 다시 [☁ 업로드]하면 돌아옵니다.";
+  if (it.pending) msg += "\n\n⚠ 아직 PC에 반영되지 않은 수정 " + it.pending
+    + "건이 함께 사라집니다. 먼저 PC에서 [☁ 수정 반영]을 하는 게 안전합니다.";
+  if (!confirm(msg)) return;
+  if (localStorage.getItem("ebookShellLast") === nm) localStorage.removeItem("ebookShellLast");
+  try {
+    await gas({op: "remove", book: nm, force: it.pending ? 1 : 0});
+    toast("🗑 『" + nm + "』을(를) 지웠습니다");
+  } catch (e) {
+    const m = String(e.message || e);
+    if (/알 수 없는 op/.test(m)) {               // 옛 GAS — 재배포 전
+      hideLocal(nm);
+      toast("동기화 서버를 재배포하기 전이라 이 폰에서만 숨겼습니다", 3600);
+      if (LIST) renderBooks(LIST, true);
+    } else toast("지우지 못했습니다: " + m, 3600);
+    return;
+  }
+  if (LIST) {                                     // 화면·캐시에서 바로 빼기
+    LIST.books = (LIST.books || []).filter(x => x !== nm);
+    if (LIST.info) LIST.info = LIST.info.filter(x => x.name !== nm);
+    try { localStorage.setItem("ebookShellList", JSON.stringify(LIST)); } catch (e) {}
+    renderBooks(LIST, true);
   }
 }
 

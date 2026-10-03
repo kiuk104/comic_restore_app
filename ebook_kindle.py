@@ -89,6 +89,33 @@ def find_kindle(cfg=None):
             continue
     return None
 
+def eject(root, log=print, wait=12.0):
+    """킨들 꺼내기 — 탐색기 '꺼내기'와 같은 동작(쓰기 캐시를 비우고 드라이브 분리).
+    성공(드라이브가 사라짐)하면 True. 킨들 안 파일을 연 창·프로그램이 있으면 실패할 수 있다."""
+    import time
+    if os.name != "nt":
+        return False
+    drive = os.path.splitdrive(os.path.abspath(root))[0] or root.rstrip("\\/")
+    ps = ("$s = New-Object -ComObject Shell.Application; "
+          f"$d = $s.Namespace(17).ParseName('{drive}'); "
+          "if ($d) { $d.InvokeVerb('Eject') }")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                       timeout=30, capture_output=True, **_nowin())
+    except Exception as e:
+        log(f"⚠ 킨들 꺼내기 명령 실패: {e}")
+        return False
+    t0 = time.time()
+    while time.time() - t0 < wait:              # 드라이브가 사라질 때까지 확인
+        if not os.path.isdir(os.path.join(root, "documents")):
+            log("⏏ 킨들을 꺼냈습니다 — 케이블을 뽑아도 됩니다.")
+            return True
+        time.sleep(0.5)
+    log("⚠ 킨들을 꺼내지 못했습니다 — 킨들 안 파일을 연 탐색기 창·프로그램을 닫고 "
+        "[⏏ 꺼내기]를 다시 누르거나, 작업 표시줄의 '하드웨어 안전하게 제거'를 쓰세요.")
+    return False
+
+
 # ───────── 파일명 ─────────
 
 def safe_name(title):
