@@ -134,6 +134,11 @@ body.rdmode:not(.hascard) #posbar.on{display:block}
    높이가 바뀌며 생기는 보정 스크롤이 '튀는' 것으로 보이지 않게 한다 */
 #list{transition:opacity .16s ease}
 body.restoring #list{opacity:0;transition:none}
+/* 집중 모드 여백 — 책 맨 앞·맨 끝 줄도 집중선 안까지 스크롤해 들어올 수 있게
+   본문 위아래에 빈 자리를 둔다(높이는 집중선 위치에 따라 JS가 --focTop/--focBot로) */
+body.rdmode.focuson #list::before,body.rdmode.focuson #list::after{content:'';display:block}
+body.rdmode.focuson #list::before{height:var(--focTop,0px)}
+body.rdmode.focuson #list::after{height:var(--focBot,0px)}
 header b{font-size:15px}
 button{cursor:pointer;padding:4px 10px;border:1px solid var(--bd2);
  border-radius:6px;background:var(--card);color:var(--fg);font-size:12px}
@@ -577,6 +582,20 @@ select{border:1px solid var(--bd);background:var(--raise);color:var(--fg)}
   background:var(--bd);margin:2px auto 6px}
 }
 @media (prefers-reduced-motion:reduce){header button{transition:none}}
+/* 글꼴 목록 접기(아코디언) — 2026-10-03 */
+#setmenu .fold{display:flex;align-items:center;gap:8px;width:100%;margin-top:8px;
+ padding:9px 12px;min-height:42px;border:1px solid var(--bd);border-radius:10px;
+ background:var(--card);color:var(--fg);text-align:left;cursor:pointer}
+#setmenu .fold .fl{font:600 12px var(--sans);color:var(--mut);flex:none;min-width:64px}
+#setmenu .fold .fv{flex:1;font-size:15px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#setmenu .fold .fa{font-style:normal;color:var(--mut);transition:transform .18s}
+#setmenu .fold.open{border-color:var(--acc);border-bottom-left-radius:0;border-bottom-right-radius:0}
+#setmenu .fold.open .fa{transform:rotate(180deg);color:var(--acc)}
+#setmenu .foldbody{display:none!important}
+#setmenu .foldbody.open{display:grid!important;padding:8px;border:1px solid var(--acc);border-top:0;
+ border-radius:0 0 10px 10px;max-height:46vh;overflow-y:auto;overscroll-behavior:contain}
+#setmenu .latgrid.foldbody.open{display:flex!important}
+#setmenu .focslot .fctgl{margin-top:4px}
 </style></head><body>
 <header>
  <b>__TITLE__</b><span id="cnt"></span>
@@ -1430,6 +1449,7 @@ function ensureRio(){if(rio)return;
 function setMode(on){
  const ci=curIdx();
  document.body.classList.toggle('rdmode',on);
+ if(window._focSpace)window._focSpace(true);  // 집중 여백(모드 전환은 아래에서 위치를 다시 잡음)
  // 버튼은 '지금 모드'가 아니라 '누르면 갈 모드'를 보여준다 — 좁은 화면에서도
  // 라벨을 함께 표시해야 현재 모드로 오해해 헛누르지 않는다.
  // 좁은 화면은 아이콘만 — 라벨을 넣으면 헤더가 두 줄로 접힌다
@@ -1451,6 +1471,7 @@ function setMode(on){
  updSrcBtn();
  if(window._pbUpd)window._pbUpd();   // 하단 위치 표시는 읽기 모드에서만
  if(window._fpNote)window._fpNote();  // 읽기 잠금 '적용 중' 표시 갱신
+ if(window._focApply)setTimeout(window._focApply,80);  // 집중 여백·집중선을 다시 맞춤
  if(window._wkSync)window._wkSync(); // 화면 꺼짐 방지도 읽기 모드에서만
  const o=rows[ci];if(o)o.r.scrollIntoView();}
 document.getElementById('mode').onclick=()=>
@@ -2326,6 +2347,7 @@ function initViewSettings(){
   return '#'+_h2((r+m)*255)+_h2((g+m)*255)+_h2((b+m)*255);}
  // 편집 textarea·읽기 문단·미리보기 글자 크기/글꼴/굵기/색 모두 반영
  function applyView(){const px=window._fs||16,ff=window._ff||FONTS[0][1];
+  if(window._focApply)setTimeout(window._focApply,60);   // 줄 간격이 바뀌면 집중선도 다시 맞춤
   const sw=window._sw||0,col=curCol()||'var(--fg)';   // 기본 = 테마 글자색
   loadStack(ff);                                   // 고른 글꼴만 불러오기
   const lfd=window._lfd||'',lfe=window._lfe||'';
@@ -2480,6 +2502,25 @@ function initViewSettings(){
   b.onclick=()=>{ffsel.value=stk;setFont(stk);ffMark();};
   ffgrid.appendChild(b);});
  ffMark();ffsel.style.display='none';
+ // 글꼴 목록 접기(아코디언) — 머리줄에 '지금 글꼴'만 보이고, 누르면 목록이 펼쳐진다.
+ // 한 번에 하나만 펼침 · 고르면 머리줄 이름이 바뀌고 목록은 열린 채(비교하며 고르기)
+ const _folds=[];
+ function mkFold(label,body,curName){
+  const h=document.createElement('button');h.type='button';h.className='fold';
+  h.innerHTML='<span class="fl"></span><b class="fv"></b><i class="fa">▾</i>';
+  h.querySelector('.fl').textContent=label;
+  body.classList.add('foldbody');
+  const upd=()=>{const [nm,stk]=curName();const v=h.querySelector('.fv');
+   v.textContent=nm;v.style.fontFamily=stk||'';};
+  const set=(on)=>{h.classList.toggle('open',on);body.classList.toggle('open',on);};
+  h.onclick=()=>{const on=!h.classList.contains('open');
+   _folds.forEach(f=>f.set(false));set(on);
+   if(on){if(window._fontPreview)window._fontPreview();
+    requestAnimationFrame(()=>{try{h.scrollIntoView({block:'nearest',behavior:'smooth'})}catch(e){}});}};
+  body.addEventListener('click',e=>{if(e.target.closest('button'))setTimeout(upd,0);});
+  upd();_folds.push({set,upd});return h;}
+ const fname=(list,v)=>{const f=list.find(x=>x[1]===v)||list[0];
+  const m=/^(.*?)\s*\((.*)\)$/.exec(f[0]);return [m?m[1]:f[0],f[1]];};
  // 독일어·영어 글꼴 — 칩 목록 (Fokus Bibel과 같은 꼴)
  function mkLat(which,label){
   const l=document.createElement('div');l.className='lbl';l.textContent=label;
@@ -2492,7 +2533,7 @@ function initViewSettings(){
    const m=/^(.*?)\s*\((.*)\)$/.exec(nm);
    b.innerHTML='<span>'+(m?m[1]:nm)+'</span>'+(m?'<small>'+m[2]+'</small>':'');
    b.onclick=()=>{setLatFont(which,stk);mk();};g.appendChild(b);});
-  mk();return [l,g];}
+  mk();return [mkFold(label,g,()=>fname(LATF,cur())),g];}
  const [ldl,ldg]=mkLat('de','독일어 글꼴');
  const [lel,leg]=mkLat('en','영어 글꼴');
  // 글꼴 이름을 그 글꼴로 미리 보이게 — 설정을 처음 열 때 가벼운 Google Fonts만 불러온다
@@ -2694,10 +2735,12 @@ function initViewSettings(){
  if(window._wkMode)window._wkNote(window._wkMode);
  // 순서 — 가장 자주 쓰는 테마·글자 크기·줄 간격·글꼴을 맨 위로 (Fokus Bibel과 같게)
  thl.style.marginTop='2px';
- [lhl,cwl,ffl,swl,cll].forEach(x=>{x.style.marginTop='14px';});
- ffl.textContent='한글 글꼴';
+ [lhl,cwl,swl,cll].forEach(x=>{x.style.marginTop='14px';});
+ const ffh=mkFold('한글 글꼴',ffgrid,()=>fname(FONTS,ffsel.value));ffh.style.marginTop='14px';
  if(PLAIN){scl.style.display='none';scrow.style.display='none';}  // 평문 책은 원문=본문
- smenu.append(thl,thgrid,thsel,fsl,fsrow,lhl,lhrow,cwl,cwrow,ffl,ffsel,ffgrid,
+ const focSlot=document.createElement('div');focSlot.className='focslot';
+ window._focSlot=focSlot;
+ smenu.append(thl,thgrid,thsel,fsl,fsrow,lhl,lhrow,cwl,cwrow,focSlot,ffh,ffsel,ffgrid,
    ldl,ldg,lel,leg,swl,swsel,
    cll,clrow,scl,scrow,ped,jsl,jssel,pbl,pbsel,bml,tel,wkl);
  // ── 좁은 화면: 헤더가 두 줄로 접히지 않게 보조 컨트롤을 ⚙ 안으로 이동 ──
@@ -2743,49 +2786,142 @@ function initViewSettings(){
    closeS();window._menuJustClosed=true;clearTimeout(window._mjcT);
    window._mjcT=setTimeout(()=>{window._menuJustClosed=false;},350);}},true);
 }
-function initCloud(){
- document.getElementById('exp').style.display='none';
- document.getElementById('ocrsel').style.display='none';
- const mx=document.getElementById('mexp');mx.style.display='';
- mx.onclick=()=>{const pl={v:1,fp:D.fp,count:D.count,
-   edits:Object.fromEntries(dirty)};
-  const b=new Blob([JSON.stringify(pl,null,1)],{type:'application/json'});
-  const a=document.createElement('a');a.href=URL.createObjectURL(b);
-  a.download=(D.title||'이북')+'_edits.json';a.click();};
- // ⚙ 보기 설정(글자 크기·글꼴)은 initViewSettings()에서 모든 모드 공용으로 생성됨.
+// 집중 모드(리딩 룰러) — 예전엔 클라우드(폰)에서만 만들어져 PC에선 보이지 않았다.
+// 이제 모든 모드 공용이고, ⚙ 안에서는 본문 너비 바로 아래 자리(_focSlot)에 놓인다.
+function initFocus(){
  // 집중 모드(리딩 룰러) — 오버레이 + 온/오프 토글 + 우측 손잡이 드래그로 위치 조절
  const foc=document.createElement('div');foc.id='focus';
  document.body.appendChild(foc);
- // 세로 중심(c%) 기준 — 선명 구역(c±clear)은 통과, 그 바로 위·아래 '좁은'
- // 띠만 밝은 회색 베일로 음영(평평·저대비), 가장자리 1% 또렷한 전환, far 밖 정상.
- const focGrad=(c)=>{const clear=7,dimIn=7.25,dimOut=12.5,far=12.75;
-  const bc=document.body.classList;     // 테마별 베일 색 (배경과 같은 계열)
-  const G=bc.contains('paper')?'170,156,128':bc.contains('sepia')?'160,152,134'
-   :bc.contains('dark')?'6,8,8':bc.contains('dim')?'22,24,28':'198,202,196';
-  const DIM=(bc.contains('dark')||bc.contains('dim'))?'.6':bc.contains('paper')?'.42':'.58';
-  const V=(a)=>'rgba('+G+','+a+')';
-  const s=(v)=>Math.max(0,Math.min(100,v));
-  return 'linear-gradient(to bottom,'
-   +V(0)+' 0%,'+V(0)+' '+s(c-far)+'%,'
-   +V(DIM)+' '+s(c-dimOut)+'%,'+V(DIM)+' '+s(c-dimIn)+'%,'
-   +V(0)+' '+s(c-clear)+'%,'+V(0)+' '+s(c+clear)+'%,'
-   +V(DIM)+' '+s(c+dimIn)+'%,'+V(DIM)+' '+s(c+dimOut)+'%,'
-   +V(0)+' '+s(c+far)+'%,'+V(0)+' 100%)';};
  // 흐린 위/아래 구역에 드래그 캐처 두 장 (가운데 선명 띠는 빈 공간=통과)
  const fdt=document.createElement('div');fdt.className='fdrag';
  const fdb=document.createElement('div');fdb.className='fdrag';
  document.body.append(fdt,fdb);
  const fp0=parseInt(localStorage.getItem('edFocusPos')||'50',10);
  window._fpos=isNaN(fp0)?50:Math.min(82,Math.max(18,fp0));
- const applyPos=()=>{foc.style.background=focGrad(window._fpos);
-  window._focApply=applyPos;           // 테마가 바뀌면 베일 색 다시 칠하기
-  const c=window._fpos;   // 그랩 밴드 = 흐림 띠 부근(제한 높이). 가운데·먼 곳은 통과
-  fdt.style.top=Math.max(0,c-16)+'vh';fdt.style.height='11vh';   // 위 흐림 띠
-  fdb.style.top=Math.min(100,c+5)+'vh';fdb.style.height='11vh';};// 아래 흐림 띠
+ if(localStorage.getItem('edFocus')==='1')document.body.classList.add('focuson');
+ // ── 집중선 옵션 (⚙) — 선명한 줄 수(0=자동) · 흐림 진하기(1~10, 5=기본) · 휠 한 칸 줄 수
+ const lsN=(k,d)=>{const v=parseInt(localStorage.getItem(k)||'',10);return isNaN(v)?d:v;};
+ const FO={lines:lsN('edFocusLines',0),str:lsN('edFocusStr',5),wheel:lsN('edFocusWheel',1)};
+ const foSave=(k,v)=>{try{localStorage.setItem(k,String(v))}catch(e){}};
+ // ── 줄에 붙는 집중선 (2026-10-03) ──
+ //  ① 띠 높이를 본문 줄 간격의 정수배로 잡고, 경계 4곳(바깥 흐림·선명 구역 위/아래)을
+ //     그 자리 문단의 '줄과 줄 사이'로 맞춘다 → 경계가 글자를 가로지르지 않는다.
+ //  ② 스크롤 '중'에는 띠를 절대 움직이지 않고(떨림 = 집중 방해), 멈춘 뒤 본문을
+ //     몇 px만 밀어 선명 구역 위 경계에 줄 사이가 오게 정렬한다.
+ const F_CLR=7,F_DIM=12.5;                 // 자동일 때 선명 구역 ±7%, 흐림 띠 바깥 ±12.5%
+ const focLive=()=>{const bc=document.body.classList;
+  return bc.contains('focuson')&&bc.contains('rdmode')&&!bc.contains('hascard');};
+ // 본문(제목 아닌) 문단의 줄 간격 px
+ const bodyLh=()=>{const r=document.querySelector('#list .rd:not(.rdh):not(.rdsh)');
+  if(r){const cs=getComputedStyle(r);const v=parseFloat(cs.lineHeight);if(v>0)return v;}
+  return (window._fs||16)*(window._lh||1.8);};
+ // 띠 기본 모양(줄 격자 맞추기 전) — 선명 구역은 집중선 위치(c%)를 가운데로
+ const geo=()=>{const H=innerHeight,C=window._fpos/100*H,lh=bodyLh();
+  const n=FO.lines>0?FO.lines:Math.max(1,Math.round(2*F_CLR/100*H/lh));
+  const clr=n*lh,dim=Math.max(1,Math.round((F_DIM-F_CLR)/100*H/lh))*lh;
+  return {H,lh,n,clr,dim,T0:C-clr/2};};
+ // y(화면 좌표)에 있는 읽기 문단의 줄 격자 {t0,b0,lh} — 문단 사이 빈칸이면 null
+ const lineAt=(y)=>{const L=document.getElementById('list');if(!L)return null;
+  const r=L.getBoundingClientRect();
+  let rd=null;
+  for(const e of document.elementsFromPoint(r.left+r.width/2,y)){
+   if(e.classList&&e.classList.contains('rd')){rd=e;break;}}
+  if(!rd)return null;
+  const cs=getComputedStyle(rd);
+  let lh=parseFloat(cs.lineHeight);if(!(lh>0))lh=parseFloat(cs.fontSize)*1.2;
+  const rr=rd.getBoundingClientRect();
+  const t0=rr.top+parseFloat(cs.paddingTop)+parseFloat(cs.borderTopWidth);
+  const b0=rr.bottom-parseFloat(cs.paddingBottom)-parseFloat(cs.borderBottomWidth);
+  return b0-t0>=lh*.5?{t0,b0,lh}:null;};
+ // y를 가장 가까운 '줄 사이'로 — 문단 위·아래 바깥(여백)이면 그대로 둔다
+ const snapY=(y)=>{const l=lineAt(y);if(!l)return y;
+  if(y<=l.t0)return l.t0;if(y>=l.b0)return l.b0;
+  const n=Math.round((l.b0-l.t0)/l.lh);   // 줄 수(마지막 줄 경계 = b0)
+  const k=Math.min(n,Math.max(0,Math.round((y-l.t0)/l.lh)));
+  return k>=n?l.b0:l.t0+k*l.lh;};
+ const focPaint=()=>{const g=geo();
+  let a=g.T0-g.dim,T=g.T0,B=g.T0+g.clr,d=g.T0+g.clr+g.dim;
+  if(focLive()){const sa=snapY(a),sT=snapY(T),sB=snapY(B),sd=snapY(d);
+   if(sa<sT&&sT<sB&&sB<sd){a=sa;T=sT;B=sB;d=sd;}}
+  const bc=document.body.classList;      // 테마별 베일 색 (배경과 같은 계열)
+  const G=bc.contains('paper')?'170,156,128':bc.contains('sepia')?'160,152,134'
+   :bc.contains('dark')?'6,8,8':bc.contains('dim')?'22,24,28':'198,202,196';
+  const base=(bc.contains('dark')||bc.contains('dim'))?.6:bc.contains('paper')?.42:.58;
+  const DIM=Math.min(.96,base*FO.str/5).toFixed(3);   // 진하기 5 = 예전 기본
+  const V=(x)=>'rgba('+G+','+x+')',px=(v)=>v.toFixed(1)+'px';
+  foc.style.background='linear-gradient(to bottom,'
+   +V(0)+' 0px,'+V(0)+' '+px(a)+','+V(DIM)+' '+px(a)+','+V(DIM)+' '+px(T)+','
+   +V(0)+' '+px(T)+','+V(0)+' '+px(B)+','+V(DIM)+' '+px(B)+','+V(DIM)+' '+px(d)+','
+   +V(0)+' '+px(d)+','+V(0)+' 100%)';
+  // 잡기 띠 = 흐림 띠 부근(조금 넉넉히). 가운데·먼 곳은 통과
+  const m=.03*g.H;
+  fdt.style.top=Math.max(0,a-m)+'px';fdt.style.height=(T-a+m+.015*g.H)+'px';
+  fdb.style.top=(B-.015*g.H)+'px';fdb.style.height=(d-B+m+.015*g.H)+'px';};
+ let _fpRaf=0;
+ const focQueue=()=>{if(_fpRaf)return;_fpRaf=requestAnimationFrame(()=>{_fpRaf=0;focPaint();});};
+ // 스크롤하는 '동안'엔 띠를 다시 칠하지 않는다 — 멈춘 뒤 focSnap에서 한 번만
+ addEventListener('resize',()=>{focSpace();focQueue();});
+ // ② 멈추면 줄 정렬 — 손가락이 닿아 있거나 위치 복원 중·편집 중엔 하지 않는다
+ let _fsT=null,_fsBusy=false,_fTouch=false;
+ addEventListener('touchstart',()=>{_fTouch=true;},{passive:true});
+ addEventListener('touchend',()=>{_fTouch=false;focIdle();},{passive:true});
+ addEventListener('touchcancel',()=>{_fTouch=false;},{passive:true});
+ function focIdle(){clearTimeout(_fsT);_fsT=setTimeout(focSnap,170);}
+ function focSnap(){
+  if(_fTouch||_fsBusy||_wBusy||!focLive()||window._restHold)return;
+  if(document.querySelector('.row.ed'))return;
+  focSpace();                     // 늦게 그려진 문단·글꼴 때문에 어긋났으면 여백도 바로잡음
+  const y=geo().T0,l=lineAt(y);
+  const d=(!l||y<=l.t0||y>=l.b0)?0:snapY(y)-y;   // 문단 사이면 그대로
+  if(Math.abs(d)<1||Math.abs(d)>l.lh*.6){focQueue();return;}
+  _fsBusy=true;scrollBy({top:d,behavior:'smooth'});
+  setTimeout(()=>{_fsBusy=false;focPaint();},360);}
+ addEventListener('scroll',()=>{if(!_fsBusy)focIdle();},{passive:true});
+ // ③ 마우스 휠 한 칸 = 본문 N줄 (집중 모드 읽기 중에만). 트랙패드처럼 잘게 오는
+ //    휠은 모아서 한 칸(≈100)마다 한 번. 빠르게 굴리면 목표 위치에 계속 더해 간다.
+ let _wAcc=0,_wTgt=null,_wBusy=false,_wT=null;
+ addEventListener('wheel',e=>{
+  if(!FO.wheel||!focLive()||e.ctrlKey||e.shiftKey)return;
+  if(e.target.closest&&e.target.closest('#setmenu,#bmenu,.row.ed,textarea,select'))return;
+  e.preventDefault();
+  const unit=e.deltaMode===1?33:e.deltaMode===2?innerHeight:1;
+  _wAcc+=e.deltaY*unit;
+  if(Math.abs(_wAcc)<50)return;                 // 한 칸이 덜 찼음(트랙패드)
+  const steps=Math.max(1,Math.round(Math.abs(_wAcc)/100))*Math.sign(_wAcc);_wAcc=0;
+  const lh=bodyLh();
+  const max=document.documentElement.scrollHeight-innerHeight;
+  _wTgt=Math.max(0,Math.min(max,(_wBusy&&_wTgt!=null?_wTgt:scrollY)+steps*FO.wheel*lh));
+  _wBusy=true;scrollTo({top:_wTgt,behavior:'smooth'});
+  clearTimeout(_wT);_wT=setTimeout(()=>{_wBusy=false;_wTgt=null;focIdle();},260);
+ },{passive:false});
+ window._focPaint=focQueue;
+ // 맨 앞·맨 끝 여백 — 첫 줄이 선명 구역 위 경계까지, 끝줄이 아래 경계까지 올 수 있게.
+ // 처음 한 번 외엔 여백이 바뀐 만큼 스크롤을 같이 옮겨 보던 화면이 튀지 않게 한다.
+ const spNow=()=>{const L=document.getElementById('list');
+  return L?(parseFloat(getComputedStyle(L,'::before').height)||0):0;};
+ const focSpace=(noComp,prev)=>{const L=document.getElementById('list');if(!L)return;
+  const g=geo(),rs=document.documentElement.style;
+  const on=document.body.classList.contains('focuson')
+   &&document.body.classList.contains('rdmode');
+  const f=L.querySelector('.rd:not([style*="display: none"])')||L;
+  const fr=f.getBoundingClientRect();
+  const pad=f===L?0:parseFloat(getComputedStyle(f).paddingTop)||0;
+  const cur=spNow();                                   // 지금 그려진 위 여백
+  const old=prev!=null?prev:cur;                       // 바뀌기 전 여백(보정용)
+  const top0=fr.top+pad+scrollY-cur;                  // 여백 없을 때 첫 줄 위치
+  const want=Math.max(0,Math.round(g.T0-top0));
+  rs.setProperty('--focTop',want+'px');
+  rs.setProperty('--focBot',Math.max(0,Math.round(g.H-(g.T0+g.clr)))+'px');
+  const now=on?want:0;
+  if(!noComp&&now!==old&&scrollY>0)scrollBy(0,now-old);};
+ window._focSpace=focSpace;
+ const applyPos=()=>{focSpace();focPaint();
+  window._focApply=applyPos;};          // 테마·글자 크기가 바뀌면 다시 칠하기
  const setPos=(p)=>{window._fpos=Math.min(82,Math.max(18,p));
   try{localStorage.setItem('edFocusPos',String(window._fpos))}catch(e){}
   applyPos();};
  applyPos();
+ setTimeout(applyPos,700);addEventListener('load',()=>setTimeout(applyPos,300));
  // 누르는 즉시 잡히고, 위아래로 드래그하면 밴드 이동(대기·롱프레스 없음).
  // 손가락 이동의 60%만 반영(미세). 이동 없는 짧은 탭은 문단 편집으로 전달.
  const FGAIN=0.6;
@@ -2817,16 +2953,15 @@ function initCloud(){
   el.addEventListener('pointercancel',()=>{
    rel();moved=false;pid=null;el.classList.remove('grab');});
   el.addEventListener('lostpointercapture',()=>{pid=null;});});
- if(localStorage.getItem('edFocus')==='1')document.body.classList.add('focuson');
  const fcl=document.createElement('div');fcl.className='lbl';
- fcl.style.marginTop='12px';fcl.textContent='집중 모드';
+ fcl.style.marginTop='14px';fcl.innerHTML='집중 모드 <span class="tip">(읽기 모드)</span>';
  const fcb=document.createElement('button');fcb.className='fctgl';
  const updFc=()=>{const on=document.body.classList.contains('focuson');
-  fcb.textContent=on?'집중 모드 켜짐 — 흐린 곳을 길게 눌러 드래그로 위치 이동':'집중 모드 꺼짐';
+  fcb.textContent=on?'집중 모드 켜짐 — 흐린 띠를 끌어 위치 이동':'집중 모드 꺼짐';
   fcb.classList.toggle('on',on);};
  fcb.onclick=()=>{const on=!document.body.classList.contains('focuson');
-  document.body.classList.toggle('focuson',on);
-  try{localStorage.setItem('edFocus',on?'1':'')}catch(e){}updFc();
+  const sp0=spNow();document.body.classList.toggle('focuson',on);
+  try{localStorage.setItem('edFocus',on?'1':'')}catch(e){}focSpace(false,sp0);updFc();focQueue();
   if(window._fpNote)window._fpNote();};   // 집중선 잠금 상태 표시도 갱신
  updFc();
  // 화면 잠금 — 집중 모드의 하위 옵션(집중 모드가 꺼져 있으면 적용되지 않음)
@@ -2858,7 +2993,46 @@ function initCloud(){
  fpc.onchange=applyFp;applyFp();
  fpl.append(fpc,fpt);
  window._fpNote=updFpNote;   // 모드가 바뀌면 표시만 갱신
- window._smenu.append(fcl,fcb,fpl,fpn);   // 공용 설정 메뉴(읽기 전용)
+ // 집중선 옵션 — 선명한 줄 수 · 흐림 진하기 · 마우스 휠 한 칸
+ const mkStep=(label,min,max,get,set,fmt)=>{
+  const l=document.createElement('div');l.className='lbl';l.style.marginTop='10px';
+  l.textContent=label+' ';const v=document.createElement('b');l.appendChild(v);
+  const row=document.createElement('div');row.className='fsrow';
+  const m=document.createElement('button');m.textContent='−';
+  const p=document.createElement('button');p.textContent='+';
+  const r=document.createElement('input');r.type='range';r.className='fsrange';
+  r.min=String(min);r.max=String(max);r.step='1';
+  const show=()=>{v.textContent=fmt(get());r.value=String(get());};
+  const put=(x)=>{set(Math.max(min,Math.min(max,x)));show();};
+  m.onclick=()=>put(get()-1);p.onclick=()=>put(get()+1);
+  r.oninput=()=>put(parseInt(r.value,10));
+  row.append(m,r,p);show();return [l,row];};
+ const [fnl,fnr]=mkStep('선명한 줄 수',0,10,()=>FO.lines,
+  x=>{FO.lines=x;foSave('edFocusLines',x);focSpace();focPaint();focIdle();},
+  x=>x>0?x+'줄':'자동 ('+geo().n+'줄)');
+ const [fsl2,fsr2]=mkStep('흐림 진하기',1,10,()=>FO.str,
+  x=>{FO.str=x;foSave('edFocusStr',x);focPaint();},x=>x+(x===5?' (기본)':''));
+ const fwl=document.createElement('div');fwl.className='lbl';fwl.style.marginTop='10px';
+ fwl.innerHTML='마우스 휠 한 칸 <span class="tip">(집중 모드 읽기 중)</span>';
+ const fws=document.createElement('select');
+ [['1줄씩',1],['2줄씩',2],['3줄씩',3],['5줄씩',5],['브라우저 기본',0]].forEach(([nm,v])=>{
+  const o=document.createElement('option');o.value=String(v);o.textContent=nm;fws.appendChild(o);});
+ fws.value=String(FO.wheel);if(fws.selectedIndex<0)fws.selectedIndex=0;
+ fws.onchange=()=>{FO.wheel=parseInt(fws.value,10)||0;foSave('edFocusWheel',FO.wheel);};
+ if(matchMedia&&matchMedia('(hover:none) and (pointer:coarse)').matches){fwl.style.display=fws.style.display='none';}  // 터치 전용 기기엔 휠 없음
+ const slot=window._focSlot||window._smenu;
+ slot.append(fcl,fcb,fnl,fnr,fsl2,fsr2,fwl,fws,fpl,fpn);}
+function initCloud(){
+ document.getElementById('exp').style.display='none';
+ document.getElementById('ocrsel').style.display='none';
+ const mx=document.getElementById('mexp');mx.style.display='';
+ mx.onclick=()=>{const pl={v:1,fp:D.fp,count:D.count,
+   edits:Object.fromEntries(dirty)};
+  const b=new Blob([JSON.stringify(pl,null,1)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);
+  a.download=(D.title||'이북')+'_edits.json';a.click();};
+ // ⚙ 보기 설정(글자 크기·글꼴)은 initViewSettings()에서 모든 모드 공용으로 생성됨.
+ // 집중 모드는 initFocus()로 옮김 — 모든 모드(PC 편집 서버 포함) 공용
  const hb2=document.getElementById('hpv');hb2.style.display='';
  hb2.onclick=()=>{const pg=D.paras[curIdx()]
    &&D.paras[curIdx()].page||D.pages[0];
@@ -3065,6 +3239,7 @@ function initWake(){
 initWake();           // 화면 꺼짐 방지 — ⚙ 체크박스는 initViewSettings에서 생성
 initViewSettings();   // ⚙ 글자 크기·글꼴 — 모든 모드(편집·읽기·데스크톱) 공용
 initSearch();         // 본문 검색 — 모든 모드 공용
+initFocus();          // 집중 모드 — 모든 모드 공용
 if(CLOUD)initCloud();
 else if(SRV)initBmk(false);
 else if(!SRV){st.textContent=
