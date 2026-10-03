@@ -21,6 +21,7 @@ import json
 import os
 import re
 import threading
+import time
 import webbrowser
 import zlib
 from pathlib import Path
@@ -31,8 +32,30 @@ import comic_restore_app as core          # noqa: E402  (코어 재사용)
 import comic_retype_pipeline as retype    # noqa: E402
 
 CONFIG_PATH = core.CONFIG_PATH
+RECENTS_PATH = CONFIG_PATH.parent / "comic_recents.json"  # 최근 작업·즐겨찾기
 _PRESET_SKIP = {"api_key", "save_key", "preset_name"}
+# 최근 작업에 담을 필드 — '어떤 책을 어떻게 돌렸나'만.
+# API 키·폰트 경로·세부 보정값은 제외(그건 작품 프리셋 몫).
+_RECENT_KEYS = ("src", "out", "page_range", "limit", "glossary",
+                "ocr_engine", "source_lang", "translate_mode",
+                "translate_backend", "preset_name")
+_RECENT_MAX = 15                      # 고정(★) 제외 최근 항목 보관 수
 _PROG_RE = re.compile(r"\[(\d+)/(\d+)\]")
+
+
+def _skey(p) -> str:
+    """최근 목록 중복 판정용 경로 키.
+
+    윈도우 전용 앱이므로 대소문자·슬래시 방향·후행 슬래시를 무시한다
+    (D:\\i\\Kaiji 와 d:/i/kaiji/ 를 같은 작업으로 본다).
+    """
+    return str(p or "").strip().replace("\\", "/").rstrip("/").casefold()
+
+
+def _basename(p) -> str:
+    """경로의 마지막 조각 — 실행 OS와 무관하게 윈도우 경로를 처리."""
+    s = str(p or "").strip().replace("\\", "/").rstrip("/")
+    return s.rsplit("/", 1)[-1] or s
 
 
 def _default_cfg() -> dict:
@@ -157,6 +180,7 @@ class Api:
             "cfg": self._cfg,
             "version": retype.__version__,
             "presets": sorted(self._presets),
+            "recents": self.list_recents(),
             "fonts": fonts, "hands": hands,
             "models": core.list_models(self._cfg.get("upscayl_models") or ""),
             "ocr_engines": core.OCR_ENGINES,
@@ -196,6 +220,61 @@ class Api:
         self._presets.pop((name or "").strip(), None)
         self.save(cfg)
         return {"presets": sorted(self._presets)}
+
+    # ---------- 최근 작업 / 즐겨찾기 ----------
+    def _load_recents(self) -> list:
+        try:
+            d = json.loads(RECENTS_PATH.read_text(encoding="utf-8"))
+            return [e for e in d if isinstance(e, dict)] \
+                if isinstance(d, list) else []
+        except Exception:
+            return []
+
+    def _save_recents(self, items: list) -> None:
+        try:
+            RECENTS_PATH.write_text(
+                json.dumps(items, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+        except OSError:
+            pass
+
+    def list_recents(self) -> list:
+        """고정(★) 먼저, 그다음 최근 실행순."""
+        items = self._load_recents()
+        items.sort(key=lambda e: (not e.get("pin"), -(e.get("ts") or 0)))
+        return items
+
+    def add_recent(self, cfg: dict) -> bool:
+        """실제로 실행할 때 호출 — 원본 폴더 기준 갱신·중복 제거."""
+        c = normalize_cfg(cfg)
+        src = str(c.get("src") or "").strip()
+        if not src:
+            return False
+        entry = {k: c.get(k, "") for k in _RECENT_KEYS}
+        entry["name"] = _basename(src)
+        items = self._load_recents()
+        old = next((e for e in items if _skey(e.get("src")) == _skey(src)), {})
+        entry["pin"] = bool(old.get("pin"))
+        entry["ts"] = time.time()
+        keep = [e for e in items if _skey(e.get("src")) != _skey(src)]
+        keep.insert(0, entry)
+        pinned = [e for e in keep if e.get("pin")]
+        unpinned = [e for e in keep if not e.get("pin")][:_RECENT_MAX]
+        self._save_recents(pinned + unpinned)
+        return True
+
+    def pin_recent(self, src: str, pin: bool):
+        items = self._load_recents()
+        for e in items:
+            if _skey(e.get("src")) == _skey(src):
+                e["pin"] = bool(pin)
+        self._save_recents(items)
+        return {"ok": True, "recents": self.list_recents()}
+
+    def del_recent(self, src: str):
+        self._save_recents([e for e in self._load_recents()
+                            if _skey(e.get("src")) != _skey(src)])
+        return {"ok": True, "recents": self.list_recents()}
 
     # ---------- 파일 대화상자 ----------
     def _dialog(self, kind, filters=None):
@@ -273,6 +352,7 @@ class Api:
         if err:
             return {"err": err}
         self.save(self._cfg)
+        self.add_recent(self._cfg)          # 최근 작업에 기록
 
         def worker():
             try:
@@ -300,6 +380,7 @@ class Api:
             c["sample_index"] = 1
         c["out"] = str(Path(c["out"]) / "_sample")
         self.save(self._cfg)
+        self.add_recent(self._cfg)          # 샘플도 '작업한 폴더'로 기록
 
         def worker():
             try:
@@ -638,11 +719,24 @@ WEB_HTML = r"""<!doctype html>
  #statetxt{color:var(--tx2);font-size:12px;min-width:80px;text-align:right}
 </style></head><body>
 
-<div class="row"><label>작품 프리셋</label>
- <select id="preset_sel"></select>
- <input type="text" id="preset_name" class="w90" placeholder="이름">
- <button onclick="presetSave()">저장</button>
- <button onclick="presetDel()">삭제</button></div>
+<fieldset id="topbar"><legend>이어서 작업 · 불러오기</legend>
+ <div class="row"><label>최근 작업</label>
+  <select id="recents" onchange="applyRecent()" style="flex:1"
+   title="이전에 실행한 원본·출력 폴더와 페이지 범위·엔진을 그대로 불러옵니다
+(그 작품의 프리셋이 있으면 함께 적용)">
+   <option value="">— 최근 작업 선택 —</option></select>
+  <button id="b_pin" onclick="pinRecent()"
+   title="즐겨찾기 고정/해제 — 고정한 항목은 목록 맨 위에 남습니다">★</button>
+  <button onclick="delRecent()" title="이 항목을 최근 목록에서 삭제
+(폴더·파일은 지우지 않습니다)">🗑</button></div>
+ <div class="row"><label>작품 프리셋</label>
+  <select id="preset_sel"
+   title="작품별 설정 묶음 — 고르면 폰트·보정 옵션까지 전부 적용됩니다"></select>
+  <input type="text" id="preset_name" class="w90" placeholder="이름"
+   title="새 이름으로 저장할 때 입력 (비우면 위에서 고른 프리셋에 덮어쓰기)">
+  <button onclick="presetSave()" title="지금 설정을 이 이름으로 저장">저장</button>
+  <button onclick="presetDel()" title="선택한 프리셋 삭제">삭제</button></div>
+</fieldset>
 
 <div class="tabs">
  <div class="tab on" data-t="run">실행</div>
@@ -1055,7 +1149,76 @@ function bindFontPreset(selId, pathId, list, autoVal, sameLabel){
   };
 }
 
+// ── 최근 작업 / 즐겨찾기 ──
+let RECENTS = [];
+function renderRecents(list){
+  RECENTS = list || [];
+  const sel = $("recents");
+  const cur = ($("c_src").value || "").trim().toLowerCase();
+  sel.innerHTML = '<option value="">— 최근 작업 선택 —</option>';
+  RECENTS.forEach((e, i) => {
+    const o = document.createElement("option");
+    o.value = String(i);
+    const src = e.src || "";
+    const nm = e.name || src.split(/[\\/]/).filter(Boolean).pop() || src;
+    o.textContent = (e.pin ? "★ " : "") + nm
+      + (e.page_range ? "  [" + e.page_range + "]" : "") + "  —  " + src;
+    if (src.trim().toLowerCase() === cur) o.selected = true;
+    sel.appendChild(o);
+  });
+  syncPin();
+}
+function curRecent(){
+  const v = $("recents").value;
+  return v === "" ? null : RECENTS[+v];
+}
+function syncPin(){
+  const e = curRecent();
+  $("b_pin").style.opacity = (e && e.pin) ? "1" : ".4";
+}
+async function applyRecent(){
+  const e = curRecent();
+  if (!e){ syncPin(); return; }
+  // 그 작품의 프리셋이 남아 있으면 먼저 적용 → 그 위에 폴더·범위를 덮어씀
+  const pn = (e.preset_name || "").trim();
+  if (pn && [...$("preset_sel").options].some(o => o.value === pn)){
+    $("preset_sel").value = pn;
+    await loadPreset(pn);
+  }
+  for (const k of FIELDS){
+    if (!(k in e)) continue;
+    const el = $("c_" + k);
+    if (!el) continue;
+    if (el.type === "checkbox") el.checked = !!e[k];
+    else el.value = e[k] == null ? "" : e[k];
+  }
+  updSummary(); updateEngineUI();
+  api().save(collectCfg());
+  syncPin();
+}
+async function pinRecent(){
+  const e = curRecent(); if (!e) return;
+  renderRecents((await api().pin_recent(e.src, !e.pin)).recents);
+}
+async function delRecent(){
+  const e = curRecent(); if (!e) return;
+  const r = await api().del_recent(e.src);
+  $("recents").value = "";
+  renderRecents(r.recents);
+}
+async function refreshRecents(){
+  try { renderRecents(await api().list_recents()); } catch (e) {}
+}
+
 // ── 작품 프리셋 ──
+async function loadPreset(name){
+  const d = await api().preset_load(name);
+  if (d && Object.keys(d).length){
+    Object.assign(INIT.cfg, d);
+    fillForm(INIT.cfg);
+    updateEngineUI();
+  }
+}
 async function presetSave(){
   const name = $("preset_name").value || $("preset_sel").value;
   const r = await api().preset_save(name, collectCfg());
@@ -1078,11 +1241,13 @@ function logLine(s){
 }
 async function doStart(){
   const r = await api().start(collectCfg());
-  if (r && r.err) alert(r.err);
+  if (r && r.err) { alert(r.err); return; }
+  refreshRecents();
 }
 async function doSample(){
   const r = await api().sample(collectCfg(), $("c_sample_index").value);
-  if (r && r.err) alert(r.err);
+  if (r && r.err) { alert(r.err); return; }
+  refreshRecents();
 }
 async function doReview(){
   const r = await api().open_review(collectCfg());
@@ -1181,8 +1346,10 @@ async function boot(){
       : [INIT.cfg.upscayl_model], INIT.cfg.upscayl_model);
   optCustom("c_ollama_model", ["qwen3:14b", "qwen3:8b", "gemma3:12b",
                                "exaone3.5:7.8b"], INIT.cfg.ollama_model);
-  optCustom("c_gemini_model", ["gemini-3.6-flash", "gemini-3.1-flash-lite",
-                               "gemini-2.5-flash-lite", "gemini-3.5-flash"],
+  optCustom("c_gemini_model", ["gemini-3.8-flash", "gemini-3.5-flash-lite",
+                               "gemini-3.1-flash-lite", "gemini-3.7-flash",
+                               "gemini-3.6-flash", "gemini-3.5-flash",
+                               "gemini-2.5-flash-lite"],
             INIT.cfg.gemini_model);
   optCustom("c_deepseek_model", ["deepseek-ai/DeepSeek-OCR",
                                  "deepseek-ai/DeepSeek-OCR-2",
@@ -1222,13 +1389,10 @@ async function boot(){
         " checked" : "") + "> " + lb;
     zb.appendChild(l);
   });
-  $("preset_sel").onchange = async () => {
-    const d = await api().preset_load($("preset_sel").value);
-    if (d && Object.keys(d).length) { Object.assign(INIT.cfg, d);
-      fillForm(INIT.cfg); updateEngineUI(); }
-  };
+  $("preset_sel").onchange = () => loadPreset($("preset_sel").value);
   fillForm(INIT.cfg);
   updateEngineUI();                  // 프리셋 로드·폼 채움 후 블록 갱신
+  renderRecents(INIT.recents || []);   // 최근 작업 목록
   document.body.addEventListener("change", () => {
     updSummary();
     updateEngineUI();

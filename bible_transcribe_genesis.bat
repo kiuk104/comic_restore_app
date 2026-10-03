@@ -1,0 +1,11 @@
+@echo off
+chcp 65001 >nul
+cd /d "%~dp0"
+set F=E:\Coding\capture_tool\01_창세기
+del "%F%\_done_transcribe.txt" 2>nul
+echo 창세기 캡처 180장 전사 - Windows OCR, Tesseract, DeepSeek(6장 동시), Gemini 3.8(6장 동시)
+call test_bible_engines.bat "%F%" winocr tesseract deepseek gemini
+echo done> "%F%\_done_transcribe.txt"
+echo.
+echo 전사 끝 - 이 창은 닫아도 됩니다.
+pause

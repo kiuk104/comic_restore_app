@@ -39,7 +39,7 @@ v2(comic_restore_pipeline)의 비파괴 톤 보정을 베이스로 깔고, 그 �
 
 from __future__ import annotations
 
-__version__ = "0.16.6"   # JSON 후행 콤마 관용 (Gemini 응답 파싱 실패 구제)
+__version__ = "0.16.7"   # 출력 파일 잠김 보호(check_free/safe_produce) 공용화
 
 import argparse
 import base64
@@ -58,6 +58,117 @@ from PIL import Image, ImageDraw, ImageFont
 # v2 보정 모듈 (같은 폴더)
 sys.path.insert(0, str(Path(__file__).parent))
 from comic_restore_pipeline import imread_unicode, imwrite_unicode, restore_page
+
+
+# ---------------------------------------------------------------------------
+# 출력 파일 보호 — 결과물을 뷰어에 열어둔 채 재실행해도 잃지 않게
+# ---------------------------------------------------------------------------
+# 2026-08-08 Spiegel 68페이지 사고에서 나온 규칙: 윈도우에서 PDF·ZIP·EPUB을
+# 뷰어가 잡고 있으면 덮어쓰기가 'Permission denied'로 죽으면서 몇 분~몇십 분
+# 걸린 결과가 통째로 날아간다. 그래서
+#   ① 오래 걸리는 작업은 시작 전에 check_free()로 잠김을 먼저 확인하고
+#   ② 실제 저장은 safe_produce()/safe_write_*()로 임시 파일에 쓴 뒤 교체한다.
+# 새 출력물을 추가할 때도 이 두 가지를 같이 쓸 것.
+def is_locked(path) -> bool:
+    """다른 프로그램이 파일을 잡고 있는가 (없는 파일은 False)."""
+    path = Path(path)
+    if not path.exists():
+        return False
+    try:
+        with open(path, "r+b"):
+            return False
+    except OSError:
+        return True
+
+
+def free_name(dst: Path) -> Path:
+    """'이름.pdf' → 비어 있는 '이름 (2).pdf'."""
+    dst = Path(dst)
+    for i in range(2, 100):
+        alt = dst.with_name(f"{dst.stem} ({i}){dst.suffix}")
+        if not alt.exists():
+            return alt
+    return dst.with_name(f"{dst.stem} (new){dst.suffix}")
+
+
+def check_free(paths, log=None) -> None:
+    """오래 걸리는 작업 전에 출력 파일이 열려 있는지 확인 — 잠겼으면 중단.
+
+    조판·번역을 다 끝낸 뒤 저장에서 막히면 시간과 API 요금만 날아가므로
+    시작 전에 본다.
+    """
+    if isinstance(paths, (str, Path)):
+        paths = [paths]
+    bad = [Path(p) for p in paths if p and is_locked(p)]
+    if not bad:
+        return
+    names = "\n".join(f"    {p}" for p in bad)
+    raise RuntimeError(
+        f"출력 파일이 다른 프로그램에서 열려 있습니다:\n{names}\n"
+        "뷰어(Acrobat·Edge·크롬·압축 프로그램 등)에서 닫은 뒤 다시 "
+        "실행하세요.")
+
+
+def _tmp_path(dst: Path) -> Path:
+    tmp = dst.with_name(f"{dst.stem}.__tmp__{dst.suffix}")
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    return tmp
+
+
+def safe_replace(tmp: Path, dst: Path, log=None, tries: int = 3,
+                 wait: float = 0.7) -> Path:
+    """임시 파일 → 목표 이름. 잠겨 있으면 재시도 후 '이름 (2)'로라도 남긴다.
+
+    반환: 실제로 저장된 경로 (교체 성공 시 dst).
+    """
+    import time
+    tmp, dst = Path(tmp), Path(dst)
+    for _ in range(max(1, tries)):
+        try:
+            os.replace(tmp, dst)
+            return dst
+        except OSError:
+            time.sleep(wait)
+    alt = free_name(dst)
+    try:
+        os.replace(tmp, alt)
+    except OSError:
+        if log:
+            log(f"!! 이름 바꾸기도 실패 — 결과는 임시 파일에 있습니다: {tmp}")
+        return tmp
+    if log:
+        log(f"※ '{dst.name}'이(가) 열려 있어 덮어쓰지 못했습니다 → "
+            f"'{alt.name}'으로 저장했습니다 (뷰어를 닫고 파일명을 정리하세요).")
+    return alt
+
+
+def safe_produce(dst, writer, log=None) -> Path:
+    """writer(임시경로)로 파일을 만든 뒤 목표 이름으로 교체.
+
+    PDF(ez_save)·EPUB·ZIP처럼 라이브러리가 경로를 받아 직접 쓰는 출력용.
+    writer가 예외를 내면 임시 파일을 지우고 그대로 올려보낸다.
+    """
+    dst = Path(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _tmp_path(dst)
+    try:
+        writer(tmp)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return safe_replace(tmp, dst, log)
+
+
+def safe_write_bytes(dst, data: bytes, log=None) -> Path:
+    return safe_produce(dst, lambda t: t.write_bytes(data), log)
+
+
+def safe_write_text(dst, text: str, log=None, encoding="utf-8") -> Path:
+    return safe_produce(
+        dst, lambda t: t.write_text(text, encoding=encoding), log)
 
 
 # ---------------------------------------------------------------------------
@@ -382,11 +493,15 @@ API_PRICES = [
     ("claude-haiku-4-5", 1.0, 5.0),
     ("claude-haiku", 0.8, 4.0),
     ("gemini-3.1-flash-lite", 0.25, 1.50),
+    ("gemini-3.5-flash-lite", 0.30, 2.50),   # 2026-09 확인 — 3.5 계열 최저가
     ("gemini-2.5-flash-lite", 0.10, 0.40),
-    # ※ gemini-3.6-flash-lite가 나오면 반드시 이 줄 '위'에 둘 것
+    # ※ 새 -lite 모델은 반드시 이 줄 '위'에 둘 것
     #   (startswith 매칭이라 -lite가 non-lite 단가에 먼저 걸림)
-    ("gemini-3.6-flash", 1.50, 7.50),    # 3.6 GA 2026-07-21 (3.5보다 출력 저렴)
-    ("gemini-3.5-flash", 1.50, 9.00),    # 주의: lite보다 6배 비쌈
+    # 3.6~3.8 flash: 2026-12-31까지 프로모션가 0.75/3.75, 2027-01-01부터 1.50/7.50
+    ("gemini-3.8-flash", 0.75, 3.75),    # 2026-09 최신 Flash
+    ("gemini-3.7-flash", 0.75, 3.75),
+    ("gemini-3.6-flash", 0.75, 3.75),
+    ("gemini-3.5-flash", 1.50, 9.00),    # 주의: 3.6~3.8보다 비쌈
     ("deepseek-v4-flash", 0.14, 0.28),   # 캐시 미스 기준 (히트 시 더 쌈)
     ("deepseek-v4-pro", 0.435, 0.87),
     ("kimi-k2.5", 0.60, 3.00),           # 캐시 미스 기준 (히트 시 6배 쌈)
@@ -2644,6 +2759,7 @@ def export_final_zip(out_dir: Path, zip_path=None, preset=None,
         suffix = f"_{preset['tag']}" if preset else ""
         zip_path = out_dir / f"{out_dir.parent.name}_final{suffix}.zip"
     zip_path = Path(zip_path)
+    check_free(zip_path, log)     # 변환에 몇 분 쓰기 전에 잠김 확인
     locked_stems = {Path(f).stem for f in load_locked(out_dir) if f}
     n_locked = sum(1 for p in finals
                    if p.name[:-len("_final.png")] in locked_stems)
@@ -2659,40 +2775,43 @@ def export_final_zip(out_dir: Path, zip_path=None, preset=None,
             pass
     if page_crops and log:
         log(f"  출력 크롭 적용: {len(page_crops)}페이지")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
-        for i, p in enumerate(finals, 1):
-            if is_cancelled and is_cancelled():
-                zf.close()
-                zip_path.unlink(missing_ok=True)   # 불완전 아카이브 제거
-                raise RuntimeError("사용자가 중지함 — ZIP 생성 취소")
-            stem = p.name[:-len("_final.png")]
-            cb = page_crops.get(stem)
-            if not preset:
-                if not cb:
-                    zf.write(p, stem + ".png")
+    # 임시 파일에 만든 뒤 교체 — 기존 ZIP을 압축 프로그램이 열어두고 있어도
+    # 여기까지 온 변환 결과를 잃지 않는다 (safe_produce).
+    def _build(target):
+        with zipfile.ZipFile(target, "w", zipfile.ZIP_STORED) as zf:
+            for i, p in enumerate(finals, 1):
+                if is_cancelled and is_cancelled():
+                    raise RuntimeError("사용자가 중지함 — ZIP 생성 취소")
+                stem = p.name[:-len("_final.png")]
+                cb = page_crops.get(stem)
+                if not preset:
+                    if not cb:
+                        zf.write(p, stem + ".png")
+                        continue
+                    with Image.open(p) as im:   # 크롭만 적용해 PNG 재저장
+                        buf = io.BytesIO()
+                        im.crop(_clamp_crop(cb, im.size)).save(buf, "PNG")
+                    zf.writestr(stem + ".png", buf.getvalue())
                     continue
-                with Image.open(p) as im:   # 크롭만 적용해 PNG 재저장
+                if log:
+                    log(f"  [{i}/{len(finals)}] {stem} 변환 중…")
+                with Image.open(p) as im:
+                    if cb:
+                        im = im.crop(_clamp_crop(cb, im.size))
+                    if im.mode != "RGB":
+                        im = im.convert("RGB")
+                    edge = int(preset["edge"])
+                    sc = edge / max(im.size)
+                    if sc < 1:   # 장변 상한 초과 시에만 축소 (확대는 안 함)
+                        im = im.resize((max(1, round(im.width * sc)),
+                                        max(1, round(im.height * sc))),
+                                       Image.LANCZOS)
                     buf = io.BytesIO()
-                    im.crop(_clamp_crop(cb, im.size)).save(buf, "PNG")
-                zf.writestr(stem + ".png", buf.getvalue())
-                continue
-            if log:
-                log(f"  [{i}/{len(finals)}] {stem} 변환 중…")
-            with Image.open(p) as im:
-                if cb:
-                    im = im.crop(_clamp_crop(cb, im.size))
-                if im.mode != "RGB":
-                    im = im.convert("RGB")
-                edge = int(preset["edge"])
-                sc = edge / max(im.size)
-                if sc < 1:   # 장변 상한 초과 시에만 축소 (확대는 안 함)
-                    im = im.resize((max(1, round(im.width * sc)),
-                                    max(1, round(im.height * sc))),
-                                   Image.LANCZOS)
-                buf = io.BytesIO()
-                im.save(buf, "JPEG", quality=int(preset["q"]),
-                        optimize=True, subsampling=0)
-            zf.writestr(stem + ".jpg", buf.getvalue())
+                    im.save(buf, "JPEG", quality=int(preset["q"]),
+                            optimize=True, subsampling=0)
+                zf.writestr(stem + ".jpg", buf.getvalue())
+
+    zip_path = safe_produce(zip_path, _build, log)
     return zip_path, len(finals), n_locked
 
 
